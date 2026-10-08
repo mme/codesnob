@@ -329,7 +329,7 @@ impl DiffView {
     ) {
         match row {
             Row::Desc(i) => {
-                let mut spans = vec![Span::styled("  │ ", Style::default().fg(p.note_fg))];
+                let mut spans = vec![Span::raw("  ")];
                 spans.extend(self.desc[i].spans.iter().cloned());
                 buf.set_line(area.x, area.y, &Line::from(spans), area.width);
             }

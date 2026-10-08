@@ -34,10 +34,17 @@ use commands::{Action, COMMANDS};
 use diffview::{Anchor, DiffView};
 use panel::{Outcome, Panel};
 
+/// Nerd Font `md-source_commit`: a ring on a vertical line, matching how
+/// Alt-Up and Alt-Down walk the branch.
+const COMMIT_ICON: &str = "\u{f0718}";
+
 /// How long a load may take before the screen says it is loading.
 const LOADING_DELAY: Duration = Duration::from_millis(150);
 
 pub struct Palette {
+    /// Keycaps: the shortcuts shown in the palette.
+    pub key_bg: Color,
+    pub key_fg: Color,
     pub add_bg: Color,
     pub add_emph: Color,
     pub del_bg: Color,
@@ -51,6 +58,8 @@ pub struct Palette {
 impl Palette {
     pub fn dark() -> Self {
         Self {
+            key_bg: Color::Rgb(0x3c, 0x41, 0x55),
+            key_fg: Color::Cyan,
             add_bg: Color::Rgb(0x12, 0x33, 0x1c),
             add_emph: Color::Rgb(0x1f, 0x6b, 0x2f),
             del_bg: Color::Rgb(0x3b, 0x12, 0x19),
@@ -64,6 +73,8 @@ impl Palette {
 
     pub fn light() -> Self {
         Self {
+            key_bg: Color::Rgb(0xd0, 0xd4, 0xe2),
+            key_fg: Color::Blue,
             add_bg: Color::Rgb(0xe2, 0xf5, 0xe6),
             add_emph: Color::Rgb(0xa8, 0xe8, 0xb5),
             del_bg: Color::Rgb(0xff, 0xe3, 0xe6),
@@ -501,8 +512,13 @@ impl App {
                 loc.repo = true;
                 loc.error = None;
                 loc.desc_dirty = true;
+                // A fetch by hand ("fetching #N…") ends in a report: the note,
+                // or what the reload that follows finds.
                 if note.is_some() {
                     self.message = note;
+                } else if !first && idx == 0 {
+                    self.message = None;
+                    loc.manual = true;
                 }
                 if idx == 0 {
                     if first {
@@ -661,10 +677,10 @@ impl App {
                 let text = match &e.pr {
                     Some(p) => match crate::pr::parse(&p.url) {
                         Some(spec) => format!(
-                            "#{} {}  {}",
+                            "{}#{} {}",
+                            spec.repo.map(|r| r.slug()).unwrap_or_default(),
                             spec.number,
-                            p.title,
-                            spec.repo.map(|r| r.slug()).unwrap_or_default()
+                            p.title
                         ),
                         None => p.title.clone(),
                     },
@@ -983,9 +999,9 @@ impl App {
                 self.perform(Action::Quit)
             }
             (KeyCode::Esc, _, _) => self.back_out(),
-            (KeyCode::Char(':'), false, _)
-            | (KeyCode::Char('?'), false, _)
-            | (KeyCode::Char('k'), true, false) => self.open_palette(),
+            (KeyCode::Char(':'), false, _) | (KeyCode::Char('k'), true, false) => {
+                self.open_palette()
+            }
             (KeyCode::Char('f'), false, false) => self.perform(Action::Files),
             (KeyCode::Char('o'), false, false) => self.perform(Action::Open),
             (KeyCode::Char('-'), false, false) => self.perform(Action::PreviousLocation),
@@ -995,6 +1011,9 @@ impl App {
             (KeyCode::Char('d'), false, false) => self.perform(Action::ToggleDescription),
             (KeyCode::Char('z'), false, false) => self.perform(Action::Narrow),
 
+            // Up the commit list is older, down is newer, uncommitted last.
+            (KeyCode::Up, false, true) => self.perform(Action::OlderCommit),
+            (KeyCode::Down, false, true) => self.perform(Action::NewerCommit),
             (KeyCode::Down, _, _)
             | (KeyCode::Char('j'), false, false)
             | (KeyCode::Char('n'), true, false) => scroll(self, 1),
@@ -1304,7 +1323,12 @@ impl App {
             (None, true) => steps.len() - 1,
             (None, false) => 0,
             (Some(0), true) => {
-                self.message = Some("this is the oldest commit".to_string());
+                let text = if steps[0] == Range::Uncommitted {
+                    "no commits since the branch point"
+                } else {
+                    "this is the oldest commit"
+                };
+                self.message = Some(text.to_string());
                 return;
             }
             (Some(i), true) => i - 1,
@@ -1724,10 +1748,17 @@ impl App {
                 match info.commits.iter().position(|c| c.id == *id) {
                     Some(i) => {
                         let c = &info.commits[i];
-                        format!("{} {} · commit {} of {n}", c.short, c.subject, i + 1)
+                        format!(
+                            "{COMMIT_ICON} commit {} of {n} · {} {}",
+                            i + 1,
+                            c.short,
+                            c.subject
+                        )
                     }
                     None => match &info.commit {
-                        Some(c) if c.id == *id => format!("{} {}", c.short, c.subject),
+                        Some(c) if c.id == *id => {
+                            format!("{COMMIT_ICON} {} {}", c.short, c.subject)
+                        }
                         _ => format!("{head} · commit"),
                     },
                 }
@@ -1922,7 +1953,7 @@ impl App {
                 }
             };
         }
-        right.push_str(" ? commands ");
+        right.push_str(" : commands ");
         let rw = right.chars().count() as u16;
         let lw = area.width.saturating_sub(rw);
         buf.set_span(area.x, area.y, &Span::styled(left, style), lw);

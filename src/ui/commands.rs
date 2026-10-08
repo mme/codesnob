@@ -87,12 +87,12 @@ pub const COMMANDS: &[Command] = &[
     Command {
         action: Action::OlderCommit,
         name: "Older commit",
-        keys: "<",
+        keys: "Alt-↑",
     },
     Command {
         action: Action::NewerCommit,
         name: "Newer commit",
-        keys: ">",
+        keys: "Alt-↓",
     },
     Command {
         action: Action::ToggleDescription,

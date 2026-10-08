@@ -33,14 +33,14 @@ Give Claude Code the `show_diff` tool:
 claude mcp add codesnob --scope user -- codesnob mcp
 ```
 
-In the viewer, `:` or `?` lists every command with its key. The ones you
+In the viewer, `:` or Ctrl-K lists every command with its key. The ones you
 need to start:
 
 | Key | Does |
 |---|---|
 | `o` | open a path, or a PR: `#123`, `owner/repo#123` or its URL |
 | `c` | the branch's commits; moving through the list previews each one |
-| `<` `>` | older and newer commit, directly |
+| Alt-↑ Alt-↓ | older and newer commit, directly |
 | `f` | the changed files; `z` narrows the view to one |
 | `d` | show or hide the commit message or PR description |
 | `-` | back to the previous location; quick repeats go further |
