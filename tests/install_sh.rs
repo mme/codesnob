@@ -28,11 +28,27 @@ fn tarball_name() -> String {
     format!("codesnob-{TAG}-{}.tar.gz", suffix())
 }
 
-fn tempdir(name: &str) -> PathBuf {
+/// A scratch directory removed when dropped, even when a test fails.
+struct Dir(PathBuf);
+
+impl std::ops::Deref for Dir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tempdir(name: &str) -> Dir {
     let dir = std::env::temp_dir().join(format!("codesnob-install-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    Dir(dir)
 }
 
 fn executable(path: &Path, body: &str) {
@@ -149,6 +165,7 @@ struct Run {
     stderr: String,
     home: PathBuf,
     scratch: PathBuf,
+    _root: Dir,
 }
 
 /// A `gh` that fails unless `works` is given: then it serves the fixture the
@@ -232,6 +249,7 @@ fn run_installer(
         stderr,
         home,
         scratch,
+        _root: root,
     }
 }
 

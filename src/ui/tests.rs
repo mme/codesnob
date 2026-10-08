@@ -16,18 +16,35 @@ struct Harness {
     app: App,
     rx: Receiver<Msg>,
     term: Terminal<TestBackend>,
+    /// Scratch directories this harness owns; removed when it is dropped,
+    /// even when a test fails, so runs do not pile up in the temp dir.
+    scratch: Vec<PathBuf>,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        for d in &self.scratch {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
 }
 
 impl Harness {
     fn open(dir: &Path) -> Self {
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-        Self::open_with_state(dir, fresh_dir(&format!("state-{name}")))
+        let state = fresh_dir(&format!("state-{name}"));
+        let mut h = Self::open_with_state(dir, state.clone());
+        h.scratch.push(state);
+        h
     }
 
+    /// `state` belongs to the caller, which may reuse it across harnesses.
     fn open_with_state(dir: &Path, state: PathBuf) -> Self {
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         let cache = fresh_dir(&format!("cache-{name}"));
-        Self::build(dir, state, cache, std::sync::Arc::new(NoPrs))
+        let mut h = Self::build(dir, state, cache.clone(), std::sync::Arc::new(NoPrs));
+        h.scratch.push(cache);
+        h
     }
 
     fn build(
@@ -56,6 +73,7 @@ impl Harness {
             app,
             rx,
             term: Terminal::new(TestBackend::new(100, 30)).unwrap(),
+            scratch: Vec::new(),
         };
         h.settle();
         h
@@ -796,7 +814,13 @@ fn pr_harness(name: &str) -> (Harness, PathBuf, PathBuf, PathBuf) {
     let (origin, user, fake) = fake_github(name);
     let state = fresh_dir(&format!("{name}-state"));
     let cache = fresh_dir(&format!("{name}-cache"));
-    let h = Harness::build(&user, state, cache.clone(), std::sync::Arc::new(fake));
+    let mut h = Harness::build(
+        &user,
+        state.clone(),
+        cache.clone(),
+        std::sync::Arc::new(fake),
+    );
+    h.scratch.push(state);
     (h, origin, user, cache)
 }
 
@@ -931,7 +955,13 @@ fn a_merged_pr_still_shows_its_own_changes() {
     });
     let state = fresh_dir("ui-pr-merged-state");
     let cache = fresh_dir("ui-pr-merged-cache");
-    let mut h = Harness::build(&user, state, cache.clone(), std::sync::Arc::new(fake));
+    let mut h = Harness::build(
+        &user,
+        state.clone(),
+        cache.clone(),
+        std::sync::Arc::new(fake),
+    );
+    h.scratch.push(state);
     h.keys("o#7<enter>");
     let status = h.status();
     assert!(
@@ -1158,7 +1188,13 @@ fn a_merged_pr_whose_base_branch_is_gone_still_opens() {
     });
     let state = fresh_dir("ui-pr-gone-base-state");
     let cache = fresh_dir("ui-pr-gone-base-cache");
-    let mut h = Harness::build(&user, state, cache.clone(), std::sync::Arc::new(fake));
+    let mut h = Harness::build(
+        &user,
+        state.clone(),
+        cache.clone(),
+        std::sync::Arc::new(fake),
+    );
+    h.scratch.push(state);
     h.keys("o#7<enter>");
     let status = h.status();
     assert!(
