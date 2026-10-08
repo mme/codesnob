@@ -1,5 +1,6 @@
-//! Repository access: find the branch point and collect changed files
-//! between that point and the working tree.
+//! Repository access: find the branch point, list the branch's commits, and
+//! collect the changed files of a range. Every range is two sides, each a
+//! commit tree or the working tree, and goes through the same pipeline.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -16,13 +17,56 @@ pub struct FileChange {
     pub new: Option<Vec<u8>>,
 }
 
+/// Which two states a view compares.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Range {
+    /// The branch point (or `--base`) against the working tree.
+    Everything,
+    /// HEAD against the working tree.
+    Uncommitted,
+    /// One commit against its first parent. Chosen from the commit list.
+    #[allow(dead_code)]
+    Commit(ObjectId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitInfo {
+    pub id: ObjectId,
+    pub short: String,
+    pub subject: String,
+    /// The full message, subject included.
+    pub message: String,
+    pub author: String,
+    /// Seconds since the Unix epoch.
+    pub time: i64,
+}
+
+/// What the branch is compared against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Base {
+    pub commit: Option<ObjectId>,
+    /// The ref the branch point was found on, e.g. "main". `None` when no
+    /// base was found and the view falls back to HEAD.
+    pub name: Option<String>,
+    /// One sentence on how the base was chosen.
+    pub reason: String,
+}
+
 pub struct Snapshot {
-    /// What HEAD is: branch name or short hash.
+    /// What HEAD is: a branch name, or "detached 1a2b3c4".
     pub head_label: String,
-    /// What we diff against: e.g. "main @ 1a2b3c4".
-    pub base_label: String,
-    /// Why that base was chosen.
-    pub base_reason: String,
+    /// The repository has no commits yet.
+    pub unborn: bool,
+    pub base: Base,
+    /// Commits between the base and HEAD, oldest first, at most `MAX_COMMITS`.
+    pub commits: Vec<CommitInfo>,
+    /// More commits exist than `commits` holds; the oldest were dropped.
+    pub commits_truncated: bool,
+    /// The working tree differs from HEAD, untracked files included.
+    pub dirty: bool,
+    pub range: Range,
+    /// For `Range::Commit`: the commit shown.
+    pub commit: Option<CommitInfo>,
     pub files: Vec<FileChange>,
 }
 
@@ -32,7 +76,12 @@ impl Snapshot {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.head_label.hash(&mut h);
-        self.base_label.hash(&mut h);
+        self.base.commit.hash(&mut h);
+        self.range.hash(&mut h);
+        self.dirty.hash(&mut h);
+        for c in &self.commits {
+            c.id.hash(&mut h);
+        }
         for f in &self.files {
             f.old_path.hash(&mut h);
             f.new_path.hash(&mut h);
@@ -43,15 +92,12 @@ impl Snapshot {
     }
 }
 
+/// The most commits listed for one branch.
+pub const MAX_COMMITS: usize = 500;
+
 const DEFAULT_BRANCHES: &[&str] = &["main", "master", "develop", "trunk"];
 
-struct Base {
-    commit: Option<ObjectId>,
-    label: String,
-    reason: String,
-}
-
-pub fn snapshot(dir: &Path, base_override: Option<&str>) -> Result<Snapshot> {
+pub fn snapshot(dir: &Path, base_override: Option<&str>, range: &Range) -> Result<Snapshot> {
     let repo = gix::discover(dir)
         .with_context(|| format!("{} is not inside a git repository", dir.display()))?;
     let workdir = repo
@@ -61,20 +107,106 @@ pub fn snapshot(dir: &Path, base_override: Option<&str>) -> Result<Snapshot> {
 
     let head_id = repo.head_id().ok().map(|id| id.detach());
     let head_label = head_label(&repo, head_id);
-
     let base = match base_override {
         Some(spec) => explicit_base(&repo, head_id, spec)?,
         None => detect_base(&repo, head_id)?,
     };
+    let (commits, commits_truncated) = match (base.commit, head_id) {
+        (base_commit, Some(head)) if base_commit != Some(head) => {
+            commits_between(&repo, head, base_commit)?
+        }
+        _ => (Vec::new(), false),
+    };
 
-    let files = collect_changes(&repo, &workdir, base.commit)?;
+    let head_tree = match head_id {
+        Some(id) => repo.find_commit(id)?.tree()?,
+        None => repo.empty_tree(),
+    };
+    let uncommitted = uncommitted_paths(&repo)?;
+    let dirty = !uncommitted.is_empty();
+
+    let mut commit = None;
+    let files = match range {
+        Range::Everything => {
+            let base_tree = tree_of(&repo, base.commit)?;
+            let mut paths = uncommitted;
+            tree_paths(&repo, &base_tree, &head_tree, &mut paths)?;
+            collect(&repo, &paths, &base_tree, &New::Worktree(&workdir))?
+        }
+        Range::Uncommitted => collect(&repo, &uncommitted, &head_tree, &New::Worktree(&workdir))?,
+        Range::Commit(id) => {
+            let c = repo
+                .find_commit(*id)
+                .with_context(|| format!("commit {} not found", short(id)))?;
+            let parent = c.parent_ids().next().map(|p| p.detach());
+            let new_tree = c.tree()?;
+            let old_tree = tree_of(&repo, parent)?;
+            commit = Some(commit_info(&c));
+            let mut paths = BTreeSet::new();
+            tree_paths(&repo, &old_tree, &new_tree, &mut paths)?;
+            collect(&repo, &paths, &old_tree, &New::Tree(&new_tree))?
+        }
+    };
 
     Ok(Snapshot {
         head_label,
-        base_label: base.label,
-        base_reason: base.reason,
+        unborn: head_id.is_none(),
+        base,
+        commits,
+        commits_truncated,
+        dirty,
+        range: range.clone(),
+        commit,
         files,
     })
+}
+
+fn tree_of(repo: &gix::Repository, commit: Option<ObjectId>) -> Result<gix::Tree<'_>> {
+    Ok(match commit {
+        Some(id) => repo.find_commit(id)?.tree()?,
+        None => repo.empty_tree(),
+    })
+}
+
+fn commit_info(c: &gix::Commit<'_>) -> CommitInfo {
+    let message = c.message_raw_sloppy().to_str_lossy().trim_end().to_string();
+    let subject = message.lines().next().unwrap_or("").to_string();
+    let (author, time) = match c.author() {
+        Ok(a) => (
+            a.name.to_str_lossy().into_owned(),
+            a.time().map(|t| t.seconds).unwrap_or(0),
+        ),
+        Err(_) => (String::new(), 0),
+    };
+    CommitInfo {
+        id: c.id,
+        short: short(&c.id),
+        subject,
+        message,
+        author,
+        time,
+    }
+}
+
+/// Commits reachable from `head` but not from `base`, oldest first.
+fn commits_between(
+    repo: &gix::Repository,
+    head: ObjectId,
+    base: Option<ObjectId>,
+) -> Result<(Vec<CommitInfo>, bool)> {
+    let walk = repo.rev_walk([head]).with_hidden(base).all()?;
+    let mut out = Vec::new();
+    let mut truncated = false;
+    for info in walk {
+        let info = info?;
+        if out.len() == MAX_COMMITS {
+            truncated = true;
+            break;
+        }
+        out.push(commit_info(&info.object()?));
+    }
+    out.reverse();
+    Ok((out, truncated))
 }
 
 fn head_label(repo: &gix::Repository, head_id: Option<ObjectId>) -> String {
@@ -105,8 +237,8 @@ fn explicit_base(repo: &gix::Repository, head_id: Option<ObjectId>, spec: &str) 
     };
     Ok(Base {
         commit: Some(commit),
-        label: format!("{spec} @ {}", short(&commit)),
-        reason: "given with --base".to_string(),
+        name: Some(spec.to_string()),
+        reason: format!("{spec} was given with --base"),
     })
 }
 
@@ -122,8 +254,8 @@ fn detect_base(repo: &gix::Repository, head_id: Option<ObjectId>) -> Result<Base
     let Some(head) = head_id else {
         return Ok(Base {
             commit: None,
-            label: "empty tree".to_string(),
-            reason: "repository has no commits yet".to_string(),
+            name: None,
+            reason: "the repository has no commits yet, so every file is new".to_string(),
         });
     };
 
@@ -131,8 +263,8 @@ fn detect_base(repo: &gix::Repository, head_id: Option<ObjectId>) -> Result<Base
     let Some(branch) = branch else {
         return Ok(Base {
             commit: Some(head),
-            label: format!("HEAD @ {}", short(&head)),
-            reason: "detached HEAD, showing working tree changes".to_string(),
+            name: None,
+            reason: "HEAD is detached, so only uncommitted changes are shown".to_string(),
         });
     };
     let on_default_branch = DEFAULT_BRANCHES.contains(&branch.as_str());
@@ -220,16 +352,21 @@ fn detect_base(repo: &gix::Repository, head_id: Option<ObjectId>) -> Result<Base
             } else {
                 cand.name.clone()
             };
+            let how = match cand.reason {
+                "reflog" => format!("{branch} was created from {name}, as its reflog records"),
+                "upstream" => format!("{name} is the upstream {branch} tracks"),
+                _ => format!("{name} is the default branch"),
+            };
             Ok(Base {
                 commit: Some(mb),
-                label: format!("{name} @ {}", short(&mb)),
-                reason: format!("branch point found via {}", cand.reason),
+                name: Some(name.clone()),
+                reason: format!("{how}; they diverged at {}", short(&mb)),
             })
         }
         None => Ok(Base {
             commit: Some(head),
-            label: format!("HEAD @ {}", short(&head)),
-            reason: "no base branch found, showing working tree changes".to_string(),
+            name: None,
+            reason: "no base branch was found, so only uncommitted changes are shown".to_string(),
         }),
     }
 }
@@ -255,89 +392,158 @@ fn reflog_origin(repo: &gix::Repository) -> Option<String> {
     Some(from.to_string())
 }
 
-fn collect_changes(
+/// Paths where the working tree differs from HEAD: staged, unstaged and untracked.
+fn uncommitted_paths(repo: &gix::Repository) -> Result<BTreeSet<BString>> {
+    use gix::diff::index::Change as TreeChange;
+    use gix::status::Item;
+    use gix::status::index_worktree::Item as WtItem;
+
+    let mut paths = BTreeSet::new();
+    let platform = repo
+        .status(gix::progress::Discard)?
+        .untracked_files(gix::status::UntrackedFiles::Files)
+        .index_worktree_rewrites(None)
+        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
+    for item in platform.into_iter(Vec::<BString>::new())? {
+        match item? {
+            Item::TreeIndex(change) => match change {
+                TreeChange::Addition { location, .. }
+                | TreeChange::Deletion { location, .. }
+                | TreeChange::Modification { location, .. } => {
+                    paths.insert(location.into_owned());
+                }
+                TreeChange::Rewrite {
+                    source_location,
+                    location,
+                    ..
+                } => {
+                    paths.insert(source_location.into_owned());
+                    paths.insert(location.into_owned());
+                }
+            },
+            Item::IndexWorktree(item) => match &item {
+                WtItem::DirectoryContents { entry, .. } => {
+                    if entry.status == gix::dir::entry::Status::Untracked {
+                        paths.insert(entry.rela_path.clone());
+                    }
+                }
+                WtItem::Modification { rela_path, .. } => {
+                    paths.insert(rela_path.clone());
+                }
+                WtItem::Rewrite {
+                    source,
+                    dirwalk_entry,
+                    ..
+                } => {
+                    paths.insert(source.rela_path().to_owned());
+                    paths.insert(dirwalk_entry.rela_path.clone());
+                }
+            },
+        }
+    }
+    Ok(paths)
+}
+
+/// Add the files that differ between two trees.
+fn tree_paths(
     repo: &gix::Repository,
-    workdir: &Path,
-    base: Option<ObjectId>,
-) -> Result<Vec<FileChange>> {
-    let base_tree = match base {
-        Some(id) => repo.find_commit(id)?.tree()?,
-        None => repo.empty_tree(),
-    };
-
-    let mut paths: BTreeSet<BString> = BTreeSet::new();
-    {
-        use gix::diff::index::Change as TreeChange;
-        use gix::status::Item;
-        use gix::status::index_worktree::Item as WtItem;
-
-        let platform = repo
-            .status(gix::progress::Discard)?
-            .untracked_files(gix::status::UntrackedFiles::Files)
-            .head_tree(base_tree.id)
-            .index_worktree_rewrites(None)
-            .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
-        for item in platform.into_iter(Vec::<BString>::new())? {
-            match item? {
-                Item::TreeIndex(change) => match change {
-                    TreeChange::Addition { location, .. }
-                    | TreeChange::Deletion { location, .. }
-                    | TreeChange::Modification { location, .. } => {
-                        paths.insert(location.into_owned());
-                    }
-                    TreeChange::Rewrite {
-                        source_location,
-                        location,
-                        ..
-                    } => {
-                        paths.insert(source_location.into_owned());
-                        paths.insert(location.into_owned());
-                    }
-                },
-                Item::IndexWorktree(item) => match &item {
-                    WtItem::DirectoryContents { entry, .. } => {
-                        if entry.status == gix::dir::entry::Status::Untracked {
-                            paths.insert(entry.rela_path.clone());
-                        }
-                    }
-                    WtItem::Modification { rela_path, .. } => {
-                        paths.insert(rela_path.clone());
-                    }
-                    WtItem::Rewrite {
-                        source,
-                        dirwalk_entry,
-                        ..
-                    } => {
-                        paths.insert(source.rela_path().to_owned());
-                        paths.insert(dirwalk_entry.rela_path.clone());
-                    }
-                },
+    old: &gix::Tree<'_>,
+    new: &gix::Tree<'_>,
+    out: &mut BTreeSet<BString>,
+) -> Result<()> {
+    use gix::object::tree::diff::ChangeDetached as C;
+    if old.id == new.id {
+        return Ok(());
+    }
+    for change in repo.diff_tree_to_tree(Some(old), Some(new), None)? {
+        match change {
+            C::Addition {
+                location,
+                entry_mode,
+                ..
+            }
+            | C::Deletion {
+                location,
+                entry_mode,
+                ..
+            } => {
+                if entry_mode.is_blob_or_symlink() {
+                    out.insert(location);
+                }
+            }
+            C::Modification {
+                location,
+                entry_mode,
+                previous_entry_mode,
+                ..
+            } => {
+                if entry_mode.is_blob_or_symlink() || previous_entry_mode.is_blob_or_symlink() {
+                    out.insert(location);
+                }
+            }
+            C::Rewrite {
+                source_location,
+                location,
+                entry_mode,
+                ..
+            } => {
+                if entry_mode.is_blob_or_symlink() {
+                    out.insert(source_location);
+                    out.insert(location);
+                }
             }
         }
     }
+    Ok(())
+}
 
+/// The new side of a range.
+enum New<'a> {
+    Worktree(&'a Path),
+    Tree(&'a gix::Tree<'a>),
+}
+
+/// A blob or symlink at `path` in `tree`, with its id.
+fn blob_at(
+    repo: &gix::Repository,
+    tree: &gix::Tree<'_>,
+    path: &BString,
+) -> Result<Option<(ObjectId, Vec<u8>)>> {
+    use gix::objs::tree::EntryKind::*;
+    let Some(entry) = tree.lookup_entry_by_path(gix::path::from_bstr(path.as_bstr()).as_ref())?
+    else {
+        return Ok(None);
+    };
+    Ok(match entry.mode().kind() {
+        Blob | BlobExecutable | Link => {
+            let id = entry.id().detach();
+            Some((id, repo.find_blob(id)?.take_data()))
+        }
+        Tree | Commit => None,
+    })
+}
+
+/// Read both sides of every path and pair exact renames.
+fn collect(
+    repo: &gix::Repository,
+    paths: &BTreeSet<BString>,
+    old_tree: &gix::Tree<'_>,
+    new: &New<'_>,
+) -> Result<Vec<FileChange>> {
     struct Side {
         path: String,
         old: Option<(ObjectId, Vec<u8>)>,
         new: Option<Vec<u8>>,
     }
     let mut entries: Vec<Side> = Vec::new();
-    for path in &paths {
-        let old =
-            match base_tree.lookup_entry_by_path(gix::path::from_bstr(path.as_bstr()).as_ref())? {
-                Some(entry) => {
-                    use gix::objs::tree::EntryKind::*;
-                    match entry.mode().kind() {
-                        Blob | BlobExecutable | Link => {
-                            let id = entry.id().detach();
-                            Some((id, repo.find_blob(id)?.take_data()))
-                        }
-                        Tree | Commit => None,
-                    }
-                }
-                None => None,
-            };
-        let new = read_worktree(&workdir.join(gix::path::from_bstr(path.as_bstr())));
+    for path in paths {
+        let old = blob_at(repo, old_tree, path)?;
+        let new = match new {
+            New::Worktree(workdir) => {
+                read_worktree(&workdir.join(gix::path::from_bstr(path.as_bstr())))
+            }
+            New::Tree(tree) => blob_at(repo, tree, path)?.map(|(_, data)| data),
+        };
         let same = match (&old, &new) {
             (None, None) => true,
             (Some((_, a)), Some(b)) => a == b,
@@ -428,57 +634,89 @@ fn read_worktree(path: &Path) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{branch_with_history, fresh_dir, git};
 
-    fn git(dir: &Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
-            .current_dir(dir)
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "init.defaultBranch=main",
-            ])
-            .args(args)
-            .output()
-            .expect("git runs")
-            .status
-            .success();
-        assert!(ok, "git {args:?}");
+    fn paths(snap: &Snapshot) -> Vec<String> {
+        snap.files
+            .iter()
+            .filter_map(|f| f.new_path.clone().or(f.old_path.clone()))
+            .collect()
     }
 
     #[test]
     fn a_branch_diffs_against_where_it_was_created_including_uncommitted_work() {
-        let dir = std::env::temp_dir().join(format!("codesnob-base-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
+        let dir = fresh_dir("base");
         git(&dir, &["init", "-q"]);
         std::fs::write(dir.join("a.txt"), "a\n").unwrap();
         git(&dir, &["add", "-A"]);
         git(&dir, &["commit", "-q", "-m", "base"]);
-        git(&dir, &["checkout", "-q", "-b", "feature"]);
+        git(&dir, &["checkout", "-q", "-b", "feature", "main"]);
         std::fs::write(dir.join("b.txt"), "b\n").unwrap();
         git(&dir, &["add", "-A"]);
         git(&dir, &["commit", "-q", "-m", "feature work"]);
         std::fs::write(dir.join("a.txt"), "a changed\n").unwrap();
         std::fs::write(dir.join("untracked.txt"), "new\n").unwrap();
 
-        let snap = snapshot(&dir, None).unwrap();
+        let snap = snapshot(&dir, None, &Range::Everything).unwrap();
         assert_eq!(snap.head_label, "feature");
-        assert!(
-            snap.base_label.starts_with("main @ "),
-            "base was {}",
-            snap.base_label
-        );
-        let paths: Vec<_> = snap
-            .files
-            .iter()
-            .filter_map(|f| f.new_path.clone())
-            .collect();
-        assert_eq!(paths, ["a.txt", "b.txt", "untracked.txt"]);
+        assert_eq!(snap.base.name.as_deref(), Some("main"));
+        assert!(snap.base.reason.contains("reflog"), "{}", snap.base.reason);
+        assert_eq!(paths(&snap), ["a.txt", "b.txt", "untracked.txt"]);
+        assert_eq!(snap.commits.len(), 1);
+        assert_eq!(snap.commits[0].subject, "feature work");
+        assert!(snap.dirty);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_range_shows_its_own_files() {
+        let dir = branch_with_history("ranges");
+
+        let all = snapshot(&dir, None, &Range::Everything).unwrap();
+        assert_eq!(
+            paths(&all),
+            ["a.txt", "b.txt", "gone.txt", "new.txt", "src/deep/one.rs"]
+        );
+        let subjects: Vec<_> = all.commits.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["one", "two"], "oldest first");
+
+        let dirty = snapshot(&dir, None, &Range::Uncommitted).unwrap();
+        assert_eq!(paths(&dirty), ["b.txt", "new.txt"]);
+
+        let one = snapshot(&dir, None, &Range::Commit(all.commits[0].id)).unwrap();
+        assert_eq!(
+            paths(&one),
+            ["src/deep/one.rs"],
+            "nested additions are listed"
+        );
+        assert_eq!(all.commits[0].id, one.commit.as_ref().unwrap().id);
+        assert_eq!(
+            one.commit.as_ref().unwrap().message,
+            "one\n\nAdds the first function."
+        );
+
+        let two = snapshot(&dir, None, &Range::Commit(all.commits[1].id)).unwrap();
+        assert_eq!(paths(&two), ["a.txt", "gone.txt"]);
+        assert_eq!(two.commit.as_ref().unwrap().subject, "two");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_clean_branch_is_not_dirty() {
+        let dir = branch_with_history("clean");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "three"]);
+        let snap = snapshot(&dir, None, &Range::Everything).unwrap();
+        assert!(!snap.dirty);
+        assert_eq!(snap.commits.len(), 3);
+        assert!(
+            snapshot(&dir, None, &Range::Uncommitted)
+                .unwrap()
+                .files
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

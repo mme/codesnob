@@ -3,8 +3,11 @@ mod diff;
 mod git;
 mod highlight;
 mod link;
+mod loader;
 mod mcp;
 mod proto;
+#[cfg(test)]
+mod testutil;
 mod ui;
 mod watch;
 mod wm;
@@ -105,7 +108,7 @@ fn main() -> Result<()> {
         if !repo {
             anyhow::bail!("{} is not inside a git repository", dir.display());
         }
-        let snap = git::snapshot(&dir, base.as_deref())?;
+        let snap = git::snapshot(&dir, base.as_deref(), &git::Range::Everything)?;
         return match print_stat(snap, args.context) {
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
             other => other.map_err(Into::into),
@@ -145,7 +148,9 @@ fn print_stat(snap: git::Snapshot, context: usize) -> std::io::Result<()> {
     writeln!(
         out,
         "{} vs {} ({})",
-        snap.head_label, snap.base_label, snap.base_reason
+        snap.head_label,
+        snap.base.name.as_deref().unwrap_or("HEAD"),
+        snap.base.reason
     )?;
     let (mut added, mut removed) = (0, 0);
     for change in snap.files {

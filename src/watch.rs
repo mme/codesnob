@@ -1,9 +1,10 @@
-//! Background refresh: watch the worktree and git directory with inotify,
-//! debounce, re-snapshot off the UI thread, and fall back to polling when
-//! no watcher can be set up.
+//! Change detection: watch the worktree and git directory (inotify on Linux,
+//! FSEvents on macOS), debounce, and tell the UI something changed. Falls back
+//! to polling when no watcher can be set up. Loading happens in `loader`.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,12 +15,17 @@ use crate::git;
 
 pub enum Msg {
     Input(crossterm::event::Event),
-    /// A snapshot from the refresher of generation `generation`; older generations are ignored.
-    Refresh {
-        generation: u64,
-        result: Result<git::Snapshot, String>,
+    /// Files changed under location `loc`.
+    Changed {
+        loc: u64,
     },
-    /// The daemon asks viewers to display this target.
+    /// A load finished. Only the latest `seq` of a location is applied.
+    Loaded {
+        loc: u64,
+        seq: u64,
+        result: Box<Result<git::Snapshot, String>>,
+    },
+    /// The daemon asks this viewer to display a target.
     Show(crate::proto::Target),
     /// Daemon link went up or down.
     Link(bool),
@@ -47,13 +53,23 @@ pub fn spawn_input(tx: Sender<Msg>) {
     });
 }
 
-/// Start the refresh thread. Returns a sender to request a refresh by hand.
-pub fn spawn_refresher(
-    dir: PathBuf,
-    base: Option<String>,
-    tx: Sender<Msg>,
-    generation: u64,
-) -> (Sender<()>, Mode) {
+/// A running watcher. Dropping it stops the thread and its OS watches.
+pub struct Handle {
+    stop: Arc<AtomicBool>,
+    poke: Sender<()>,
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Wake the thread so it sees the flag now rather than at the next event.
+        let _ = self.poke.send(());
+    }
+}
+
+/// Watch `dir`'s repository and send `Msg::Changed { loc }` after each burst
+/// of changes.
+pub fn spawn_watcher(dir: PathBuf, tx: Sender<Msg>, loc: u64) -> (Handle, Mode) {
     let (poke_tx, poke_rx) = channel::<()>();
     let watcher = setup_watcher(&dir, poke_tx.clone());
     let mode = if watcher.is_some() {
@@ -61,8 +77,16 @@ pub fn spawn_refresher(
     } else {
         Mode::Polling
     };
-    std::thread::spawn(move || refresh_loop(dir, base, tx, poke_rx, watcher, generation));
-    (poke_tx, mode)
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    std::thread::spawn(move || watch_loop(dir, tx, poke_rx, watcher, loc, flag));
+    (
+        Handle {
+            stop,
+            poke: poke_tx,
+        },
+        mode,
+    )
 }
 
 /// macOS's FSEvents watches whole trees cheaply but re-creates its stream on
@@ -175,13 +199,13 @@ impl Watch {
     }
 }
 
-fn refresh_loop(
+fn watch_loop(
     dir: PathBuf,
-    base: Option<String>,
     tx: Sender<Msg>,
     poke: Receiver<()>,
     mut watch: Option<Watch>,
-    generation: u64,
+    loc: u64,
+    stop: Arc<AtomicBool>,
 ) {
     loop {
         match watch {
@@ -195,22 +219,21 @@ fn refresh_loop(
                 Err(RecvTimeoutError::Disconnected) => return,
             },
         }
-        // Collapse bursts of events into one refresh.
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        // Collapse bursts of events into one notification.
         while poke.recv_timeout(DEBOUNCE).is_ok() {}
-
-        let snap = git::snapshot(&dir, base.as_deref()).map_err(|e| format!("{e:#}"));
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        // Directories created since the last burst get watched too.
         if let Some(w) = watch.as_mut()
             && let Ok(repo) = gix::discover(&dir)
         {
             w.add_worktree_dirs(&repo);
         }
-        if tx
-            .send(Msg::Refresh {
-                generation,
-                result: snap,
-            })
-            .is_err()
-        {
+        if tx.send(Msg::Changed { loc }).is_err() {
             return;
         }
     }
@@ -256,38 +279,41 @@ mod tests {
         dir
     }
 
-    /// The next refresh within `wait`, skipping input and link messages.
-    fn next_refresh(rx: &Receiver<Msg>, wait: Duration) -> Option<git::Snapshot> {
+    /// Whether a change notification arrives within `wait`.
+    fn changed(rx: &Receiver<Msg>, wait: Duration) -> bool {
         let deadline = Instant::now() + wait;
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             match rx.recv_timeout(left) {
-                Ok(Msg::Refresh { result, .. }) => return Some(result.expect("snapshot")),
+                Ok(Msg::Changed { loc: 7 }) => return true,
                 Ok(_) => continue,
-                Err(_) => return None,
+                Err(_) => return false,
             }
         }
-        None
+        false
+    }
+
+    /// Wait out the tail of a burst.
+    fn quiet(rx: &Receiver<Msg>) {
+        while changed(rx, Duration::from_millis(800)) {}
     }
 
     #[test]
-    fn an_edit_refreshes_and_an_ignored_write_does_not() {
+    fn an_edit_notifies_and_an_ignored_write_does_not() {
         let dir = repo("edit");
         let (tx, rx) = channel();
-        let (_poke, mode) = spawn_refresher(dir.clone(), None, tx, 1);
+        let (_handle, mode) = spawn_watcher(dir.clone(), tx, 7);
         assert!(mode == Mode::Watching, "a native watcher is available");
         // Let the watcher settle before the first change.
         std::thread::sleep(Duration::from_millis(300));
 
         std::fs::write(dir.join("tracked.txt"), "two\n").unwrap();
-        let snap = next_refresh(&rx, Duration::from_secs(10)).expect("an edit triggers a refresh");
-        assert_eq!(snap.files.len(), 1, "the edited file is the diff");
+        assert!(changed(&rx, Duration::from_secs(10)), "an edit notifies");
 
-        // Drain the tail of that burst, then touch only ignored paths.
-        while next_refresh(&rx, Duration::from_millis(800)).is_some() {}
+        quiet(&rx);
         std::fs::write(dir.join("ignored/build.log"), "noise\n").unwrap();
         assert!(
-            next_refresh(&rx, Duration::from_millis(1500)).is_none(),
-            "writes in ignored directories do not refresh"
+            !changed(&rx, Duration::from_millis(1500)),
+            "writes in ignored directories do not notify"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -296,20 +322,36 @@ mod tests {
     fn a_new_directory_is_picked_up() {
         let dir = repo("newdir");
         let (tx, rx) = channel();
-        let (_poke, _) = spawn_refresher(dir.clone(), None, tx, 1);
+        let (_handle, _) = spawn_watcher(dir.clone(), tx, 7);
         std::thread::sleep(Duration::from_millis(300));
 
         std::fs::create_dir(dir.join("src")).unwrap();
-        next_refresh(&rx, Duration::from_secs(10)).expect("creating a directory refreshes");
-        while next_refresh(&rx, Duration::from_millis(800)).is_some() {}
+        assert!(
+            changed(&rx, Duration::from_secs(10)),
+            "creating a directory notifies"
+        );
+        quiet(&rx);
 
         std::fs::write(dir.join("src/lib.rs"), "fn main() {}\n").unwrap();
-        let snap = next_refresh(&rx, Duration::from_secs(10))
-            .expect("a file in the new directory refreshes");
         assert!(
-            snap.files
-                .iter()
-                .any(|f| f.new_path.as_deref() == Some("src/lib.rs"))
+            changed(&rx, Duration::from_secs(10)),
+            "a file in the new directory notifies"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropping_the_handle_stops_notifications() {
+        let dir = repo("drop");
+        let (tx, rx) = channel();
+        let (handle, _) = spawn_watcher(dir.clone(), tx, 7);
+        std::thread::sleep(Duration::from_millis(300));
+        drop(handle);
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(dir.join("tracked.txt"), "after\n").unwrap();
+        assert!(
+            !changed(&rx, Duration::from_millis(1500)),
+            "a stopped watcher is silent"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
