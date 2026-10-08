@@ -99,6 +99,19 @@ pub struct ViewSpec {
     pub highlights: Vec<HighlightSpec>,
 }
 
+/// The most highlights one call can place: ① to ⑳.
+pub const MAX_HIGHLIGHTS: usize = 20;
+
+/// A highlight's number as the viewer shows it: ① to ⑳.
+pub fn circled(n: usize) -> String {
+    match n {
+        1..=MAX_HIGHLIGHTS => char::from_u32(0x2460 + n as u32 - 1)
+            .map(String::from)
+            .unwrap_or_else(|| format!("({n})")),
+        _ => format!("({n})"),
+    }
+}
+
 /// A highlighted line range, 1-based and inclusive, with an optional note.
 /// In a diff the lines are the new side's, or the old side's for a deleted
 /// file.

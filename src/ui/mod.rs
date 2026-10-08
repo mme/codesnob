@@ -182,7 +182,6 @@ struct LocMark {
     start: usize,
     end: usize,
     note: Option<String>,
-    number: usize,
     /// The highlighted lines as first seen; `None` until then.
     text: Option<Vec<String>>,
 }
@@ -193,7 +192,8 @@ impl LocMark {
             path: self.path.clone(),
             start: self.start,
             end: self.end,
-            number: self.number,
+            // Numbered by the view, by where it sits.
+            number: 0,
             note: self.note.clone(),
         }
     }
@@ -232,33 +232,20 @@ fn anchor_mark(m: &mut LocMark, lines: &[String]) -> bool {
     }
 }
 
-/// Follow every highlight to its text; returns the numbers of those gone.
+/// Follow every highlight to its text; returns how many are gone.
 /// Highlights on files `lines_of` does not know stay as they are.
-fn reanchor(
-    marks: &mut Vec<LocMark>,
-    lines_of: &dyn Fn(&str) -> Option<Vec<String>>,
-) -> Vec<usize> {
-    let mut gone = Vec::new();
-    marks.retain_mut(|m| {
-        let Some(lines) = lines_of(&m.path) else {
-            return true;
-        };
-        let kept = anchor_mark(m, &lines);
-        if !kept {
-            gone.push(m.number);
-        }
-        kept
-    });
-    gone
+fn reanchor(marks: &mut Vec<LocMark>, lines_of: &dyn Fn(&str) -> Option<Vec<String>>) -> usize {
+    let before = marks.len();
+    marks.retain_mut(|m| lines_of(&m.path).is_none_or(|lines| anchor_mark(m, &lines)));
+    before - marks.len()
 }
 
-fn gone_message(gone: &[usize]) -> Option<String> {
+fn gone_message(gone: usize) -> Option<String> {
     match gone {
-        [] => None,
-        [n] => Some(format!("highlight {n} no longer matches its code; removed")),
-        many => Some(format!(
-            "{} highlights no longer match their code; removed",
-            many.len()
+        0 => None,
+        1 => Some("a highlight no longer matches its code; removed".to_string()),
+        n => Some(format!(
+            "{n} highlights no longer match their code; removed"
         )),
     }
 }
@@ -1074,7 +1061,7 @@ impl App {
         loc.view.set_built(files);
         loc.view
             .set_marks(loc.marks.iter().map(LocMark::drawn).collect());
-        if current && let Some(text) = gone_message(&gone) {
+        if current && let Some(text) = gone_message(gone) {
             self.message = Some(text);
         }
         loc.view.target = spec
@@ -1190,7 +1177,7 @@ impl App {
         });
         loc.view
             .set_marks(loc.marks.iter().map(LocMark::drawn).collect());
-        if current && let Some(text) = gone_message(&gone) {
+        if current && let Some(text) = gone_message(gone) {
             self.message = Some(text);
         }
         if !narrow_view(&mut loc.view, &loc.focus) {
@@ -1553,13 +1540,12 @@ impl App {
         let marks: Vec<LocMark> = view
             .highlights
             .iter()
-            .enumerate()
-            .map(|(i, h)| LocMark {
+            .take(crate::proto::MAX_HIGHLIGHTS)
+            .map(|h| LocMark {
                 path: h.path.clone(),
                 start: h.start,
                 end: h.end,
                 note: h.note.clone(),
-                number: i + 1,
                 text: None,
             })
             .collect();

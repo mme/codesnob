@@ -1776,7 +1776,7 @@ fn highlights_follow_their_code_and_go_when_it_does() {
     assert!(h.app.cur().unwrap().marks.is_empty());
     assert!(
         h.status()
-            .contains("highlight 1 no longer matches its code; removed"),
+            .contains("a highlight no longer matches its code; removed"),
         "{}",
         h.status()
     );
@@ -1810,36 +1810,64 @@ fn angle_brackets_move_between_hunks_without_highlights() {
 }
 
 #[test]
-fn highlights_go_by_their_numbers_not_their_place_in_the_file() {
+fn highlights_are_numbered_by_where_they_sit_not_the_order_given() {
     let dir = repo_with_long_file("ui-marks-order");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    // ① is further down the file than ②.
+    // Given out of order; numbered top to bottom.
     spec.highlights = vec![
-        hl("src/long.rs", 45, 45, Some("first")),
-        hl("src/long.rs", 10, 11, Some("second")),
-        hl("src/long.rs", 30, 30, Some("third")),
+        hl("src/long.rs", 45, 45, Some("lowest")),
+        hl("src/long.rs", 10, 11, Some("highest")),
+        hl("src/long.rs", 30, 30, Some("middle")),
     ];
     h.app.show_view(target(&dir), spec);
     h.settle();
     let at_top = |h: &mut Harness| h.screen().lines().nth(1).unwrap_or("").to_string();
     assert!(
-        at_top(&mut h).contains("① first"),
+        at_top(&mut h).contains("① highest"),
         "opens at ①: {}",
         at_top(&mut h)
     );
     h.keys(">");
-    assert!(at_top(&mut h).contains("② second"), "{}", at_top(&mut h));
+    assert!(at_top(&mut h).contains("② middle"), "{}", at_top(&mut h));
     h.keys(">");
-    assert!(at_top(&mut h).contains("③ third"), "{}", at_top(&mut h));
+    assert!(at_top(&mut h).contains("③ lowest"), "{}", at_top(&mut h));
     h.keys(">");
-    assert!(at_top(&mut h).contains("③ third"), "stays on the last");
+    assert!(at_top(&mut h).contains("③ lowest"), "stays on the last");
     h.keys("jjj<");
     assert!(
-        at_top(&mut h).contains("② second"),
+        at_top(&mut h).contains("② middle"),
         "scrolling does not change the order: {}",
         at_top(&mut h)
     );
     assert!(h.status().contains("highlight 2 of 3"), "{}", h.status());
+    cleanup(dir);
+}
+
+#[test]
+fn highlights_across_files_go_in_the_order_the_files_are_shown() {
+    let dir = repo_with_long_file("ui-marks-files");
+    let mut h = Harness::open(&dir);
+    // Listed long.rs first, so its highlights come first though its path sorts last.
+    let mut spec = code(None, &[("src/long.rs", None), ("src/deep/one.rs", None)]);
+    spec.highlights = vec![
+        hl("src/deep/one.rs", 1, 1, Some("in one")),
+        hl("src/long.rs", 50, 50, Some("long low")),
+        hl("src/long.rs", 5, 5, Some("long high")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    // Excerpts: all three are on screen, top to bottom in number order.
+    let screen = h.screen();
+    let row = |want: &str| {
+        screen
+            .lines()
+            .position(|l| l.contains(want))
+            .unwrap_or_else(|| panic!("{want} on screen:\n{screen}"))
+    };
+    assert!(row("① long high") < row("② long low"), "{screen}");
+    assert!(row("② long low") < row("③ in one"), "{screen}");
+    h.keys(">>");
+    assert!(h.status().contains("highlight 3 of 3"), "{}", h.status());
     cleanup(dir);
 }

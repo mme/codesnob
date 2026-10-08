@@ -94,7 +94,19 @@ impl DiffView {
     }
 
     /// Replace the highlights, keeping the line in view.
-    pub fn set_marks(&mut self, marks: Vec<Mark>) {
+    /// Highlights are numbered by where they sit: in the order the files are
+    /// shown, then by line.
+    pub fn set_marks(&mut self, mut marks: Vec<Mark>) {
+        let at = |path: &str| {
+            self.files
+                .iter()
+                .position(|f| f.path == path)
+                .unwrap_or(usize::MAX)
+        };
+        marks.sort_by_key(|m| (at(&m.path), m.start, m.end));
+        for (i, m) in marks.iter_mut().enumerate() {
+            m.number = i + 1;
+        }
         if self.marks != marks {
             let anchor = self.anchor();
             // The same highlights after a reload keep their place in order.
@@ -510,7 +522,7 @@ impl DiffView {
                 let tint = Style::default().bg(p.mark_bg);
                 buf.set_style(area, tint);
                 let mut spans = vec![Span::styled(
-                    format!("  {} ", numbered(mark.number)),
+                    format!("  {} ", crate::proto::circled(mark.number)),
                     tint.fg(p.mark_fg).add_modifier(Modifier::BOLD),
                 )];
                 if let Some(note) = &mark.note {
@@ -748,15 +760,5 @@ fn line_no(f: &FileDiff, line: &crate::diff::DiffLine) -> Option<usize> {
     match f.status {
         Status::Deleted => line.old_no,
         _ => line.new_no,
-    }
-}
-
-/// ① to ⑳, then (21) and on.
-fn numbered(n: usize) -> String {
-    match n {
-        1..=20 => char::from_u32(0x2460 + n as u32 - 1)
-            .map(String::from)
-            .unwrap_or_else(|| format!("({n})")),
-        _ => format!("({n})"),
     }
 }
