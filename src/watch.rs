@@ -34,6 +34,11 @@ pub enum Msg {
         loc: u64,
         mode: Mode,
     },
+    /// Progress checking out a PR for location `loc`.
+    Pr {
+        loc: u64,
+        progress: Box<crate::pr::Progress>,
+    },
 }
 
 const DEBOUNCE: Duration = Duration::from_millis(150);

@@ -10,6 +10,7 @@ pub enum Action {
     SwitchLocation(u64),
     PreviousLocation,
     CloseLocation,
+    PrunePrs,
     Commits,
     OlderCommit,
     NewerCommit,
@@ -110,6 +111,11 @@ pub const COMMANDS: &[Command] = &[
     Command {
         action: Action::CloseLocation,
         name: "Close location",
+        keys: "",
+    },
+    Command {
+        action: Action::PrunePrs,
+        name: "Remove PR checkouts",
         keys: "",
     },
     Command {
