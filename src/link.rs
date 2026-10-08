@@ -47,7 +47,12 @@ impl Link {
             position: None,
             target: None,
         };
-        Self { inner: Arc::new(Mutex::new(Inner { entry, writer: None })) }
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                entry,
+                writer: None,
+            })),
+        }
     }
 
     pub fn set_target(&self, target: Target) {
@@ -76,8 +81,13 @@ impl Link {
 
 impl Inner {
     fn send(&mut self, method: Method) {
-        let Some(w) = self.writer.as_mut() else { return };
-        let line = to_line(&Request { id: "v".to_string(), method });
+        let Some(w) = self.writer.as_mut() else {
+            return;
+        };
+        let line = to_line(&Request {
+            id: "v".to_string(),
+            method,
+        });
         if w.write_all(line.as_bytes()).is_err() {
             self.writer = None;
         }
@@ -90,7 +100,9 @@ pub fn spawn(tx: Sender<Msg>, link: Link) {
     std::thread::spawn(move || {
         let Some(platform) = wm::detect() else { return };
         let name = platform.name();
-        platform.track(std::process::id(), &mut |window| tracker.set_window(window, name));
+        platform.track(std::process::id(), &mut |window| {
+            tracker.set_window(window, name)
+        });
     });
 
     std::thread::spawn(move || {
@@ -131,18 +143,26 @@ fn session(tx: &Sender<Msg>, link: &Link) -> Result<(), String> {
         if n == 0 {
             return Err("daemon closed".to_string());
         }
-        if let Ok(ServerFrame::Event(Event::Show { viewer, target })) = ServerFrame::parse(&line) {
-            if viewer == my_id {
-                tx.send(Msg::Show(target)).map_err(|_| "ui gone")?;
-            }
+        if let Ok(ServerFrame::Event(Event::Show { viewer, target })) = ServerFrame::parse(&line)
+            && viewer == my_id
+        {
+            tx.send(Msg::Show(target)).map_err(|_| "ui gone")?;
         }
     }
 }
 
 /// Ask the daemon to display `dir`, preferring a viewer on our workspace.
-pub fn request_show(client: &mut proto::Client, dir: PathBuf, base: Option<String>) -> Result<proto::ShowResult, String> {
+pub fn request_show(
+    client: &mut proto::Client,
+    dir: PathBuf,
+    base: Option<String>,
+) -> Result<proto::ShowResult, String> {
     let workspace = wm::own_workspace();
-    let v = client.call(Method::Show { dir, base, workspace })?;
+    let v = client.call(Method::Show {
+        dir,
+        base,
+        workspace,
+    })?;
     serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
@@ -150,13 +170,17 @@ pub fn describe(r: &proto::ShowResult) -> String {
     let ws = r.workspace.as_deref().unwrap_or("unknown workspace");
     match r.picked_by.as_str() {
         "same" => format!("shown in viewer {} on your workspace {ws}", r.viewer),
-        "nearest" => format!("shown in viewer {} on workspace {ws}, the nearest to yours", r.viewer),
+        "nearest" => format!(
+            "shown in viewer {} on workspace {ws}, the nearest to yours",
+            r.viewer
+        ),
         _ => format!("shown in viewer {} (workspace {ws})", r.viewer),
     }
 }
 
 fn one_shot() -> Result<proto::Client, String> {
-    let stream = proto::connect_or_spawn().ok_or("could not reach or start the codesnob daemon")?;
+    let stream =
+        proto::connect_or_spawn().ok_or("could not reach or start the codesnob daemon")?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let mut client = proto::Client::new(stream, "c").map_err(|e| e.to_string())?;
     client.hello()?;
@@ -172,7 +196,10 @@ pub fn show(dir: PathBuf, base: Option<String>) -> Result<(), String> {
     let mut client = one_shot()?;
     let r = request_show(&mut client, dir.clone(), base)?;
     if !r.repo {
-        eprintln!("codesnob: {} is not inside a git repository", dir.display());
+        eprintln!(
+            "codesnob: {} is not inside a git repository",
+            dir.display()
+        );
     }
     println!("{}", describe(&r));
     Ok(())
@@ -183,7 +210,10 @@ pub fn status(json: bool) -> Result<(), String> {
     let mut client = one_shot()?;
     let v = client.call(Method::Status)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
     let st: proto::StatusResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
@@ -191,8 +221,15 @@ pub fn status(json: bool) -> Result<(), String> {
         Some(t) => println!(
             "target: {}{}{}",
             t.dir.display(),
-            t.base.as_ref().map(|b| format!(" (base {b})")).unwrap_or_default(),
-            if t.repo { "" } else { "  [not a git repository]" }
+            t.base
+                .as_ref()
+                .map(|b| format!(" (base {b})"))
+                .unwrap_or_default(),
+            if t.repo {
+                ""
+            } else {
+                "  [not a git repository]"
+            }
         ),
         None => println!("target: none"),
     }
@@ -207,7 +244,10 @@ pub fn status(json: bool) -> Result<(), String> {
                 v.pid,
                 v.workspace.as_deref().unwrap_or("-"),
                 v.window.as_deref().unwrap_or("-"),
-                v.target.as_ref().map(|t| t.dir.display().to_string()).unwrap_or_default(),
+                v.target
+                    .as_ref()
+                    .map(|t| t.dir.display().to_string())
+                    .unwrap_or_default(),
             );
         }
     }

@@ -110,7 +110,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(opts: Options, palette: Palette, hl: Highlighter, tx: Sender<Msg>, link: Link) -> Self {
+    pub fn new(
+        opts: Options,
+        palette: Palette,
+        hl: Highlighter,
+        tx: Sender<Msg>,
+        link: Link,
+    ) -> Self {
         let (refresh, _) = std::sync::mpsc::channel();
         Self {
             opts,
@@ -157,12 +163,21 @@ impl App {
         self.refresh = dummy;
         self.mode = Mode::Off;
 
-        let snap = if target.repo { git::snapshot(&target.dir, target.base.as_deref()) } else { Err(anyhow::anyhow!("not a repository")) };
+        let snap = if target.repo {
+            git::snapshot(&target.dir, target.base.as_deref())
+        } else {
+            Err(anyhow::anyhow!("not a repository"))
+        };
         match snap {
             Ok(snap) => {
                 self.idle = false;
                 self.load(snap);
-                let (refresh, mode) = watch::spawn_refresher(target.dir.clone(), target.base.clone(), self.tx.clone(), self.generation);
+                let (refresh, mode) = watch::spawn_refresher(
+                    target.dir.clone(),
+                    target.base.clone(),
+                    self.tx.clone(),
+                    self.generation,
+                );
                 self.refresh = refresh;
                 self.mode = mode;
             }
@@ -171,7 +186,11 @@ impl App {
                 self.load(git::Snapshot {
                     head_label: "no repository".to_string(),
                     base_label: target.dir.display().to_string(),
-                    base_reason: if target.repo { format!("{e:#}") } else { "not inside a git repository".to_string() },
+                    base_reason: if target.repo {
+                        format!("{e:#}")
+                    } else {
+                        "not inside a git repository".to_string()
+                    },
                     files: Vec::new(),
                 });
             }
@@ -185,7 +204,10 @@ impl App {
     }
 
     pub fn summary(&self) -> String {
-        format!("{} → {} ({})", self.head_label, self.base_label, self.base_reason)
+        format!(
+            "{} → {} ({})",
+            self.head_label, self.base_label, self.base_reason
+        )
     }
 
     fn mode_label(&self) -> String {
@@ -194,7 +216,11 @@ impl App {
             Mode::Polling => "auto-refresh by polling every 2s",
             Mode::Off => "auto-refresh off",
         };
-        let link = if self.linked { "daemon connected" } else { "daemon not connected" };
+        let link = if self.linked {
+            "daemon connected"
+        } else {
+            "daemon not connected"
+        };
         format!("{refresh} · {link}")
     }
 
@@ -203,7 +229,11 @@ impl App {
         self.head_label = snap.head_label;
         self.base_label = snap.base_label;
         self.base_reason = snap.base_reason;
-        self.files = snap.files.into_iter().map(|c| diff::build(c, self.opts.context)).collect();
+        self.files = snap
+            .files
+            .into_iter()
+            .map(|c| diff::build(c, self.opts.context))
+            .collect();
         self.hl.clear();
         self.build_rows();
     }
@@ -278,11 +308,22 @@ impl App {
             }
             Row::Hunk(fi, hi) => {
                 let h = &self.files[*fi].hunks[*hi];
-                (Some(if h.new_count > 0 { (1, h.new_start) } else { (0, h.old_start) }), true)
+                (
+                    Some(if h.new_count > 0 {
+                        (1, h.new_start)
+                    } else {
+                        (0, h.old_start)
+                    }),
+                    true,
+                )
             }
             _ => (None, false),
         };
-        Some(Anchor { path, line, at_hunk })
+        Some(Anchor {
+            path,
+            line,
+            at_hunk,
+        })
     }
 
     fn restore(&mut self, a: Anchor) {
@@ -291,7 +332,11 @@ impl App {
             return;
         };
         let start = self.file_starts[fi];
-        let end = self.file_starts.get(fi + 1).copied().unwrap_or(self.rows.len());
+        let end = self
+            .file_starts
+            .get(fi + 1)
+            .copied()
+            .unwrap_or(self.rows.len());
         let mut best: Option<(usize, usize)> = None; // (distance, row)
         if let Some((side, target)) = a.line {
             for (idx, row) in self.rows[start..end].iter().enumerate() {
@@ -399,14 +444,16 @@ impl App {
         }
 
         match (k.code, ctrl, alt) {
-            (KeyCode::Char('c'), true, _) | (KeyCode::Char('q'), _, _) | (KeyCode::Esc, _, _) => self.quit = true,
+            (KeyCode::Char('c'), true, _) | (KeyCode::Char('q'), _, _) | (KeyCode::Esc, _, _) => {
+                self.quit = true
+            }
 
-            (KeyCode::Down, _, _) | (KeyCode::Char('j'), false, false) | (KeyCode::Char('n'), true, false) => {
-                self.scroll_by(1)
-            }
-            (KeyCode::Up, _, _) | (KeyCode::Char('k'), false, false) | (KeyCode::Char('p'), true, false) => {
-                self.scroll_by(-1)
-            }
+            (KeyCode::Down, _, _)
+            | (KeyCode::Char('j'), false, false)
+            | (KeyCode::Char('n'), true, false) => self.scroll_by(1),
+            (KeyCode::Up, _, _)
+            | (KeyCode::Char('k'), false, false)
+            | (KeyCode::Char('p'), true, false) => self.scroll_by(-1),
             (KeyCode::PageDown, _, _)
             | (KeyCode::Char(' '), false, false)
             | (KeyCode::Char('f'), false, false)
@@ -418,31 +465,35 @@ impl App {
             (KeyCode::Char('d'), true, false) => self.scroll_by(half),
             (KeyCode::Char('u'), true, false) => self.scroll_by(-half),
 
-            (KeyCode::Home, _, _) | (KeyCode::Char('g'), false, false) | (KeyCode::Char('<'), false, true) => {
-                self.scroll = 0
-            }
-            (KeyCode::End, _, _) | (KeyCode::Char('G'), false, false) | (KeyCode::Char('>'), false, true) => {
-                self.scroll = self.end_scroll()
-            }
+            (KeyCode::Home, _, _)
+            | (KeyCode::Char('g'), false, false)
+            | (KeyCode::Char('<'), false, true) => self.scroll = 0,
+            (KeyCode::End, _, _)
+            | (KeyCode::Char('G'), false, false)
+            | (KeyCode::Char('>'), false, true) => self.scroll = self.end_scroll(),
 
-            (KeyCode::Char('n'), false, false) | (KeyCode::Char(']'), false, false) | (KeyCode::Enter, _, _) => {
-                self.jump_next(&hunk_starts)
+            (KeyCode::Char('n'), false, false)
+            | (KeyCode::Char(']'), false, false)
+            | (KeyCode::Enter, _, _) => self.jump_next(&hunk_starts),
+            (KeyCode::Char('p'), false, false) | (KeyCode::Char('['), false, false) => {
+                self.jump_prev(&hunk_starts)
             }
-            (KeyCode::Char('p'), false, false) | (KeyCode::Char('['), false, false) => self.jump_prev(&hunk_starts),
-            (KeyCode::Char('N'), false, false) | (KeyCode::Char('}'), false, false) | (KeyCode::Tab, _, _) => {
-                self.jump_next(&file_starts)
-            }
-            (KeyCode::Char('P'), false, false) | (KeyCode::Char('{'), false, false) | (KeyCode::BackTab, _, _) => {
-                self.jump_prev(&file_starts)
-            }
+            (KeyCode::Char('N'), false, false)
+            | (KeyCode::Char('}'), false, false)
+            | (KeyCode::Tab, _, _) => self.jump_next(&file_starts),
+            (KeyCode::Char('P'), false, false)
+            | (KeyCode::Char('{'), false, false)
+            | (KeyCode::BackTab, _, _) => self.jump_prev(&file_starts),
 
-            (KeyCode::Right, _, _) | (KeyCode::Char('f'), true, false) | (KeyCode::Char('l'), false, false) => {
-                self.hscroll += 8
+            (KeyCode::Right, _, _)
+            | (KeyCode::Char('f'), true, false)
+            | (KeyCode::Char('l'), false, false) => self.hscroll += 8,
+            (KeyCode::Left, _, _)
+            | (KeyCode::Char('b'), true, false)
+            | (KeyCode::Char('h'), false, false) => self.hscroll = self.hscroll.saturating_sub(8),
+            (KeyCode::Char('0'), false, false) | (KeyCode::Char('a'), true, false) => {
+                self.hscroll = 0
             }
-            (KeyCode::Left, _, _) | (KeyCode::Char('b'), true, false) | (KeyCode::Char('h'), false, false) => {
-                self.hscroll = self.hscroll.saturating_sub(8)
-            }
-            (KeyCode::Char('0'), false, false) | (KeyCode::Char('a'), true, false) => self.hscroll = 0,
 
             (KeyCode::Char('r'), false, false) | (KeyCode::F(5), _, _) => self.request_reload(),
             (KeyCode::Char('?'), _, _) => self.show_help = true,
@@ -467,27 +518,38 @@ impl App {
         let mut idx = self.scroll;
 
         // Sticky header unless the real header is the first visible row.
-        if let Some(fi) = self.current_file() {
-            if !matches!(self.rows.get(self.scroll), Some(Row::File(_))) {
-                self.render_file_header(fi, Rect::new(body.x, y, body.width, 1), buf);
-                y += 1;
-            }
+        if let Some(fi) = self.current_file()
+            && !matches!(self.rows.get(self.scroll), Some(Row::File(_)))
+        {
+            self.render_file_header(fi, Rect::new(body.x, y, body.width, 1), buf);
+            y += 1;
         }
         while y < body.bottom() {
-            let Some(&row) = self.rows.get(idx) else { break };
+            let Some(&row) = self.rows.get(idx) else {
+                break;
+            };
             self.render_row(row, Rect::new(body.x, y, body.width, 1), buf);
             y += 1;
             idx += 1;
         }
         if self.rows.is_empty() {
             let lines: Vec<String> = if self.idle {
-                vec!["not inside a git repository".to_string(), self.base_label.clone()]
+                vec![
+                    "not inside a git repository".to_string(),
+                    self.base_label.clone(),
+                ]
             } else {
-                vec![format!("no changes between {} and {}", self.head_label, self.base_label)]
+                vec![format!(
+                    "no changes between {} and {}",
+                    self.head_label, self.base_label
+                )]
             };
             let top = body.y + (body.height.saturating_sub(lines.len() as u16)) / 2;
             for (i, text) in lines.iter().enumerate() {
-                let line = Line::from(Span::styled(text.clone(), Style::default().fg(self.palette.note_fg)));
+                let line = Line::from(Span::styled(
+                    text.clone(),
+                    Style::default().fg(self.palette.note_fg),
+                ));
                 let w = (line.width() as u16).min(body.width);
                 buf.set_line(body.x + (body.width - w) / 2, top + i as u16, &line, w);
             }
@@ -504,7 +566,10 @@ impl App {
             Row::Blank => {}
             Row::File(fi) => self.render_file_header(fi, area, buf),
             Row::Note(text) => {
-                let line = Line::from(Span::styled(format!("  {text}"), Style::default().fg(self.palette.note_fg)));
+                let line = Line::from(Span::styled(
+                    format!("  {text}"),
+                    Style::default().fg(self.palette.note_fg),
+                ));
                 buf.set_line(area.x, area.y, &line, area.width);
             }
             Row::Hunk(fi, hi) => {
@@ -517,7 +582,10 @@ impl App {
                     text.push(' ');
                     text.push_str(f);
                 }
-                let line = Line::from(Span::styled(text, Style::default().fg(self.palette.hunk_fg)));
+                let line = Line::from(Span::styled(
+                    text,
+                    Style::default().fg(self.palette.hunk_fg),
+                ));
                 buf.set_line(area.x, area.y, &line, area.width);
             }
             Row::Line(fi, hi, li) => self.render_line(fi, hi, li, area, buf),
@@ -534,14 +602,23 @@ impl App {
         };
         let base = Style::default().bg(self.palette.header_bg);
         let mut spans = vec![
-            Span::styled(format!(" {tag} "), base.fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {tag} "),
+                base.fg(color).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(f.display_path(), base.add_modifier(Modifier::BOLD)),
         ];
         if f.binary {
             spans.push(Span::styled("  binary", base.fg(self.palette.note_fg)));
         } else {
-            spans.push(Span::styled(format!("  +{}", f.added), base.fg(Color::Green)));
-            spans.push(Span::styled(format!(" −{}", f.removed), base.fg(Color::Red)));
+            spans.push(Span::styled(
+                format!("  +{}", f.added),
+                base.fg(Color::Green),
+            ));
+            spans.push(Span::styled(
+                format!(" −{}", f.removed),
+                base.fg(Color::Red),
+            ));
         }
         let pos = Span::styled(
             format!(" {}/{} ", fi + 1, self.files.len()),
@@ -586,7 +663,10 @@ impl App {
         };
         let mut spans = vec![
             Span::styled(gutter, row_style.fg(p.gutter_fg)),
-            Span::styled(format!("{marker} "), marker_style.add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{marker} "),
+                marker_style.add_modifier(Modifier::BOLD),
+            ),
         ];
 
         // Syntax spans for the line's source file side.
@@ -597,8 +677,16 @@ impl App {
         };
         let syntax: Vec<(Style, usize, usize)> = {
             let f = &self.files[fi];
-            let src = if side == 0 { &f.old_lines } else { &f.new_lines };
-            self.hl.lines((fi, side), &path, src).get(src_idx).cloned().unwrap_or_default()
+            let src = if side == 0 {
+                &f.old_lines
+            } else {
+                &f.new_lines
+            };
+            self.hl
+                .lines((fi, side), &path, src)
+                .get(src_idx)
+                .cloned()
+                .unwrap_or_default()
         };
         let l = &self.files[fi].hunks[hi].lines[li];
         let text = &l.text;
@@ -628,7 +716,11 @@ impl App {
                     skip -= n;
                     continue;
                 }
-                let off = seg.char_indices().nth(skip).map(|(i, _)| i).unwrap_or(seg.len());
+                let off = seg
+                    .char_indices()
+                    .nth(skip)
+                    .map(|(i, _)| i)
+                    .unwrap_or(seg.len());
                 seg = &seg[off..];
                 skip = 0;
             }
@@ -654,12 +746,18 @@ impl App {
         buf.set_style(area, style);
         let left = match &self.message {
             Some(m) => format!(" {m}"),
-            None => format!(" {}  vs  {}  ·  {}", self.head_label, self.base_label, self.base_reason),
+            None => format!(
+                " {}  vs  {}  ·  {}",
+                self.head_label, self.base_label, self.base_reason
+            ),
         };
-        let (added, removed) = self.files.iter().fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
+        let (added, removed) = self
+            .files
+            .iter()
+            .fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
         let pos = self.current_file().map(|i| i + 1).unwrap_or(0);
         let end = self.end_scroll();
-        let pct = if end == 0 { 100 } else { (self.scroll.min(end) * 100) / end };
+        let pct = (self.scroll.min(end) * 100).checked_div(end).unwrap_or(100);
         let right = format!(
             " {} files  +{added} −{removed}  ·  {pos}/{}  {pct:>3}%  ·  ? help ",
             self.files.len(),
@@ -691,10 +789,20 @@ impl App {
             ("?", "this help"),
             ("q  Esc  C-c", "quit"),
         ];
-        let key_w = ROWS.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
-        let desc_w = ROWS.iter().map(|(_, d)| d.chars().count()).max().unwrap_or(0);
+        let key_w = ROWS
+            .iter()
+            .map(|(k, _)| k.chars().count())
+            .max()
+            .unwrap_or(0);
+        let desc_w = ROWS
+            .iter()
+            .map(|(_, d)| d.chars().count())
+            .max()
+            .unwrap_or(0);
 
-        let key_style = Style::default().fg(self.palette.hunk_fg).add_modifier(Modifier::BOLD);
+        let key_style = Style::default()
+            .fg(self.palette.hunk_fg)
+            .add_modifier(Modifier::BOLD);
         let title_style = Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
         let dim = Style::default().fg(self.palette.note_fg);
 
@@ -715,8 +823,14 @@ impl App {
             }
         }
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled(format!("  {}", self.summary()), dim)));
-        lines.push(Line::from(Span::styled(format!("  {}", self.mode_label()), dim)));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", self.summary()),
+            dim,
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", self.mode_label()),
+            dim,
+        )));
         lines.push(Line::default());
 
         let inner_w = (2 + key_w + 3 + desc_w + 2).max(self.summary().chars().count() + 4) as u16;
@@ -734,8 +848,13 @@ impl App {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(dim)
-                    .title(Line::from(Span::styled(" codesnob ", Style::default().add_modifier(Modifier::BOLD))))
-                    .title_bottom(Line::from(Span::styled(" any key to close ", dim)).right_aligned()),
+                    .title(Line::from(Span::styled(
+                        " codesnob ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )))
+                    .title_bottom(
+                        Line::from(Span::styled(" any key to close ", dim)).right_aligned(),
+                    ),
             )
             .render(rect, buf);
     }

@@ -2,6 +2,9 @@
 name = "codesnob"
 version = "0.1.0"
 edition = "2024"
+description = "Fast terminal diff viewer: what changed since the branch point"
+license = "Apache-2.0"
+repository = "https://github.com/mme/codesnob"
 
 [dependencies]
 anyhow = "1"
@@ -10,7 +13,8 @@ crossterm = "0.29"
 gix = { version = "0.88", default-features = false, features = ["sha1", "max-performance-safe", "status", "revision", "blob-diff", "excludes"] }
 imara-diff = "0.2"
 libc = "0.2.190"
-notify = { version = "8", default-features = false }
+# FSEvents on macOS; without it notify falls back to 30-second polling there.
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "layout-cache", "underline-color"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

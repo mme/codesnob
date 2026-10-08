@@ -17,7 +17,11 @@ const MAX_SOCKET_PATH: usize = 100;
 // ---- paths ------------------------------------------------------------------
 
 fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) { "codesnob-dev" } else { "codesnob" }
+    if cfg!(debug_assertions) {
+        "codesnob-dev"
+    } else {
+        "codesnob"
+    }
 }
 
 fn short_runtime_dir() -> PathBuf {
@@ -102,7 +106,10 @@ pub struct ViewerEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Method {
-    Hello { protocol: u32, version: String },
+    Hello {
+        protocol: u32,
+        version: String,
+    },
     /// Display `dir` in one viewer: the first on `workspace`, else the
     /// nearest workspace, else the first viewer. Errors when none is connected.
     Show {
@@ -170,10 +177,15 @@ pub struct StatusResult {
 #[serde(tag = "event", content = "params", rename_all = "snake_case")]
 pub enum Event {
     /// Addressed to one viewer; others ignore it.
-    Show { viewer: String, target: Target },
+    Show {
+        viewer: String,
+        target: Target,
+    },
     ViewerConnected(ViewerEntry),
     ViewerUpdated(ViewerEntry),
-    ViewerDisconnected { id: String },
+    ViewerDisconnected {
+        id: String,
+    },
 }
 
 pub enum ServerFrame {
@@ -241,7 +253,12 @@ pub struct Client {
 impl Client {
     pub fn new(stream: UnixStream, id_prefix: &'static str) -> std::io::Result<Self> {
         let reader = BufReader::new(stream.try_clone()?);
-        Ok(Self { writer: stream, reader, next_id: 1, id_prefix })
+        Ok(Self {
+            writer: stream,
+            reader,
+            next_id: 1,
+            id_prefix,
+        })
     }
 
     pub fn into_parts(self) -> (UnixStream, BufReader<UnixStream>) {
@@ -251,11 +268,19 @@ impl Client {
     pub fn call(&mut self, method: Method) -> Result<Value, String> {
         let id = format!("{}{}", self.id_prefix, self.next_id);
         self.next_id += 1;
-        let req = Request { id: id.clone(), method };
-        self.writer.write_all(to_line(&req).as_bytes()).map_err(|e| e.to_string())?;
+        let req = Request {
+            id: id.clone(),
+            method,
+        };
+        self.writer
+            .write_all(to_line(&req).as_bytes())
+            .map_err(|e| e.to_string())?;
         loop {
             let mut line = String::new();
-            let n = self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
+            let n = self
+                .reader
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?;
             if n == 0 {
                 return Err("daemon closed the connection".to_string());
             }
@@ -276,7 +301,10 @@ impl Client {
     }
 
     pub fn hello(&mut self) -> Result<HelloResult, String> {
-        let v = self.call(Method::Hello { protocol: PROTOCOL_VERSION, version: VERSION.to_string() })?;
+        let v = self.call(Method::Hello {
+            protocol: PROTOCOL_VERSION,
+            version: VERSION.to_string(),
+        })?;
         serde_json::from_value(v).map_err(|e| e.to_string())
     }
 }

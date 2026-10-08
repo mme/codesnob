@@ -23,7 +23,11 @@ pub fn serve() -> Result<()> {
         let msg: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                reply(&mut out, Value::Null, Err((-32700, format!("parse error: {e}"))))?;
+                reply(
+                    &mut out,
+                    Value::Null,
+                    Err((-32700, format!("parse error: {e}"))),
+                )?;
                 continue;
             }
         };
@@ -48,7 +52,9 @@ pub fn serve() -> Result<()> {
 fn reply(out: &mut impl Write, id: Value, result: Result<Value, (i64, String)>) -> Result<()> {
     let msg = match result {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err((code, message)) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
+        Err((code, message)) => {
+            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+        }
     };
     serde_json::to_writer(&mut *out, &msg)?;
     out.write_all(b"\n")?;
@@ -57,8 +63,15 @@ fn reply(out: &mut impl Write, id: Value, result: Result<Value, (i64, String)>) 
 }
 
 fn initialize(params: &Value) -> Value {
-    let requested = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
-    let version = if SUPPORTED.contains(&requested) { requested } else { SUPPORTED[0] };
+    let requested = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let version = if SUPPORTED.contains(&requested) {
+        requested
+    } else {
+        SUPPORTED[0]
+    };
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": {} },
@@ -99,17 +112,28 @@ fn tool_result(r: Result<String, String>) -> Value {
 }
 
 fn show_diff(args: &Value) -> Result<String, String> {
-    let path = args.get("path").and_then(Value::as_str).ok_or("missing required argument: path")?;
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or("missing required argument: path")?;
     let base = args.get("base").and_then(Value::as_str).map(str::to_owned);
     let dir = std::fs::canonicalize(path).map_err(|e| format!("{path}: {e}"))?;
     let mut client = link::connect()?;
-    let r = link::request_show(&mut client, PathBuf::from(&dir), base).map_err(|e| match e.as_str() {
-        "no codesnob viewer is connected" => "no codesnob viewer is running; ask the user to open one with `codesnob`".to_string(),
-        _ => e,
+    let r = link::request_show(&mut client, PathBuf::from(&dir), base).map_err(|e| {
+        match e.as_str() {
+            "no codesnob viewer is connected" => {
+                "no codesnob viewer is running; ask the user to open one with `codesnob`"
+                    .to_string()
+            }
+            _ => e,
+        }
     })?;
     let mut text = link::describe(&r);
     if !r.repo {
-        text.push_str(&format!("; note: {} is not inside a git repository, the viewer shows a notice instead", dir.display()));
+        text.push_str(&format!(
+            "; note: {} is not inside a git repository, the viewer shows a notice instead",
+            dir.display()
+        ));
     }
     Ok(text)
 }

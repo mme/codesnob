@@ -70,7 +70,9 @@ pub fn ancestry(pid: u32) -> Vec<u32> {
     let mut out = vec![pid];
     let mut cur = pid;
     while out.len() < MAX {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{cur}/stat")) else { break };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{cur}/stat")) else {
+            break;
+        };
         let Some(ppid) = parse_ppid(&stat) else { break };
         if ppid <= 1 {
             break;
@@ -104,13 +106,17 @@ pub mod hyprland {
 
     impl Hyprland {
         pub fn detect() -> Option<Self> {
-            let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok().filter(|s| !s.is_empty())?;
+            let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+                .ok()
+                .filter(|s| !s.is_empty())?;
             let mut candidates = Vec::new();
             if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
                 candidates.push(PathBuf::from(rt).join("hypr").join(&sig));
             }
             candidates.push(PathBuf::from("/tmp/hypr").join(&sig));
-            let dir = candidates.into_iter().find(|d| d.join(".socket.sock").exists())?;
+            let dir = candidates
+                .into_iter()
+                .find(|d| d.join(".socket.sock").exists())?;
             Some(Self { dir })
         }
 
@@ -130,7 +136,10 @@ pub mod hyprland {
         }
 
         fn locate(&self, address: &str) -> Option<Window> {
-            self.clients()?.into_iter().find(|c| normalize(&c.address) == address).map(Client::into_window)
+            self.clients()?
+                .into_iter()
+                .find(|c| normalize(&c.address) == address)
+                .map(Client::into_window)
         }
 
         fn connect_events(&self) -> std::io::Result<UnixStream> {
@@ -159,7 +168,10 @@ pub mod hyprland {
             Window {
                 address: normalize(&self.address),
                 workspace: self.workspace.and_then(|w| w.name),
-                position: self.at.filter(|a| a.len() >= 2).map(|a| Position { x: a[0], y: a[1] }),
+                position: self
+                    .at
+                    .filter(|a| a.len() >= 2)
+                    .map(|a| Position { x: a[0], y: a[1] }),
             }
         }
     }
@@ -187,8 +199,13 @@ pub mod hyprland {
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum Event {
-        Moved { address: String, workspace: String },
-        Closed { address: String },
+        Moved {
+            address: String,
+            workspace: String,
+        },
+        Closed {
+            address: String,
+        },
         /// Layout may have changed; re-check our placement.
         Relaid,
     }
@@ -198,16 +215,25 @@ pub mod hyprland {
         match name {
             "movewindow" => {
                 let (addr, ws) = data.split_once(',')?;
-                Some(Event::Moved { address: normalize(addr), workspace: ws.to_string() })
+                Some(Event::Moved {
+                    address: normalize(addr),
+                    workspace: ws.to_string(),
+                })
             }
             "movewindowv2" => {
                 let (addr, rest) = data.split_once(',')?;
                 let (_id, name) = rest.split_once(',')?;
-                Some(Event::Moved { address: normalize(addr), workspace: name.to_string() })
+                Some(Event::Moved {
+                    address: normalize(addr),
+                    workspace: name.to_string(),
+                })
             }
-            "closewindow" => Some(Event::Closed { address: normalize(data) }),
-            "openwindow" | "changefloatingmode" | "fullscreen" | "pin" | "swapwindow" | "moveworkspace"
-            | "moveworkspacev2" | "monitoradded" | "monitorremoved" | "configreloaded" => Some(Event::Relaid),
+            "closewindow" => Some(Event::Closed {
+                address: normalize(data),
+            }),
+            "openwindow" | "changefloatingmode" | "fullscreen" | "pin" | "swapwindow"
+            | "moveworkspace" | "moveworkspacev2" | "monitoradded" | "monitorremoved"
+            | "configreloaded" => Some(Event::Relaid),
             _ => None,
         }
     }
@@ -224,14 +250,21 @@ pub mod hyprland {
 
         fn track(&self, pid: u32, on_change: &mut dyn FnMut(Option<Window>)) {
             // Subscribe before resolving so a move during the lookup is queued, not lost.
-            let Ok(events) = self.connect_events() else { return };
-            let Some(mut window) = resolve_when_mapped(self, pid) else { return };
+            let Ok(events) = self.connect_events() else {
+                return;
+            };
+            let Some(mut window) = resolve_when_mapped(self, pid) else {
+                return;
+            };
             on_change(Some(window.clone()));
             let mut reader = BufReader::new(events).take(u64::MAX);
             let mut line = String::new();
             loop {
                 line.clear();
-                let n = match (&mut reader).take(MAX_EVENT_LINE as u64).read_line(&mut line) {
+                let n = match (&mut reader)
+                    .take(MAX_EVENT_LINE as u64)
+                    .read_line(&mut line)
+                {
                     Ok(0) | Err(_) => return,
                     Ok(n) => n,
                 };
@@ -241,7 +274,9 @@ pub mod hyprland {
                 match parse_event(line.trim_end()) {
                     Some(Event::Moved { address, workspace }) if address == window.address => {
                         let position = self.locate(&window.address).and_then(|w| w.position);
-                        if window.workspace.as_deref() == Some(workspace.as_str()) && window.position == position {
+                        if window.workspace.as_deref() == Some(workspace.as_str())
+                            && window.position == position
+                        {
                             continue;
                         }
                         window.workspace = Some(workspace);
@@ -262,7 +297,9 @@ pub mod hyprland {
                         }
                     }
                     Some(_) => {
-                        let Some(placed) = self.locate(&window.address) else { continue };
+                        let Some(placed) = self.locate(&window.address) else {
+                            continue;
+                        };
                         if placed == window {
                             continue;
                         }
@@ -283,14 +320,28 @@ pub mod hyprland {
         fn parses_events() {
             assert_eq!(
                 parse_event("movewindow>>0xABC,dev"),
-                Some(Event::Moved { address: "abc".into(), workspace: "dev".into() })
+                Some(Event::Moved {
+                    address: "abc".into(),
+                    workspace: "dev".into()
+                })
             );
             assert_eq!(
                 parse_event("movewindowv2>>abc,3,name,with,commas"),
-                Some(Event::Moved { address: "abc".into(), workspace: "name,with,commas".into() })
+                Some(Event::Moved {
+                    address: "abc".into(),
+                    workspace: "name,with,commas".into()
+                })
             );
-            assert_eq!(parse_event("closewindow>>ABC"), Some(Event::Closed { address: "abc".into() }));
-            assert_eq!(parse_event("openwindow>>abc,1,foot,foot"), Some(Event::Relaid));
+            assert_eq!(
+                parse_event("closewindow>>ABC"),
+                Some(Event::Closed {
+                    address: "abc".into()
+                })
+            );
+            assert_eq!(
+                parse_event("openwindow>>abc,1,foot,foot"),
+                Some(Event::Relaid)
+            );
             assert_eq!(parse_event("workspace>>2"), None);
             assert_eq!(parse_event("activewindowv2>>abc"), None);
             assert_eq!(parse_event("garbage"), None);
