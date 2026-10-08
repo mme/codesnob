@@ -45,7 +45,7 @@ need to start:
 | `u` | only the uncommitted changes, and back |
 | `f` | the changed files; `z` narrows the view to one |
 | `d` | show or hide the commit message or PR description |
-| `-` | back to the previous location; quick repeats go further |
+| Alt-← Alt-→ | previous and next location; `-` also goes back |
 | `L` | all locations open in this viewer |
 | Esc | back out one level |
 
