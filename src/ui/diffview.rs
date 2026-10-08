@@ -13,6 +13,8 @@ use crate::highlight::Highlighter;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Row {
+    /// A line of the description block above the files.
+    Desc(usize),
     File(usize),
     Hunk(usize, usize),
     Line(usize, usize, usize),
@@ -38,6 +40,8 @@ pub struct DiffView {
     gutter_w: usize,
     /// Narrowed to this file index; `None` shows every file.
     only: Option<usize>,
+    /// The description block: a commit message or PR body, already wrapped.
+    desc: Vec<Line<'static>>,
     pub scroll: usize,
     pub hscroll: usize,
 }
@@ -80,6 +84,22 @@ impl DiffView {
         self.only
     }
 
+    /// Replace the description block, keeping the diff line in view.
+    pub fn set_description(&mut self, lines: Vec<Line<'static>>) {
+        // At the very top, stay there so a new description is what you see.
+        let anchor = if self.scroll == 0 {
+            None
+        } else {
+            self.anchor()
+        };
+        self.desc = lines;
+        self.build_rows();
+        match anchor {
+            Some(a) => self.restore(a),
+            None => self.scroll = 0,
+        }
+    }
+
     /// Scroll so file `fi` starts at the top.
     pub fn scroll_to_file(&mut self, fi: usize) {
         if let Some(r) = self.file_row(fi) {
@@ -98,6 +118,10 @@ impl DiffView {
         self.rows.is_empty()
     }
 
+    pub fn has_files(&self) -> bool {
+        !self.files.is_empty()
+    }
+
     pub fn totals(&self) -> (usize, usize) {
         self.files
             .iter()
@@ -109,6 +133,9 @@ impl DiffView {
         self.file_starts.clear();
         self.hunk_starts.clear();
         let mut max_no = 1;
+        for i in 0..self.desc.len() {
+            self.rows.push(Row::Desc(i));
+        }
         for (fi, f) in self.files.iter().enumerate() {
             if self.only.is_some_and(|o| o != fi) {
                 continue;
@@ -131,6 +158,10 @@ impl DiffView {
                     self.rows.push(Row::Line(fi, hi, li));
                 }
             }
+        }
+        if self.files.is_empty() && !self.desc.is_empty() {
+            self.rows.push(Row::Blank);
+            self.rows.push(Row::Note("no files changed"));
         }
         self.gutter_w = max_no.to_string().len().max(3);
         self.clamp();
@@ -224,6 +255,10 @@ impl DiffView {
         if self.file_starts.is_empty() {
             return None;
         }
+        if self.scroll < self.file_starts[0] {
+            // In the description block, above every file.
+            return None;
+        }
         let i = match self.file_starts.binary_search(&self.scroll) {
             Ok(i) => i,
             Err(i) => i.saturating_sub(1),
@@ -293,6 +328,11 @@ impl DiffView {
         hl: &mut Highlighter,
     ) {
         match row {
+            Row::Desc(i) => {
+                let mut spans = vec![Span::styled("  │ ", Style::default().fg(p.note_fg))];
+                spans.extend(self.desc[i].spans.iter().cloned());
+                buf.set_line(area.x, area.y, &Line::from(spans), area.width);
+            }
             Row::Blank => {}
             Row::File(fi) => self.render_file_header(fi, area, buf, p),
             Row::Note(text) => {

@@ -18,14 +18,13 @@ pub struct FileChange {
 }
 
 /// Which two states a view compares.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Range {
     /// The branch point (or `--base`) against the working tree.
     Everything,
     /// HEAD against the working tree.
     Uncommitted,
-    /// One commit against its first parent. Chosen from the commit list.
-    #[allow(dead_code)]
+    /// One commit against its first parent.
     Commit(ObjectId),
 }
 
@@ -155,7 +154,7 @@ pub fn snapshot(dir: &Path, base_override: Option<&str>, range: &Range) -> Resul
         commits,
         commits_truncated,
         dirty,
-        range: range.clone(),
+        range: *range,
         commit,
         files,
     })

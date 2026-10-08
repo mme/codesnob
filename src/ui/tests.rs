@@ -129,18 +129,24 @@ fn the_palette_lists_commands_with_their_keys_and_runs_them() {
     h.keys(":");
     let screen = h.screen();
     assert!(screen.contains("Commands ›"), "{screen}");
-    assert!(screen.contains("Next hunk"), "{screen}");
-    let next_hunk = screen.lines().find(|l| l.contains("Next hunk")).unwrap();
+    let commits = screen.lines().find(|l| l.contains("Commits…")).unwrap();
     assert!(
-        next_hunk.trim_end().ends_with('n'),
-        "the shortcut is shown: {next_hunk}"
+        commits.trim_end().ends_with('c'),
+        "the shortcut is shown: {commits}"
     );
     assert!(
         !screen.contains("Everything since branch point"),
         "commands that do not apply are hidden"
     );
 
-    h.keys("uncom<enter>");
+    h.keys("next h");
+    let screen = h.screen();
+    let first = screen.lines().find(|l| l.starts_with("› ")).unwrap();
+    assert!(
+        first.contains("Next hunk") && first.trim_end().ends_with('n'),
+        "{first}"
+    );
+    h.keys("<esc>:uncom<enter>");
     assert!(h.status().starts_with("feature · uncommitted changes"));
     assert!(h.status().contains("2 files"), "{}", h.status());
 
@@ -353,6 +359,160 @@ fn narrowing_survives_a_reload_until_the_file_has_no_changes() {
     assert!(
         status.contains("b.txt has no changes here; showing all files"),
         "{status}"
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn the_commit_list_previews_each_commit_and_esc_reverts() {
+    let dir = branch_with_history("ui-commits");
+    let mut h = Harness::open(&dir);
+    h.keys("c");
+    let screen = h.screen();
+    assert!(screen.contains("Commits ›"), "{screen}");
+    let rows: Vec<&str> = screen
+        .lines()
+        .skip_while(|l| !l.contains("Commits ›"))
+        .skip(1)
+        .take_while(|l| !l.trim().is_empty())
+        .collect();
+    assert!(
+        rows[0].contains("Everything since main") && rows[0].contains("2 commits"),
+        "{rows:?}"
+    );
+    assert!(
+        rows[1].ends_with("just now") && rows[1].contains(" one "),
+        "oldest first: {rows:?}"
+    );
+    assert!(rows[2].contains(" two "), "{rows:?}");
+    assert!(
+        rows[3].contains("Uncommitted changes"),
+        "dirty state last: {rows:?}"
+    );
+    assert!(rows[0].starts_with("› "), "starts on the current view");
+
+    h.keys("<down>");
+    let status = h.status();
+    assert!(
+        status.contains(" one · commit 1 of 2"),
+        "moving previews: {status}"
+    );
+    assert!(h.screen().contains("src/deep/one.rs"));
+
+    h.keys("<esc>");
+    assert!(
+        h.status().contains("2 commits and uncommitted work"),
+        "Esc reverts: {}",
+        h.status()
+    );
+
+    h.keys("c<down><down><enter>");
+    assert!(
+        h.status().contains(" two · commit 2 of 2"),
+        "Enter keeps: {}",
+        h.status()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn angle_brackets_walk_the_branch_and_esc_comes_back() {
+    let dir = branch_with_history("ui-step");
+    let mut h = Harness::open(&dir);
+    h.keys("<");
+    assert!(
+        h.status().contains("uncommitted changes"),
+        "older from everything starts at the end: {}",
+        h.status()
+    );
+    h.keys("<");
+    assert!(h.status().contains("two · commit 2 of 2"), "{}", h.status());
+    h.keys("<");
+    assert!(h.status().contains("one · commit 1 of 2"), "{}", h.status());
+    h.keys("<");
+    assert!(
+        h.status().contains("this is the oldest commit"),
+        "{}",
+        h.status()
+    );
+    h.keys(">>");
+    assert!(h.status().contains("uncommitted changes"), "{}", h.status());
+    h.keys(">");
+    assert!(h.status().contains("nothing newer"), "{}", h.status());
+    h.keys("<esc>");
+    assert!(
+        h.status()
+            .contains("2 commits and uncommitted work since main"),
+        "{}",
+        h.status()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn a_commit_shows_its_message_above_the_diff_and_d_hides_it() {
+    let dir = branch_with_history("ui-desc");
+    let mut h = Harness::open(&dir);
+    h.keys(">");
+    let screen = h.screen();
+    let top: Vec<&str> = screen.lines().take(4).collect();
+    assert!(
+        top[0].contains("│") && top[0].contains("· t ·"),
+        "header with author: {top:?}"
+    );
+    assert!(top[1].contains("one"), "subject: {top:?}");
+    assert!(top[3].contains("Adds the first function."), "body: {top:?}");
+
+    h.keys("d");
+    let screen = h.screen();
+    assert!(!screen.contains("Adds the first function."), "{screen}");
+    assert!(
+        screen.lines().next().unwrap().contains("src/deep/one.rs"),
+        "{screen}"
+    );
+    assert!(
+        h.status().contains("one · commit 1 of 2"),
+        "the subject stays in the status bar"
+    );
+
+    h.keys(">");
+    assert!(
+        !h.screen().contains("│"),
+        "hidden stays hidden for the session"
+    );
+    h.keys("d");
+    assert!(
+        h.screen().lines().next().unwrap().contains("│"),
+        "and comes back"
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn an_amended_commit_falls_back_to_everything() {
+    let dir = branch_with_history("ui-amend");
+    let mut h = Harness::open(&dir);
+    h.keys("<<");
+    assert!(h.status().contains("two · commit 2 of 2"), "{}", h.status());
+    crate::testutil::git(&dir, &["commit", "-q", "--amend", "-m", "two, amended"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !h.status().contains("no longer on this branch") && Instant::now() < deadline {
+        if let Ok(m) = h.rx.recv_timeout(Duration::from_millis(50)) {
+            h.app.dispatch(m);
+        }
+    }
+    assert!(
+        h.status().contains("is no longer on this branch"),
+        "{}",
+        h.status()
+    );
+    h.settle();
+    h.keys("j");
+    assert!(
+        h.status()
+            .contains("2 commits and uncommitted work since main"),
+        "{}",
+        h.status()
     );
     cleanup(dir);
 }

@@ -6,6 +6,7 @@
 
 mod commands;
 mod diffview;
+mod markdown;
 mod panel;
 #[cfg(test)]
 mod tests;
@@ -120,6 +121,7 @@ enum Focus {
 
 /// Where the view was when a previewing list opened, to return to on Esc.
 struct Origin {
+    range: Range,
     focus: Focus,
     anchor: Option<Anchor>,
 }
@@ -144,6 +146,12 @@ struct Location {
     fingerprint: u64,
     /// A reload by hand is in flight, so its result gets reported.
     manual: bool,
+    /// Restore this position once the requested range has loaded.
+    pending_anchor: Option<Anchor>,
+    /// The description block must be rebuilt before the next draw.
+    desc_dirty: bool,
+    /// The width the description block was wrapped at.
+    desc_width: u16,
 }
 
 pub struct App {
@@ -164,6 +172,8 @@ pub struct App {
     recent: HashMap<panel::Kind, Vec<String>>,
     message: Option<String>,
     body_h: usize,
+    /// Commit messages are shown above a commit's diff unless turned off.
+    show_commit_desc: bool,
     pub quit: bool,
 }
 
@@ -191,6 +201,7 @@ impl App {
             recent: HashMap::new(),
             message: None,
             body_h: 1,
+            show_commit_desc: true,
             quit: false,
         }
     }
@@ -227,6 +238,9 @@ impl App {
             error: None,
             fingerprint: 0,
             manual: false,
+            pending_anchor: None,
+            desc_dirty: true,
+            desc_width: 0,
         };
         // One location for now; switching between several comes later.
         self.locations = vec![loc];
@@ -260,7 +274,7 @@ impl App {
             seq: loc.seq,
             dir: loc.dir.clone(),
             base: loc.base.clone(),
-            range: loc.range.clone(),
+            range: loc.range,
         });
     }
 
@@ -302,6 +316,20 @@ impl App {
             }
         };
         loc.error = None;
+        // The commit being viewed left the branch (amend, rebase): fall back.
+        if let Range::Commit(id) = snap.range
+            && !snap.commits.iter().any(|c| c.id == id)
+            && loc
+                .info
+                .as_ref()
+                .is_some_and(|i| i.commits.iter().any(|c| c.id == id))
+        {
+            let short = id.to_hex_with_len(7).to_string();
+            self.message = Some(format!("{short} is no longer on this branch"));
+            loc.range = Range::Everything;
+            self.request();
+            return;
+        }
         let fingerprint = snap.fingerprint();
         if fingerprint == loc.fingerprint {
             if manual {
@@ -317,10 +345,13 @@ impl App {
         if let Focus::File(path) = &loc.focus
             && !loc.view.narrow_to_path(Some(path))
         {
-            self.message = Some(format!("{path} has no changes here; showing all files"));
-            loc.focus = Focus::All;
+            // While a list previews, a file missing from one commit is not news.
+            if self.panel.is_none() {
+                self.message = Some(format!("{path} has no changes here; showing all files"));
+                loc.focus = Focus::All;
+            }
         }
-        match anchor {
+        match anchor.or(loc.pending_anchor.take()) {
             Some(a) => loc.view.restore(a),
             None if !same_range => {
                 loc.view.scroll = 0;
@@ -329,6 +360,7 @@ impl App {
             None => {}
         }
         loc.info = Some(info);
+        loc.desc_dirty = true;
         self.hl.clear();
         if manual {
             self.message = Some("reloaded".to_string());
@@ -429,6 +461,10 @@ impl App {
             | (KeyCode::Char('?'), false, _)
             | (KeyCode::Char('k'), true, false) => self.open_palette(),
             (KeyCode::Char('f'), false, false) => self.perform(Action::Files),
+            (KeyCode::Char('c'), false, false) => self.perform(Action::Commits),
+            (KeyCode::Char('<'), false, false) => self.perform(Action::OlderCommit),
+            (KeyCode::Char('>'), false, false) => self.perform(Action::NewerCommit),
+            (KeyCode::Char('d'), false, false) => self.perform(Action::ToggleDescription),
             (KeyCode::Char('z'), false, false) => self.perform(Action::Narrow),
 
             (KeyCode::Down, _, _)
@@ -508,6 +544,7 @@ impl App {
             Some(p) => Focus::File(p),
             None => Focus::All,
         };
+        loc.desc_dirty = true;
         match anchor {
             Some(a) if keep => loc.view.restore(a),
             _ => loc.view.scroll = 0,
@@ -537,8 +574,12 @@ impl App {
         if now == before {
             return;
         }
-        if let Some(Action::GoToFile(fi)) = now {
-            self.go_to_file(fi);
+        match now {
+            Some(Action::GoToFile(fi)) => self.go_to_file(fi),
+            Some(Action::RangeEverything) => self.set_range(Range::Everything),
+            Some(Action::RangeUncommitted) => self.set_range(Range::Uncommitted),
+            Some(Action::ShowCommit(id)) => self.set_range(Range::Commit(id)),
+            _ => {}
         }
     }
 
@@ -552,15 +593,162 @@ impl App {
             return;
         }
         let Some(loc) = self.cur_mut() else { return };
-        let path = match &origin.focus {
-            Focus::File(p) => Some(p.as_str()),
+        loc.focus = origin.focus;
+        loc.desc_dirty = true;
+        if loc.range != origin.range {
+            // The old range reloads; its position comes back when it lands.
+            loc.range = origin.range;
+            loc.pending_anchor = origin.anchor;
+            self.request();
+            return;
+        }
+        let path = match &loc.focus {
+            Focus::File(p) => Some(p.clone()),
             Focus::All => None,
         };
-        loc.view.narrow_to_path(path);
-        loc.focus = origin.focus;
+        loc.view.narrow_to_path(path.as_deref());
         if let Some(a) = origin.anchor {
             loc.view.restore(a);
         }
+    }
+
+    fn open_commits(&mut self) {
+        let Some(loc) = self.cur() else { return };
+        let Some(info) = &loc.info else { return };
+        let mut items = Vec::new();
+        if let Some(base) = &info.base.name {
+            let n = info.commits.len();
+            items.push(panel::Item {
+                tag: None,
+                text: format!("Everything since {base}"),
+                hint: format!(
+                    "{n}{} commit{}",
+                    if info.commits_truncated { "+" } else { "" },
+                    if n == 1 { "" } else { "s" }
+                ),
+                action: Action::RangeEverything,
+                key: "everything".to_string(),
+            });
+        }
+        for c in &info.commits {
+            items.push(panel::Item {
+                tag: Some((c.short.clone(), self.palette.hunk_fg)),
+                text: c.subject.clone(),
+                hint: ago(c.time),
+                action: Action::ShowCommit(c.id),
+                key: c.id.to_string(),
+            });
+        }
+        if info.dirty {
+            items.push(panel::Item {
+                tag: None,
+                text: "Uncommitted changes".to_string(),
+                hint: String::new(),
+                action: Action::RangeUncommitted,
+                key: "uncommitted".to_string(),
+            });
+        }
+        let note = if info.commits_truncated {
+            Some(format!("newest {} shown", git::MAX_COMMITS))
+        } else if info.base.name.is_none() {
+            Some("no base branch, so only uncommitted changes".to_string())
+        } else if info.commits.is_empty() {
+            Some("no commits since the branch point".to_string())
+        } else {
+            None
+        };
+        let current = match loc.range {
+            Range::Everything if info.base.name.is_some() => "everything".to_string(),
+            Range::Everything | Range::Uncommitted => "uncommitted".to_string(),
+            Range::Commit(id) => id.to_string(),
+        };
+        self.origin = Some(Origin {
+            range: loc.range,
+            focus: loc.focus.clone(),
+            anchor: loc.view.anchor(),
+        });
+        let mut panel = Panel::new(panel::Kind::Commits, items, Vec::new(), Some(&current));
+        panel.note = note;
+        self.panel = Some(panel);
+    }
+
+    /// The steps `<` and `>` walk: the commits oldest first, then the
+    /// uncommitted changes when there are any.
+    fn steps(&self) -> Vec<Range> {
+        let Some(info) = self.cur().and_then(|l| l.info.as_ref()) else {
+            return Vec::new();
+        };
+        let mut steps: Vec<Range> = info.commits.iter().map(|c| Range::Commit(c.id)).collect();
+        if info.dirty {
+            steps.push(Range::Uncommitted);
+        }
+        steps
+    }
+
+    fn step(&mut self, older: bool) {
+        let steps = self.steps();
+        let Some(loc) = self.cur() else { return };
+        if steps.is_empty() {
+            self.message = Some("no commits since the branch point".to_string());
+            return;
+        }
+        let at = steps.iter().position(|r| *r == loc.range);
+        let next = match (at, older) {
+            (None, true) => steps.len() - 1,
+            (None, false) => 0,
+            (Some(0), true) => {
+                self.message = Some("this is the oldest commit".to_string());
+                return;
+            }
+            (Some(i), true) => i - 1,
+            (Some(i), false) if i + 1 == steps.len() => {
+                self.message = Some("nothing newer".to_string());
+                return;
+            }
+            (Some(i), false) => i + 1,
+        };
+        self.set_range(steps[next]);
+    }
+
+    /// The description block for the current view, wrapped to `width`.
+    fn description(&self, width: u16) -> Vec<Line<'static>> {
+        let Some(loc) = self.cur() else {
+            return Vec::new();
+        };
+        if loc.focus != Focus::All || !self.show_commit_desc {
+            return Vec::new();
+        }
+        let Some(info) = &loc.info else {
+            return Vec::new();
+        };
+        let (Range::Commit(id), Some(c)) = (info.range, &info.commit) else {
+            return Vec::new();
+        };
+        if c.id != id {
+            return Vec::new();
+        }
+        let width = width.saturating_sub(6) as usize;
+        let dim = Style::default().fg(self.palette.note_fg);
+        let mut out = vec![Line::from(Span::styled(
+            format!("{} · {} · {}", c.short, c.author, ago(c.time)),
+            dim,
+        ))];
+        let mut title = markdown::render(
+            &format!("**{}**", c.subject.replace('*', "\\*")),
+            width,
+            &self.palette,
+        );
+        out.append(&mut title);
+        let body = c
+            .message
+            .split_once('\n')
+            .map(|(_, b)| b.trim())
+            .unwrap_or("");
+        if !body.is_empty() {
+            out.push(Line::default());
+            out.extend(markdown::render(body, width, &self.palette));
+        }
+        out
     }
 
     fn open_files(&mut self) {
@@ -595,6 +783,7 @@ impl App {
             .current_file()
             .map(|fi| loc.view.files[fi].path.clone());
         self.origin = Some(Origin {
+            range: loc.range,
             focus: loc.focus.clone(),
             anchor: loc.view.anchor(),
         });
@@ -610,12 +799,20 @@ impl App {
         let Some(loc) = self.cur() else {
             return action == Action::Quit;
         };
-        let has_rows = !loc.view.is_empty();
+        let has_rows = loc.view.has_files();
         let has_base = loc
             .info
             .as_ref()
             .is_some_and(|i| i.base.name.is_some() && !i.unborn);
+        let has_info = loc.info.is_some();
         match action {
+            Action::Commits => has_info,
+            Action::OlderCommit | Action::NewerCommit => loc
+                .info
+                .as_ref()
+                .is_some_and(|i| !i.commits.is_empty() || i.dirty),
+            Action::ShowCommit(_) => loc.repo,
+            Action::ToggleDescription => matches!(loc.range, Range::Commit(_)),
             Action::Files | Action::Narrow | Action::GoToFile(_) => has_rows,
             Action::NextHunk
             | Action::PrevHunk
@@ -663,6 +860,16 @@ impl App {
         match action {
             Action::Quit => self.quit = true,
             Action::Files => self.open_files(),
+            Action::Commits => self.open_commits(),
+            Action::OlderCommit => self.step(true),
+            Action::NewerCommit => self.step(false),
+            Action::ShowCommit(id) => self.set_range(Range::Commit(id)),
+            Action::ToggleDescription => {
+                self.show_commit_desc = !self.show_commit_desc;
+                if let Some(loc) = self.cur_mut() {
+                    loc.desc_dirty = true;
+                }
+            }
             Action::GoToFile(fi) => self.go_to_file(fi),
             Action::Narrow => {
                 let Some(loc) = self.cur() else { return };
@@ -853,6 +1060,17 @@ impl App {
         let panel_area = Rect::new(body.x, body.bottom() - panel_h, body.width, panel_h);
         body.height -= panel_h;
         self.body_h = body.height as usize;
+        let rebuild = self
+            .cur()
+            .is_some_and(|l| l.desc_dirty || l.desc_width != body.width);
+        if rebuild {
+            let lines = self.description(body.width);
+            if let Some(loc) = self.locations.first_mut() {
+                loc.view.set_description(lines);
+                loc.desc_dirty = false;
+                loc.desc_width = body.width;
+            }
+        }
         if let Some(loc) = self.locations.first_mut() {
             loc.view.clamp();
         }
@@ -905,7 +1123,7 @@ impl App {
             return;
         }
         if let Some(loc) = self.cur()
-            && !loc.view.is_empty()
+            && loc.view.has_files()
         {
             let n = loc.view.files.len();
             let cur = loc.view.current_file();
@@ -915,10 +1133,14 @@ impl App {
                     let f = &loc.view.files[fi];
                     format!(" file {pos} of {n}  +{} −{}  ·", f.added, f.removed)
                 }
-                _ => {
+                (_, cur) => {
                     let (added, removed) = loc.view.totals();
                     let noun = if n == 1 { "file" } else { "files" };
-                    format!(" {n} {noun}  +{added} −{removed}  ·  {pos}/{n}  ·")
+                    match cur {
+                        Some(_) => format!(" {n} {noun}  +{added} −{removed}  ·  {pos}/{n}  ·"),
+                        // Above the first file, in the description.
+                        None => format!(" {n} {noun}  +{added} −{removed}  ·"),
+                    }
                 }
             };
         }
@@ -930,6 +1152,25 @@ impl App {
             buf.set_span(area.right() - rw, area.y, &Span::styled(right, style), rw);
         }
     }
+}
+
+/// "3 hours ago", for commit lists.
+fn ago(time: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(time);
+    let s = (now - time).max(0);
+    let (n, unit) = match s {
+        0..60 => return "just now".to_string(),
+        60..3600 => (s / 60, "minute"),
+        3600..86_400 => (s / 3600, "hour"),
+        86_400..604_800 => (s / 86_400, "day"),
+        604_800..2_592_000 => (s / 604_800, "week"),
+        2_592_000..31_536_000 => (s / 2_592_000, "month"),
+        _ => (s / 31_536_000, "year"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }
 
 pub fn run(mut app: App, rx: Receiver<Msg>) -> Result<()> {
