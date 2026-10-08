@@ -1683,11 +1683,14 @@ fn highlights_are_numbered_tinted_and_stepped_through() {
     let note = screen.lines().find(|l| l.contains('①')).expect("numbered");
     assert!(note.contains("the loop"), "{note}");
     let row = screen.lines().position(|l| l.contains('①')).unwrap();
-    assert!(
-        (5..15).contains(&row),
-        "opens at the first highlight: row {row}"
+    assert_eq!(
+        row, 1,
+        "① sits at the top, under the file header:\n{screen}"
     );
-    let marked: Vec<&str> = screen.lines().filter(|l| l.starts_with('▌')).collect();
+    let marked: Vec<&str> = screen
+        .lines()
+        .filter(|l| l.starts_with('▌') && l.contains("// line 2"))
+        .collect();
     assert_eq!(marked.len(), 3, "lines 20-22 carry the bar: {screen}");
     assert!(
         marked.iter().all(|l| l.contains(" 2")),
@@ -1696,7 +1699,11 @@ fn highlights_are_numbered_tinted_and_stepped_through() {
     assert!(h.status().contains("highlight 1 of 2"), "{}", h.status());
 
     h.keys(">");
-    assert!(h.screen().lines().any(|l| l.contains('②')));
+    assert_eq!(
+        h.screen().lines().position(|l| l.contains('②')),
+        Some(1),
+        "every jump puts the note at the top"
+    );
     assert!(h.status().contains("highlight 2 of 2"), "{}", h.status());
     h.keys("<");
     assert!(h.status().contains("highlight 1 of 2"), "{}", h.status());
@@ -1799,5 +1806,40 @@ fn angle_brackets_move_between_hunks_without_highlights() {
     );
     h.keys("<");
     assert!(!h.status().contains("highlight"));
+    cleanup(dir);
+}
+
+#[test]
+fn highlights_go_by_their_numbers_not_their_place_in_the_file() {
+    let dir = repo_with_long_file("ui-marks-order");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    // ① is further down the file than ②.
+    spec.highlights = vec![
+        hl("src/long.rs", 45, 45, Some("first")),
+        hl("src/long.rs", 10, 11, Some("second")),
+        hl("src/long.rs", 30, 30, Some("third")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let at_top = |h: &mut Harness| h.screen().lines().nth(1).unwrap_or("").to_string();
+    assert!(
+        at_top(&mut h).contains("① first"),
+        "opens at ①: {}",
+        at_top(&mut h)
+    );
+    h.keys(">");
+    assert!(at_top(&mut h).contains("② second"), "{}", at_top(&mut h));
+    h.keys(">");
+    assert!(at_top(&mut h).contains("③ third"), "{}", at_top(&mut h));
+    h.keys(">");
+    assert!(at_top(&mut h).contains("③ third"), "stays on the last");
+    h.keys("jjj<");
+    assert!(
+        at_top(&mut h).contains("② second"),
+        "scrolling does not change the order: {}",
+        at_top(&mut h)
+    );
+    assert!(h.status().contains("highlight 2 of 3"), "{}", h.status());
     cleanup(dir);
 }

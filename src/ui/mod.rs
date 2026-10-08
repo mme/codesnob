@@ -2206,13 +2206,12 @@ impl App {
             Action::CloseLocation => self.close_location(),
             Action::Commits => self.open_commits(),
             Action::NextMark | Action::PrevMark => {
-                let body_h = self.body_h;
                 let Some(loc) = self.cur_mut() else { return };
                 let v = &mut loc.view;
                 // Highlights when there are any, else hunks.
                 match (action == Action::NextMark, v.has_marks()) {
-                    (true, true) => v.next_mark(body_h),
-                    (false, true) => v.prev_mark(body_h),
+                    (true, true) => v.next_mark(),
+                    (false, true) => v.prev_mark(),
                     (true, false) => v.next_hunk(),
                     (false, false) => v.prev_hunk(),
                 }
@@ -2519,16 +2518,20 @@ impl App {
             }
         }
         if let Some(loc) = self.locations.first_mut() {
-            // A target line sits about a third of the way down.
-            if std::mem::take(&mut loc.view.place_target)
-                && let Some(row) = loc
+            // A target line sits about a third of the way down; otherwise
+            // the view opens with ① at the top.
+            if std::mem::take(&mut loc.view.place_target) {
+                let line = loc
                     .view
                     .target
                     .clone()
-                    .and_then(|(p, l)| loc.view.row_of_line(&p, l))
-                    .or_else(|| loc.view.first_mark_row())
-            {
-                loc.view.scroll = row.saturating_sub(self.body_h / 3);
+                    .and_then(|(p, l)| loc.view.row_of_line(&p, l));
+                match line {
+                    Some(row) => loc.view.scroll = row.saturating_sub(self.body_h / 3),
+                    None => {
+                        loc.view.first_mark();
+                    }
+                }
             }
             loc.view.clamp();
         }
@@ -2646,7 +2649,7 @@ impl App {
                 }
             };
         }
-        if let Some((i, n)) = self.cur().and_then(|l| l.view.mark_position(self.body_h)) {
+        if let Some((i, n)) = self.cur().and_then(|l| l.view.mark_position()) {
             right.insert_str(0, &format!(" highlight {i} of {n}  ·"));
         }
         right.push_str(" : commands ");
