@@ -7,7 +7,7 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::Palette;
@@ -16,17 +16,34 @@ use super::commands::Action;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Kind {
     Commands,
+    Files,
 }
 
 impl Kind {
     pub fn title(self) -> &'static str {
         match self {
             Kind::Commands => "Commands",
+            Kind::Files => "Files",
         }
+    }
+
+    /// Lists whose order means something keep it; the rest put recent first.
+    fn recent_first(self) -> bool {
+        match self {
+            Kind::Commands => true,
+            Kind::Files => false,
+        }
+    }
+
+    /// Moving the selection previews the choice behind the panel.
+    pub fn previews(self) -> bool {
+        matches!(self, Kind::Files)
     }
 }
 
 pub struct Item {
+    /// A short colored prefix that is shown but not searched, like a status letter.
+    pub tag: Option<(String, Color)>,
     pub text: String,
     /// Right-aligned: a shortcut, a count, a date.
     pub hint: String,
@@ -57,7 +74,8 @@ pub struct Panel {
 }
 
 impl Panel {
-    pub fn new(kind: Kind, items: Vec<Item>, recent: Vec<String>) -> Self {
+    /// `select` names the item to start on, by key.
+    pub fn new(kind: Kind, items: Vec<Item>, recent: Vec<String>, select: Option<&str>) -> Self {
         let mut p = Self {
             kind,
             input: String::new(),
@@ -69,10 +87,23 @@ impl Panel {
             matcher: Matcher::new(Config::DEFAULT),
         };
         p.refilter();
+        if let Some(key) = select
+            && let Some(pos) = p.shown.iter().position(|&i| p.items[i].key == key)
+        {
+            p.selected = pos;
+        }
         p
     }
 
+    /// The action of the highlighted row.
+    pub fn selected_action(&self) -> Option<Action> {
+        self.shown.get(self.selected).map(|&i| self.items[i].action)
+    }
+
     fn recency(&self, i: usize) -> usize {
+        if !self.kind.recent_first() {
+            return usize::MAX;
+        }
         self.recent
             .iter()
             .position(|k| *k == self.items[i].key)
@@ -211,15 +242,12 @@ impl Panel {
             buf.set_style(row, style);
             let marker = if selected { "› " } else { "  " };
             let item = &self.items[i];
-            buf.set_line(
-                area.x,
-                y,
-                &Line::from(vec![
-                    Span::styled(marker, style.fg(p.hunk_fg)),
-                    Span::styled(item.text.clone(), style),
-                ]),
-                area.width,
-            );
+            let mut spans = vec![Span::styled(marker, style.fg(p.hunk_fg))];
+            if let Some((tag, color)) = &item.tag {
+                spans.push(Span::styled(format!("{tag} "), style.fg(*color)));
+            }
+            spans.push(Span::styled(item.text.clone(), style));
+            buf.set_line(area.x, y, &Line::from(spans), area.width);
             let hw = item.hint.chars().count() as u16 + 2;
             if !item.hint.is_empty() && area.width > hw + 10 {
                 buf.set_span(

@@ -3,6 +3,11 @@
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Action {
+    Files,
+    /// Narrow to the current file, or show all files again.
+    Narrow,
+    /// Move to file `n`: jump in the full view, switch file while narrowed.
+    GoToFile(usize),
     NextHunk,
     PrevHunk,
     NextFile,
@@ -25,6 +30,16 @@ pub struct Command {
 
 /// In palette order: what the palette is for first, movement after.
 pub const COMMANDS: &[Command] = &[
+    Command {
+        action: Action::Files,
+        name: "Files…",
+        keys: "f",
+    },
+    Command {
+        action: Action::Narrow,
+        name: "Narrow to this file",
+        keys: "z",
+    },
     Command {
         action: Action::RangeEverything,
         name: "Everything since branch point",

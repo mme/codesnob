@@ -233,3 +233,126 @@ fn edits_show_up_without_moving_the_view() {
     );
     cleanup(dir);
 }
+
+#[test]
+fn the_file_list_jumps_in_diff_order_with_live_preview() {
+    let dir = branch_with_history("ui-files");
+    let mut h = Harness::open(&dir);
+    assert!(h.status().contains("1/5"), "{}", h.status());
+
+    h.keys("f");
+    let screen = h.screen();
+    assert!(screen.contains("Files ›"), "{screen}");
+    // Panel rows: a selection marker, then a status letter.
+    let rows: Vec<&str> = screen
+        .lines()
+        .filter(|l| {
+            let c: Vec<char> = l.chars().take(4).collect();
+            c.len() == 4 && "MADR".contains(c[2]) && c[3] == ' '
+        })
+        .collect();
+    assert!(
+        rows[0].contains("M a.txt") && rows[0].contains("+1 −1"),
+        "{rows:?}"
+    );
+    assert!(
+        rows[4].contains("A src/deep/one.rs"),
+        "same order as the diff: {rows:?}"
+    );
+
+    h.keys("<down><down>");
+    assert!(
+        h.status().contains("3/5"),
+        "moving the selection previews: {}",
+        h.status()
+    );
+    h.keys("<esc>");
+    assert!(
+        h.status().contains("1/5"),
+        "Esc returns to where you were: {}",
+        h.status()
+    );
+
+    h.keys("fone<enter>");
+    assert!(
+        h.status().contains("5/5"),
+        "typing filters, Enter jumps: {}",
+        h.status()
+    );
+    assert!(!h.status().contains("only"), "jumping does not narrow");
+    cleanup(dir);
+}
+
+#[test]
+fn z_narrows_to_one_file_and_esc_brings_everything_back() {
+    let dir = branch_with_history("ui-narrow");
+    let mut h = Harness::open(&dir);
+    h.keys("N");
+    h.keys("z");
+    let screen = h.screen();
+    assert!(
+        h.status().contains("b.txt only · Esc for all"),
+        "{}",
+        h.status()
+    );
+    assert!(h.status().contains("file 2 of 5"), "{}", h.status());
+    let headers = screen
+        .lines()
+        .filter(|l| l.starts_with(" M ") || l.starts_with(" A ") || l.starts_with(" D "))
+        .count();
+    assert_eq!(headers, 1, "only one file is shown: {screen}");
+
+    h.keys("N");
+    assert!(
+        h.status().contains("gone.txt only"),
+        "next file moves the narrowing: {}",
+        h.status()
+    );
+    h.keys("f<down><enter>");
+    assert!(
+        h.status().contains("new.txt only"),
+        "the file list switches the narrowed file: {}",
+        h.status()
+    );
+
+    h.keys("<esc>");
+    assert!(!h.status().contains("only"), "{}", h.status());
+    assert!(
+        h.status().contains("4/5"),
+        "back at the same file: {}",
+        h.status()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn narrowing_survives_a_reload_until_the_file_has_no_changes() {
+    let dir = branch_with_history("ui-narrow-live");
+    let mut h = Harness::open(&dir);
+    h.keys("Nz");
+    assert!(h.status().contains("b.txt only"), "{}", h.status());
+
+    let wait_for = |h: &mut Harness, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !h.status().contains(what) && Instant::now() < deadline {
+            if let Ok(m) = h.rx.recv_timeout(Duration::from_millis(50)) {
+                h.app.dispatch(m);
+            }
+        }
+        h.status()
+    };
+    std::fs::write(dir.join("zzz.txt"), "late\n").unwrap();
+    let status = wait_for(&mut h, "of 6");
+    assert!(
+        status.contains("b.txt only") && status.contains("file 2 of 6"),
+        "{status}"
+    );
+
+    std::fs::write(dir.join("b.txt"), "b.txt\n").unwrap();
+    let status = wait_for(&mut h, "showing all files");
+    assert!(
+        status.contains("b.txt has no changes here; showing all files"),
+        "{status}"
+    );
+    cleanup(dir);
+}
