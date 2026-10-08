@@ -20,9 +20,20 @@ struct Harness {
 
 impl Harness {
     fn open(dir: &Path) -> Self {
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        Self::open_with_state(dir, fresh_dir(&format!("state-{name}")))
+    }
+
+    fn open_with_state(dir: &Path, state: PathBuf) -> Self {
         let (tx, rx) = channel();
         let hl = Highlighter::new("base16").unwrap();
-        let mut app = App::new(Options { context: 3 }, Palette::dark(), hl, tx, Link::new());
+        let opts = Options {
+            context: 3,
+            state_dir: Some(state),
+        };
+        let mut app = App::new(opts, Palette::dark(), hl, tx, Link::new());
+        // Loads between key presses must not outlast the strip on slow machines.
+        app.flip_window = Duration::from_secs(60);
         app.open(Target {
             dir: dir.to_path_buf(),
             base: None,
@@ -515,4 +526,173 @@ fn an_amended_commit_falls_back_to_everything() {
         h.status()
     );
     cleanup(dir);
+}
+
+/// A repository on main with one uncommitted file.
+fn small_repo(name: &str) -> PathBuf {
+    let dir = fresh_dir(name);
+    crate::testutil::git(&dir, &["init", "-q"]);
+    std::fs::write(dir.join("readme.md"), "hello\n").unwrap();
+    crate::testutil::git(&dir, &["add", "-A"]);
+    crate::testutil::git(&dir, &["commit", "-q", "-m", "init"]);
+    std::fs::write(dir.join("readme.md"), "hello again\n").unwrap();
+    dir
+}
+
+#[test]
+fn open_a_typed_path_and_flip_back_with_dash() {
+    let a = branch_with_history("ui-loc-a");
+    let b = small_repo("ui-loc-b");
+    let mut h = Harness::open(&a);
+    h.keys("<<");
+    assert!(h.status().contains("two · commit 2 of 2"), "{}", h.status());
+
+    h.keys(&format!("o{}<enter>", b.display()));
+    assert!(
+        h.status().starts_with("main · uncommitted changes"),
+        "{}",
+        h.status()
+    );
+
+    h.keys("-");
+    assert!(
+        h.status().contains("ui-loc-a"),
+        "the strip names the locations: {}",
+        h.status()
+    );
+    h.keys("j");
+    assert!(
+        h.status().contains("two · commit 2 of 2"),
+        "a location keeps its range: {}",
+        h.status()
+    );
+    h.keys("-");
+    h.keys("j");
+    assert!(
+        h.status().starts_with("main · uncommitted changes"),
+        "{}",
+        h.status()
+    );
+    cleanup(a);
+    cleanup(b);
+}
+
+#[test]
+fn quick_repeated_dashes_go_further_back() {
+    let a = small_repo("ui-flip-a");
+    let b = small_repo("ui-flip-b");
+    let c = small_repo("ui-flip-c");
+    let mut h = Harness::open(&a);
+    h.keys(&format!("o{}<enter>", b.display()));
+    h.keys(&format!("o{}<enter>", c.display()));
+    h.keys("--");
+    let status = h.status();
+    assert!(
+        status.contains("ui-flip-c")
+            && status.contains("ui-flip-b")
+            && status.contains("ui-flip-a"),
+        "{status}"
+    );
+    assert_eq!(
+        h.app.cur().unwrap().dir,
+        a,
+        "two quick presses land two back"
+    );
+    cleanup(a);
+    cleanup(b);
+    cleanup(c);
+}
+
+#[test]
+fn tab_completes_directories_and_a_bad_path_says_so() {
+    let a = small_repo("ui-tab");
+    std::fs::create_dir_all(a.join("projects/codesnob")).unwrap();
+    let mut h = Harness::open(&a);
+    h.keys("oproj");
+    h.app.dispatch(Msg::Input(Event::Key(KeyEvent::new(
+        KeyCode::Tab,
+        KeyModifiers::NONE,
+    ))));
+    assert!(h.screen().contains("Open › projects/"), "{}", h.screen());
+    h.app.dispatch(Msg::Input(Event::Key(KeyEvent::new(
+        KeyCode::Tab,
+        KeyModifiers::NONE,
+    ))));
+    assert!(
+        h.screen().contains("Open › projects/codesnob/"),
+        "{}",
+        h.screen()
+    );
+
+    h.keys("<c-u>nowhere<enter>");
+    let screen = h.screen();
+    assert!(screen.contains("no such directory: nowhere"), "{screen}");
+    assert!(
+        screen.contains("Open ›"),
+        "the prompt stays open to fix the path"
+    );
+    cleanup(a);
+}
+
+#[test]
+fn recent_locations_survive_a_restart() {
+    let a = small_repo("ui-recent-a");
+    let b = small_repo("ui-recent-b");
+    let state = fresh_dir("ui-recent-state");
+    {
+        let mut h = Harness::open_with_state(&a, state.clone());
+        h.keys(&format!("o{}<enter>", b.display()));
+    }
+    let mut h = Harness::open_with_state(&a, state.clone());
+    h.keys("o");
+    let screen = h.screen();
+    let rows: Vec<&str> = screen
+        .lines()
+        .skip_while(|l| !l.contains("Open ›"))
+        .skip(1)
+        .take_while(|l| !l.trim().is_empty())
+        .collect();
+    assert!(
+        rows[0].contains("ui-recent-a") && rows[0].ends_with("open"),
+        "{rows:?}"
+    );
+    assert!(rows[1].contains("ui-recent-b"), "{rows:?}");
+
+    h.keys("<down><enter>");
+    assert_eq!(h.app.cur().unwrap().dir, b, "Enter on a recent opens it");
+    cleanup(a);
+    cleanup(b);
+    cleanup(state);
+}
+
+#[test]
+fn the_location_list_switches_and_close_drops_one() {
+    let a = small_repo("ui-list-a");
+    let b = small_repo("ui-list-b");
+    let mut h = Harness::open(&a);
+    h.keys(&format!("o{}<enter>", b.display()));
+    h.keys(":locations<enter>");
+    let screen = h.screen();
+    assert!(screen.contains("Locations ›"), "{screen}");
+    assert!(
+        screen.contains("main · everything"),
+        "rows show branch and range: {screen}"
+    );
+    h.keys("<enter>");
+    assert_eq!(
+        h.app.cur().unwrap().dir,
+        a,
+        "starts on the previous location"
+    );
+
+    h.keys(":close loc<enter>");
+    assert_eq!(h.app.locations.len(), 1);
+    assert_eq!(h.app.cur().unwrap().dir, b);
+    h.keys(":");
+    assert!(
+        !h.screen().contains("Close location"),
+        "nothing left to close"
+    );
+    cleanup(a);
+    cleanup(b);
 }

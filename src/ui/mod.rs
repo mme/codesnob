@@ -78,6 +78,19 @@ impl Palette {
 
 pub struct Options {
     pub context: usize,
+    /// Where the recent-locations list is kept; `None` keeps nothing.
+    pub state_dir: Option<PathBuf>,
+}
+
+/// How long the location strip stays after the last `-`.
+const FLIP_WINDOW: Duration = Duration::from_millis(1000);
+
+/// A run of `-` presses: each goes one further back in `order`, the
+/// most-recent order as it was at the first press.
+struct Flip {
+    order: Vec<u64>,
+    depth: usize,
+    last: Instant,
 }
 
 /// The parts of the last applied snapshot that the chrome needs.
@@ -174,6 +187,11 @@ pub struct App {
     body_h: usize,
     /// Commit messages are shown above a commit's diff unless turned off.
     show_commit_desc: bool,
+    flip: Option<Flip>,
+    /// How long the location strip stays after the last `-`.
+    flip_window: Duration,
+    /// The recent entries the Open list was built from.
+    open_choices: Vec<crate::recent::Entry>,
     pub quit: bool,
 }
 
@@ -202,26 +220,26 @@ impl App {
             message: None,
             body_h: 1,
             show_commit_desc: true,
+            flip: None,
+            flip_window: FLIP_WINDOW,
+            open_choices: Vec::new(),
             quit: false,
         }
     }
 
-    /// Display a target: a repository, or a placeholder when `dir` is not in one.
+    /// Display a target: switch to it if this viewer has it open, else open
+    /// it as a new location. Not being in a repository shows a placeholder.
     pub fn open(&mut self, target: Target) {
-        if let Some(cur) = self.locations.first()
-            && cur.dir == target.dir
-            && cur.base == target.base
+        if let Some(i) = self
+            .locations
+            .iter()
+            .position(|l| l.dir == target.dir && l.base == target.base)
         {
+            self.switch_to(i);
             return;
         }
         let id = self.next_id;
         self.next_id += 1;
-        let (watch, mode) = if target.repo {
-            let (h, m) = watch::spawn_watcher(target.dir.clone(), self.tx.clone(), id);
-            (Some(h), m)
-        } else {
-            (None, Mode::Off)
-        };
         let loc = Location {
             id,
             dir: target.dir.clone(),
@@ -231,8 +249,8 @@ impl App {
             focus: Focus::All,
             view: DiffView::default(),
             info: None,
-            _watch: watch,
-            mode,
+            _watch: None,
+            mode: Mode::Off,
             seq: 0,
             pending_since: None,
             error: None,
@@ -242,13 +260,245 @@ impl App {
             desc_dirty: true,
             desc_width: 0,
         };
-        // One location for now; switching between several comes later.
-        self.locations = vec![loc];
+        if let Some(state) = &self.opts.state_dir {
+            crate::recent::record(state, &target.dir, target.base.as_deref());
+        }
+        self.deactivate();
+        self.locations.insert(0, loc);
+        self.activate();
+    }
+
+    /// Bring location `i` to the front, as it was left.
+    fn switch_to(&mut self, i: usize) {
+        if i == 0 || i >= self.locations.len() {
+            return;
+        }
+        self.deactivate();
+        let loc = self.locations.remove(i);
+        self.locations.insert(0, loc);
+        self.activate();
+    }
+
+    /// Only the location on screen watches its files.
+    fn deactivate(&mut self) {
+        if let Some(loc) = self.locations.first_mut() {
+            loc._watch = None;
+            loc.mode = Mode::Off;
+        }
+    }
+
+    /// Start watching the front location and bring it up to date.
+    fn activate(&mut self) {
         self.panel = None;
-        self.message = None;
+        self.origin = None;
         self.hl.clear();
+        let tx = self.tx.clone();
+        let Some(loc) = self.locations.first_mut() else {
+            return;
+        };
+        loc.desc_dirty = true;
+        if loc.repo {
+            loc._watch = Some(watch::spawn_watcher(loc.dir.clone(), tx, loc.id));
+        }
+        let target = Target {
+            dir: loc.dir.clone(),
+            base: loc.base.clone(),
+            repo: loc.repo,
+        };
         self.link.set_target(target);
         self.request();
+    }
+
+    fn close_location(&mut self) {
+        if self.locations.len() < 2 {
+            return;
+        }
+        self.deactivate();
+        self.locations.remove(0);
+        self.activate();
+    }
+
+    /// `-`: flip to the previous location; quick repeats go further back.
+    fn flip(&mut self) {
+        if self.locations.len() < 2 {
+            self.message = Some("no other location open; o opens one".to_string());
+            return;
+        }
+        let flip = match self.flip.take() {
+            Some(f) if f.last.elapsed() < self.flip_window => Flip {
+                depth: f.depth + 1,
+                last: Instant::now(),
+                order: f.order,
+            },
+            _ => Flip {
+                order: self.locations.iter().map(|l| l.id).collect(),
+                depth: 1,
+                last: Instant::now(),
+            },
+        };
+        let target = flip.order[flip.depth % flip.order.len()];
+        if let Some(i) = self.locations.iter().position(|l| l.id == target) {
+            self.switch_to(i);
+        }
+        self.flip = Some(flip);
+    }
+
+    fn flipping(&self) -> bool {
+        self.flip
+            .as_ref()
+            .is_some_and(|f| f.last.elapsed() < self.flip_window)
+    }
+
+    /// Whether the screen must be redrawn on a timer: a load is in flight,
+    /// or the location strip is waiting to disappear.
+    pub fn needs_tick(&self) -> bool {
+        self.loading() || self.flipping()
+    }
+
+    /// Open what the Open prompt resolved to.
+    fn open_dir(&mut self, dir: PathBuf, base: Option<String>) {
+        let repo = gix::discover(&dir).is_ok();
+        self.open(Target { dir, base, repo });
+    }
+
+    /// A typed path: `~` expanded, relative to the current location.
+    fn resolve_path(&self, input: &str) -> Result<PathBuf, String> {
+        let path = self.expand(input);
+        let canon =
+            std::fs::canonicalize(&path).map_err(|_| format!("no such directory: {input}"))?;
+        if canon.is_dir() {
+            Ok(canon)
+        } else {
+            canon
+                .parent()
+                .map(|p| p.to_path_buf())
+                .ok_or_else(|| format!("no such directory: {input}"))
+        }
+    }
+
+    fn expand(&self, input: &str) -> PathBuf {
+        let input = input.trim();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let path = match (input.strip_prefix('~'), &home) {
+            (Some(rest), Some(home)) => home.join(rest.trim_start_matches('/')),
+            _ => PathBuf::from(input),
+        };
+        if path.is_absolute() {
+            return path;
+        }
+        let base = self
+            .cur()
+            .map(|l| l.dir.clone())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        base.join(path)
+    }
+
+    /// Tab in the Open prompt: complete the directory name being typed.
+    fn complete(&self, input: &str) -> Option<String> {
+        let (dir_part, prefix) = match input.rfind('/') {
+            Some(i) => (&input[..=i], &input[i + 1..]),
+            None => ("", input),
+        };
+        let base = if dir_part.is_empty() {
+            self.expand(".")
+        } else {
+            self.expand(dir_part)
+        };
+        let mut names: Vec<String> = std::fs::read_dir(base)
+            .ok()?
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with(prefix) && (prefix.starts_with('.') || !n.starts_with('.')))
+            .collect();
+        names.sort();
+        let first = names.first()?;
+        if names.len() == 1 {
+            return Some(format!("{dir_part}{first}/"));
+        }
+        let common = names.iter().fold(first.clone(), |acc, n| {
+            acc.chars()
+                .zip(n.chars())
+                .take_while(|(a, b)| a == b)
+                .map(|(a, _)| a)
+                .collect()
+        });
+        (common.len() > prefix.len()).then(|| format!("{dir_part}{common}"))
+    }
+
+    fn open_prompt(&mut self) {
+        let list = self
+            .opts
+            .state_dir
+            .as_deref()
+            .map(crate::recent::load)
+            .unwrap_or_default();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let items = list
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let open = self
+                    .locations
+                    .iter()
+                    .any(|l| l.dir == e.dir && l.base == e.base);
+                panel::Item {
+                    tag: None,
+                    text: tilde(&e.dir, home.as_deref()),
+                    hint: if open {
+                        "open".to_string()
+                    } else {
+                        ago(e.used as i64)
+                    },
+                    action: Action::OpenRecent(i),
+                    key: e.dir.display().to_string(),
+                }
+            })
+            .collect();
+        self.open_choices = list;
+        self.panel = Some(Panel::new(panel::Kind::Open, items, Vec::new(), None));
+    }
+
+    fn open_locations(&mut self) {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let items = self
+            .locations
+            .iter()
+            .map(|l| panel::Item {
+                tag: None,
+                text: format!("{}  {}", name_of(&l.dir), tilde(&l.dir, home.as_deref())),
+                hint: self.location_summary(l),
+                action: Action::SwitchLocation(l.id),
+                key: l.id.to_string(),
+            })
+            .collect();
+        let previous = self.locations.get(1).map(|l| l.id.to_string());
+        self.panel = Some(Panel::new(
+            panel::Kind::Locations,
+            items,
+            Vec::new(),
+            previous.as_deref(),
+        ));
+    }
+
+    /// "feature · commit 2 of 3": a location's branch and range.
+    fn location_summary(&self, l: &Location) -> String {
+        if !l.repo {
+            return "no repository".to_string();
+        }
+        let Some(info) = &l.info else {
+            return String::new();
+        };
+        let range = match l.range {
+            Range::Everything => "everything".to_string(),
+            Range::Uncommitted => "uncommitted".to_string(),
+            Range::Commit(id) => match info.commits.iter().position(|c| c.id == id) {
+                Some(i) => format!("commit {} of {}", i + 1, info.commits.len()),
+                None => id.to_hex_with_len(7).to_string(),
+            },
+        };
+        format!("{} · {range}", info.head_label)
     }
 
     fn cur(&self) -> Option<&Location> {
@@ -380,12 +630,24 @@ impl App {
             Msg::Loaded { loc, seq, result } => self.apply_loaded(loc, seq, *result),
             Msg::Show(target) => self.open(target),
             Msg::Link(up) => self.linked = up,
+            Msg::Watching { loc, mode } => {
+                if let Some(l) = self.locations.iter_mut().find(|l| l.id == loc)
+                    && l._watch.is_some()
+                {
+                    l.mode = mode;
+                }
+            }
         }
     }
 
     pub fn handle(&mut self, ev: Event) {
         match ev {
             Event::Key(k) if k.kind != crossterm::event::KeyEventKind::Release => self.key(k),
+            Event::Paste(text) => {
+                if let Some(p) = self.panel.as_mut() {
+                    p.paste(&text);
+                }
+            }
             Event::Mouse(m) => {
                 let delta: isize = match m.kind {
                     MouseEventKind::ScrollDown => 3,
@@ -430,6 +692,15 @@ impl App {
                     }
                     self.perform(action);
                 }
+                Some(Outcome::Submit { input, selected }) => self.submit_open(&input, selected),
+                Some(Outcome::Complete) => {
+                    let input = self.panel.as_ref().map(|p| p.input().to_string());
+                    if let Some(done) = input.and_then(|i| self.complete(&i))
+                        && let Some(p) = self.panel.as_mut()
+                    {
+                        p.set_input(done);
+                    }
+                }
                 Some(Outcome::Quit) => self.quit = true,
                 Some(Outcome::Stay) | None => self.preview(before),
             }
@@ -437,6 +708,9 @@ impl App {
         }
 
         self.message = None;
+        if k.code != KeyCode::Char('-') {
+            self.flip = None;
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         let page = self.body_h.saturating_sub(2).max(1) as isize;
@@ -461,6 +735,8 @@ impl App {
             | (KeyCode::Char('?'), false, _)
             | (KeyCode::Char('k'), true, false) => self.open_palette(),
             (KeyCode::Char('f'), false, false) => self.perform(Action::Files),
+            (KeyCode::Char('o'), false, false) => self.perform(Action::Open),
+            (KeyCode::Char('-'), false, false) => self.perform(Action::PreviousLocation),
             (KeyCode::Char('c'), false, false) => self.perform(Action::Commits),
             (KeyCode::Char('<'), false, false) => self.perform(Action::OlderCommit),
             (KeyCode::Char('>'), false, false) => self.perform(Action::NewerCommit),
@@ -609,6 +885,29 @@ impl App {
         loc.view.narrow_to_path(path.as_deref());
         if let Some(a) = origin.anchor {
             loc.view.restore(a);
+        }
+    }
+
+    /// Enter in the Open prompt: a typed path that exists wins, else the
+    /// highlighted recent location.
+    fn submit_open(&mut self, input: &str, selected: Option<Action>) {
+        let input = input.trim();
+        let typed = (!input.is_empty()).then(|| self.resolve_path(input));
+        match (typed, selected) {
+            (Some(Ok(dir)), _) => {
+                self.close_panel(false);
+                self.open_dir(dir, None);
+            }
+            (_, Some(action)) => {
+                self.close_panel(false);
+                self.perform(action);
+            }
+            (Some(Err(e)), None) => {
+                if let Some(p) = self.panel.as_mut() {
+                    p.note = Some(e);
+                }
+            }
+            (None, None) => self.close_panel(false),
         }
     }
 
@@ -797,7 +1096,7 @@ impl App {
 
     fn applicable(&self, action: Action) -> bool {
         let Some(loc) = self.cur() else {
-            return action == Action::Quit;
+            return matches!(action, Action::Quit | Action::Open);
         };
         let has_rows = loc.view.has_files();
         let has_base = loc
@@ -805,7 +1104,11 @@ impl App {
             .as_ref()
             .is_some_and(|i| i.base.name.is_some() && !i.unborn);
         let has_info = loc.info.is_some();
+        let several = self.locations.len() > 1;
         match action {
+            Action::Open | Action::OpenRecent(_) => true,
+            Action::Locations | Action::SwitchLocation(_) => several,
+            Action::PreviousLocation | Action::CloseLocation => several,
             Action::Commits => has_info,
             Action::OlderCommit | Action::NewerCommit => loc
                 .info
@@ -860,6 +1163,24 @@ impl App {
         match action {
             Action::Quit => self.quit = true,
             Action::Files => self.open_files(),
+            Action::Open => self.open_prompt(),
+            Action::OpenRecent(i) => {
+                if let Some(e) = self.open_choices.get(i).cloned() {
+                    if e.dir.is_dir() {
+                        self.open_dir(e.dir, e.base);
+                    } else {
+                        self.message = Some(format!("{} no longer exists", e.dir.display()));
+                    }
+                }
+            }
+            Action::Locations => self.open_locations(),
+            Action::SwitchLocation(id) => {
+                if let Some(i) = self.locations.iter().position(|l| l.id == id) {
+                    self.switch_to(i);
+                }
+            }
+            Action::PreviousLocation => self.flip(),
+            Action::CloseLocation => self.close_location(),
             Action::Commits => self.open_commits(),
             Action::OlderCommit => self.step(true),
             Action::NewerCommit => self.step(false),
@@ -1110,6 +1431,27 @@ impl App {
     fn render_status(&self, area: Rect, buf: &mut Buffer) {
         let style = Style::default().add_modifier(Modifier::REVERSED);
         buf.set_style(area, style);
+        if let Some(flip) = self.flip.as_ref().filter(|_| self.flipping()) {
+            // The location strip: where `-` has taken you, among the others.
+            let target = flip.order[flip.depth % flip.order.len()];
+            let mut spans = vec![Span::styled(" ", style)];
+            for (n, id) in flip.order.iter().enumerate() {
+                let Some(l) = self.locations.iter().find(|l| l.id == *id) else {
+                    continue;
+                };
+                if n > 0 {
+                    spans.push(Span::styled(" · ", style));
+                }
+                let name = format!(" {} ", name_of(&l.dir));
+                spans.push(if *id == target {
+                    Span::styled(name, Style::default().add_modifier(Modifier::BOLD))
+                } else {
+                    Span::styled(name, style)
+                });
+            }
+            buf.set_line(area.x, area.y, &Line::from(spans), area.width);
+            return;
+        }
         let left = format!(" {}", self.scope());
         let mut right = String::new();
         if let Some(m) = &self.message {
@@ -1154,6 +1496,22 @@ impl App {
     }
 }
 
+/// A location's short name: its directory's.
+fn name_of(dir: &std::path::Path) -> String {
+    dir.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string())
+}
+
+/// `dir` with the home directory shown as `~`.
+fn tilde(dir: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    match home.and_then(|h| dir.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => dir.display().to_string(),
+    }
+}
+
 /// "3 hours ago", for commit lists.
 fn ago(time: i64) -> String {
     let now = std::time::SystemTime::now()
@@ -1175,12 +1533,17 @@ fn ago(time: i64) -> String {
 
 pub fn run(mut app: App, rx: Receiver<Msg>) -> Result<()> {
     let mut terminal = ratatui::init();
-    crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture).ok();
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste
+    )
+    .ok();
     let result = (|| -> Result<()> {
         loop {
             terminal.draw(|f| app.draw(f))?;
-            // While a load is in flight, wake up to show "Loading…" in time.
-            let msg = if app.loading() {
+            // Wake up on a timer while something on screen is time-based.
+            let msg = if app.needs_tick() {
                 match rx.recv_timeout(Duration::from_millis(50)) {
                     Ok(m) => Some(m),
                     Err(RecvTimeoutError::Timeout) => None,
@@ -1204,7 +1567,12 @@ pub fn run(mut app: App, rx: Receiver<Msg>) -> Result<()> {
             }
         }
     })();
-    crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture).ok();
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste
+    )
+    .ok();
     ratatui::restore();
     result
 }

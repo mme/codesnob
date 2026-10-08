@@ -18,6 +18,8 @@ pub enum Kind {
     Commands,
     Files,
     Commits,
+    Open,
+    Locations,
 }
 
 impl Kind {
@@ -26,6 +28,8 @@ impl Kind {
             Kind::Commands => "Commands",
             Kind::Files => "Files",
             Kind::Commits => "Commits",
+            Kind::Open => "Open",
+            Kind::Locations => "Locations",
         }
     }
 
@@ -33,7 +37,7 @@ impl Kind {
     fn recent_first(self) -> bool {
         match self {
             Kind::Commands => true,
-            Kind::Files | Kind::Commits => false,
+            Kind::Files | Kind::Commits | Kind::Open | Kind::Locations => false,
         }
     }
 
@@ -59,6 +63,14 @@ pub enum Outcome {
     Stay,
     Close,
     Choose(Action, String),
+    /// Enter in a list that takes typed input (Open): the input, and the
+    /// highlighted row if any.
+    Submit {
+        input: String,
+        selected: Option<Action>,
+    },
+    /// Tab in a list that takes typed input: complete the input.
+    Complete,
     Quit,
 }
 
@@ -99,6 +111,22 @@ impl Panel {
             p.selected = pos;
         }
         p
+    }
+
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+
+    pub fn set_input(&mut self, input: String) {
+        self.input = input;
+        self.refilter();
+    }
+
+    /// Pasted text goes into the input, newlines dropped.
+    pub fn paste(&mut self, text: &str) {
+        self.input
+            .extend(text.chars().filter(|c| *c != '\n' && *c != '\r'));
+        self.refilter();
     }
 
     /// The action of the highlighted row.
@@ -152,6 +180,13 @@ impl Panel {
         match (k.code, ctrl) {
             (KeyCode::Char('c'), true) => return Outcome::Quit,
             (KeyCode::Esc, _) => return Outcome::Close,
+            (KeyCode::Enter, _) if self.kind == Kind::Open => {
+                return Outcome::Submit {
+                    input: self.input.clone(),
+                    selected: self.selected_action(),
+                };
+            }
+            (KeyCode::Tab, _) if self.kind == Kind::Open => return Outcome::Complete,
             (KeyCode::Enter, _) => {
                 return match self.shown.get(self.selected) {
                     Some(&i) => Outcome::Choose(self.items[i].action, self.items[i].key.clone()),
@@ -228,12 +263,12 @@ impl Panel {
             self.offset = self.selected + 1 - rows;
         }
         if self.shown.is_empty() {
-            buf.set_span(
-                area.x,
-                area.y + 1,
-                &Span::styled("  no matches", dim),
-                area.width,
-            );
+            let text = match self.kind {
+                Kind::Open if self.items.is_empty() => "  type a path, Tab completes",
+                Kind::Open => "  Enter opens the path",
+                _ => "  no matches",
+            };
+            buf.set_span(area.x, area.y + 1, &Span::styled(text, dim), area.width);
         }
         for (n, &i) in self.shown.iter().skip(self.offset).take(rows).enumerate() {
             let y = area.y + 1 + n as u16;
