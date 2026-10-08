@@ -6,6 +6,7 @@ mod link;
 mod loader;
 mod mcp;
 mod proto;
+mod recent;
 #[cfg(test)]
 mod testutil;
 mod ui;
@@ -126,6 +127,7 @@ fn main() -> Result<()> {
     let mut app = ui::App::new(
         ui::Options {
             context: args.context,
+            state_dir: recent::default_dir(),
         },
         palette,
         hl,

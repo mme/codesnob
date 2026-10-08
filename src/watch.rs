@@ -29,6 +29,11 @@ pub enum Msg {
     Show(crate::proto::Target),
     /// Daemon link went up or down.
     Link(bool),
+    /// How location `loc`'s watcher ended up detecting changes.
+    Watching {
+        loc: u64,
+        mode: Mode,
+    },
 }
 
 const DEBOUNCE: Duration = Duration::from_millis(150);
@@ -68,25 +73,29 @@ impl Drop for Handle {
 }
 
 /// Watch `dir`'s repository and send `Msg::Changed { loc }` after each burst
-/// of changes.
-pub fn spawn_watcher(dir: PathBuf, tx: Sender<Msg>, loc: u64) -> (Handle, Mode) {
+/// of changes. Setting up the watches walks the worktree, so it happens on
+/// the watcher's own thread; `Msg::Watching` reports the outcome.
+pub fn spawn_watcher(dir: PathBuf, tx: Sender<Msg>, loc: u64) -> Handle {
     let (poke_tx, poke_rx) = channel::<()>();
-    let watcher = setup_watcher(&dir, poke_tx.clone());
-    let mode = if watcher.is_some() {
-        Mode::Watching
-    } else {
-        Mode::Polling
-    };
+    let poke = poke_tx.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
-    std::thread::spawn(move || watch_loop(dir, tx, poke_rx, watcher, loc, flag));
-    (
-        Handle {
-            stop,
-            poke: poke_tx,
-        },
-        mode,
-    )
+    std::thread::spawn(move || {
+        let watcher = setup_watcher(&dir, poke);
+        let mode = if watcher.is_some() {
+            Mode::Watching
+        } else {
+            Mode::Polling
+        };
+        if tx.send(Msg::Watching { loc, mode }).is_err() {
+            return;
+        }
+        watch_loop(dir, tx, poke_rx, watcher, loc, flag)
+    });
+    Handle {
+        stop,
+        poke: poke_tx,
+    }
 }
 
 /// macOS's FSEvents watches whole trees cheaply but re-creates its stream on
@@ -301,7 +310,11 @@ mod tests {
     fn an_edit_notifies_and_an_ignored_write_does_not() {
         let dir = repo("edit");
         let (tx, rx) = channel();
-        let (_handle, mode) = spawn_watcher(dir.clone(), tx, 7);
+        let _handle = spawn_watcher(dir.clone(), tx, 7);
+        let mode = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Msg::Watching { mode, .. }) => mode,
+            _ => panic!("the watcher reports its mode first"),
+        };
         assert!(mode == Mode::Watching, "a native watcher is available");
         // Let the watcher settle before the first change.
         std::thread::sleep(Duration::from_millis(300));
@@ -322,7 +335,7 @@ mod tests {
     fn a_new_directory_is_picked_up() {
         let dir = repo("newdir");
         let (tx, rx) = channel();
-        let (_handle, _) = spawn_watcher(dir.clone(), tx, 7);
+        let _handle = spawn_watcher(dir.clone(), tx, 7);
         std::thread::sleep(Duration::from_millis(300));
 
         std::fs::create_dir(dir.join("src")).unwrap();
@@ -344,7 +357,7 @@ mod tests {
     fn dropping_the_handle_stops_notifications() {
         let dir = repo("drop");
         let (tx, rx) = channel();
-        let (handle, _) = spawn_watcher(dir.clone(), tx, 7);
+        let handle = spawn_watcher(dir.clone(), tx, 7);
         std::thread::sleep(Duration::from_millis(300));
         drop(handle);
         std::thread::sleep(Duration::from_millis(300));

@@ -3,6 +3,13 @@
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Action {
+    Open,
+    /// Open entry `n` of the recent list shown by Open.
+    OpenRecent(usize),
+    Locations,
+    SwitchLocation(u64),
+    PreviousLocation,
+    CloseLocation,
     Commits,
     OlderCommit,
     NewerCommit,
@@ -35,6 +42,21 @@ pub struct Command {
 
 /// In palette order: what the palette is for first, movement after.
 pub const COMMANDS: &[Command] = &[
+    Command {
+        action: Action::Open,
+        name: "Open…",
+        keys: "o",
+    },
+    Command {
+        action: Action::Locations,
+        name: "Locations…",
+        keys: "",
+    },
+    Command {
+        action: Action::PreviousLocation,
+        name: "Previous location",
+        keys: "-",
+    },
     Command {
         action: Action::Commits,
         name: "Commits…",
@@ -84,6 +106,11 @@ pub const COMMANDS: &[Command] = &[
         action: Action::Reload,
         name: "Reload",
         keys: "r",
+    },
+    Command {
+        action: Action::CloseLocation,
+        name: "Close location",
+        keys: "",
     },
     Command {
         action: Action::NextHunk,
