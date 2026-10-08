@@ -319,6 +319,16 @@ fn checkout_dir(cache: &Path, repo: &RepoId, number: u64) -> PathBuf {
         .join(number.to_string())
 }
 
+/// The repository behind an existing checkout.
+fn common_dir(dir: &Path) -> Option<PathBuf> {
+    let out = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()?;
+    Some(PathBuf::from(out.trim()))
+}
+
 fn checkout(
     info: &Info,
     clones: &[PathBuf],
@@ -328,81 +338,108 @@ fn checkout(
         .repo()
         .ok_or_else(|| format!("cannot read the repository from {}", info.url))?;
     let n = info.number;
+    // Checkouts share the cache; a prune neither runs during one nor races it.
+    let _cache = lock(&cache.join(".lock"), false, true);
 
-    // A clone of the repository: one already open here, else the cache's.
-    let cache_clone = cache
-        .join("repos")
-        .join(&repo.host)
-        .join(&repo.owner)
-        .join(&repo.name);
-    let mut candidates = clones.to_vec();
-    candidates.push(cache_clone.clone());
-    let (clone, remote) = match find_clone(&repo, &candidates) {
+    let dir = checkout_dir(cache, &repo, n);
+    // Fetch into the repository the checkout already lives in, so the
+    // checkout sees the new head; otherwise into a clone open here, else the
+    // cache's own clone.
+    let existing = if dir.join(".git").exists() {
+        let found = common_dir(&dir).and_then(|c| find_clone(&repo, &[c]));
+        if found.is_none() {
+            remove_checkout(&dir);
+        }
+        found
+    } else {
+        None
+    };
+    let fresh = existing.is_none();
+    let (clone, remote) = match existing {
         Some(found) => found,
         None => {
-            std::fs::create_dir_all(cache_clone.parent().unwrap_or(cache))
-                .map_err(|e| e.to_string())?;
-            let out = Command::new("gh")
-                .args(["repo", "clone"])
-                .arg(format!("{}/{}/{}", repo.host, repo.owner, repo.name))
-                .arg(&cache_clone)
-                .args(["--", "--filter=blob:none", "--no-checkout", "--quiet"])
-                .output()
-                .map_err(|e| format!("gh failed: {e}"))?;
-            if !out.status.success() {
-                let err = String::from_utf8_lossy(&out.stderr);
-                return Err(err.lines().last().unwrap_or("clone failed").to_string());
+            let cache_clone = cache
+                .join("repos")
+                .join(&repo.host)
+                .join(&repo.owner)
+                .join(&repo.name);
+            let mut candidates = clones.to_vec();
+            candidates.push(cache_clone.clone());
+            match find_clone(&repo, &candidates) {
+                Some(found) => found,
+                None => {
+                    std::fs::create_dir_all(cache_clone.parent().unwrap_or(cache))
+                        .map_err(|e| e.to_string())?;
+                    let out = Command::new("gh")
+                        .args(["repo", "clone"])
+                        .arg(format!("{}/{}/{}", repo.host, repo.owner, repo.name))
+                        .arg(&cache_clone)
+                        .args(["--", "--filter=blob:none", "--no-checkout", "--quiet"])
+                        .output()
+                        .map_err(|e| format!("gh failed: {e}"))?;
+                    if !out.status.success() {
+                        let err = String::from_utf8_lossy(&out.stderr);
+                        return Err(err.lines().last().unwrap_or("clone failed").to_string());
+                    }
+                    (cache_clone, "origin".to_string())
+                }
             }
-            (cache_clone, "origin".to_string())
         }
     };
 
     let head_ref = format!("refs/codesnob/pr/{n}");
     let base_ref = format!("refs/codesnob/pr/{n}-base");
-    git(
-        &clone,
-        &[
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            &remote,
-            &format!("+refs/pull/{n}/head:{head_ref}"),
-            &format!("+refs/heads/{}:{base_ref}", info.base_ref_name),
-        ],
-    )?;
+    let fetch = |refspec: &str| git(&clone, &["fetch", "--quiet", "--no-tags", &remote, refspec]);
+    fetch(&format!("+refs/pull/{n}/head:{head_ref}"))?;
+    // The base branch may be gone, typically after a stacked PR merged.
+    let base_fetched = fetch(&format!("+refs/heads/{}:{base_ref}", info.base_ref_name)).is_ok();
 
     // A merged PR is already part of its base branch, so diffing against the
     // branch shows nothing. Start from the branch as it was just before the
     // merge instead, which is what GitHub shows.
+    let mut based = base_fetched;
     if info.state == "MERGED"
         && let Some(m) = &info.merge_commit
-        && let Ok(before) = git(&clone, &["rev-parse", "--verify", &format!("{}^1", m.oid)])
     {
-        git(&clone, &["update-ref", &base_ref, before.trim()])?;
+        let parent = format!("{}^1", m.oid);
+        if git(&clone, &["rev-parse", "--verify", "--quiet", &parent]).is_err() {
+            let _ = fetch(&m.oid);
+        }
+        if let Ok(before) = git(&clone, &["rev-parse", "--verify", "--quiet", &parent]) {
+            git(&clone, &["update-ref", &base_ref, before.trim()])?;
+            based = true;
+        }
+    }
+    if !based {
+        return Err(format!(
+            "the base branch {} no longer exists",
+            info.base_ref_name
+        ));
     }
 
-    let dir = checkout_dir(cache, &repo, n);
     let mut note = None;
     let fetched = git(&clone, &["rev-parse", &head_ref]).unwrap_or_default();
     if !info.head_ref_oid.is_empty() && fetched.trim() != info.head_ref_oid {
         note = Some(format!("#{n} moved while fetching; r fetches again"));
     }
-    if dir.join(".git").exists() {
+    if !fresh {
         if let Err(e) = git(&dir, &["checkout", "--quiet", "--detach", &head_ref]) {
             note = Some(format!(
                 "local edits kept the checkout at its old head ({e})"
             ));
         }
     } else {
-        let _ = git(&clone, &["worktree", "prune"]);
         if dir.exists() {
             std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
         }
         std::fs::create_dir_all(dir.parent().unwrap_or(cache)).map_err(|e| e.to_string())?;
         let path = dir.to_string_lossy().into_owned();
+        // --force: a checkout deleted by hand can still be registered.
         git(
             &clone,
-            &["worktree", "add", "--quiet", "--detach", &path, &head_ref],
+            &[
+                "worktree", "add", "--quiet", "--force", "--detach", &path, &head_ref,
+            ],
         )?;
     }
     touch(&dir);
@@ -410,7 +447,8 @@ fn checkout(
     Ok((dir, base_ref, note))
 }
 
-/// Next to each checkout, `<n>.used` records when it was last opened.
+/// Next to each checkout, `<n>.used` records when it was last opened, and a
+/// viewer showing the checkout holds a shared lock on it.
 fn marker(dir: &Path) -> PathBuf {
     let mut m = dir.as_os_str().to_owned();
     m.push(".used");
@@ -421,36 +459,83 @@ fn touch(dir: &Path) {
     let _ = std::fs::write(marker(dir), b"");
 }
 
-/// Remove PR checkouts not opened within `unused_for`, except `keep`.
-/// Returns how many were removed.
-pub fn prune(cache: &Path, unused_for: Duration, keep: &[PathBuf]) -> usize {
+/// An advisory file lock, released when dropped.
+pub struct Hold(#[allow(dead_code)] std::fs::File);
+
+fn lock(path: &Path, exclusive: bool, wait: bool) -> Option<Hold> {
+    use std::os::unix::io::AsRawFd;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()?;
+    let mut op = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    if !wait {
+        op |= libc::LOCK_NB;
+    }
+    // SAFETY: flock on a descriptor this function owns.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
+    (rc == 0).then_some(Hold(file))
+}
+
+/// Keep the checkout at `dir` from being pruned, by any viewer, while held.
+pub fn hold(dir: &Path) -> Option<Hold> {
+    lock(&marker(dir), false, true)
+}
+
+/// Remove PR checkouts not opened within `unused_for` and not open in any
+/// viewer. Returns how many were removed.
+pub fn prune(cache: &Path, unused_for: Duration) -> usize {
+    // Never during a checkout; another time will do.
+    let Some(_cache) = lock(&cache.join(".lock"), true, false) else {
+        return 0;
+    };
     let mut removed = 0;
-    let mut stack = vec![cache.join("pr")];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let path = e.path();
-            if path.extension().is_some_and(|x| x == "used") {
-                let dir = path.with_extension("");
-                let age = e
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| SystemTime::now().duration_since(t).ok())
-                    .unwrap_or(Duration::MAX);
-                let kept = keep
-                    .iter()
-                    .any(|k| std::fs::canonicalize(&dir).is_ok_and(|d| d == *k));
-                if age >= unused_for && !kept {
+    let level = |d: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(d)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .collect()
+    };
+    // pr/<host>/<owner>/<name>/<n> with <n>.used beside it.
+    for host in level(&cache.join("pr")) {
+        for owner in level(&host) {
+            for name in level(&owner) {
+                for path in level(&name) {
+                    let file = path.file_name().map(|f| f.to_string_lossy().into_owned());
+                    let Some(n) = file.as_deref().and_then(|f| f.strip_suffix(".used")) else {
+                        continue;
+                    };
+                    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+                        continue;
+                    }
+                    let dir = name.join(n);
+                    let age = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| SystemTime::now().duration_since(t).ok())
+                        .unwrap_or(Duration::MAX);
+                    if age < unused_for {
+                        continue;
+                    }
+                    // A viewer showing it holds a shared lock.
+                    let Some(_open) = lock(&path, true, false) else {
+                        continue;
+                    };
                     remove_checkout(&dir);
                     let _ = std::fs::remove_file(&path);
                     remove_empty_parents(&dir, cache);
                     removed += 1;
                 }
-            } else if path.is_dir() && !path.join(".git").exists() {
-                stack.push(path);
             }
         }
     }
@@ -459,7 +544,7 @@ pub fn prune(cache: &Path, unused_for: Duration, keep: &[PathBuf]) -> usize {
 }
 
 /// Clones in the cache exist only to back PR checkouts; one with none left
-/// goes too, and is cloned again when needed.
+/// goes too, and is cloned again when needed. Runs under the cache lock.
 fn prune_clones(cache: &Path) {
     let repos = cache.join("repos");
     let Ok(hosts) = std::fs::read_dir(&repos) else {
@@ -562,6 +647,20 @@ mod tests {
         assert_eq!(parse("~/Projects/x"), None);
         assert_eq!(parse("src/lib.rs"), None);
         assert_eq!(parse("https://github.com/acme/widget"), None);
+    }
+
+    #[test]
+    fn prune_only_reads_numbered_markers() {
+        let cache = crate::testutil::fresh_dir("pr-markers");
+        let repo = cache.join("pr/github.com/acme/foo");
+        std::fs::create_dir_all(repo.join("keep-me")).unwrap();
+        std::fs::create_dir_all(cache.join("pr/github.com/acme/foo.used")).unwrap();
+        assert_eq!(prune(&cache, Duration::ZERO), 0);
+        assert!(
+            repo.join("keep-me").exists(),
+            "a repo named foo.used is not a marker"
+        );
+        let _ = std::fs::remove_dir_all(cache);
     }
 
     #[test]

@@ -125,9 +125,7 @@ fn main() -> Result<()> {
     };
     // PR checkouts unused for a week go, quietly, in the background.
     if let Some(cache) = pr::default_cache() {
-        std::thread::spawn(move || {
-            pr::prune(&cache, std::time::Duration::from_secs(7 * 86_400), &[])
-        });
+        std::thread::spawn(move || pr::prune(&cache, std::time::Duration::from_secs(7 * 86_400)));
     }
     let (tx, rx) = std::sync::mpsc::channel();
     let link = link::Link::new();

@@ -94,6 +94,8 @@ struct PrState {
     fetching: bool,
     /// Checked out at least once, so `dir` is real.
     ready: bool,
+    /// Keeps the checkout from being pruned while this viewer has it open.
+    _hold: Option<crate::pr::Hold>,
 }
 
 /// How long the location strip stays after the last `-`.
@@ -310,6 +312,10 @@ impl App {
 
     /// Only the location on screen watches its files.
     fn deactivate(&mut self) {
+        // A list previewing on the location being left puts it back first.
+        if self.panel.is_some() {
+            self.close_panel(true);
+        }
         if let Some(loc) = self.locations.first_mut() {
             loc._watch = None;
             loc.mode = Mode::Off;
@@ -385,6 +391,7 @@ impl App {
                 info: None,
                 fetching: true,
                 ready: false,
+                _hold: None,
             }),
         };
         self.deactivate();
@@ -485,6 +492,9 @@ impl App {
                     p.info = Some(info);
                     p.fetching = false;
                     p.ready = true;
+                    if p._hold.is_none() {
+                        p._hold = crate::pr::hold(&dir);
+                    }
                 }
                 loc.dir = dir;
                 loc.base = Some(base);
@@ -762,6 +772,7 @@ impl App {
         }
         loc.range = range;
         loc.error = None;
+        loc.pending_anchor = None;
         self.request();
     }
 
@@ -773,6 +784,8 @@ impl App {
 
     fn apply_loaded(&mut self, id: u64, seq: u64, result: Result<git::Snapshot, String>) {
         let context = self.opts.context;
+        // A location loaded in the background speaks only once it is shown.
+        let current = self.locations.first().is_some_and(|l| l.id == id);
         let Some(loc) = self.locations.iter_mut().find(|l| l.id == id) else {
             return;
         };
@@ -781,14 +794,16 @@ impl App {
         }
         loc.pending_since = None;
         let manual = std::mem::take(&mut loc.manual);
+        // Only ever for this load; never carried to a later range.
+        let pending = loc.pending_anchor.take();
         let snap = match result {
             Ok(snap) => snap,
             Err(e) => {
                 let shown = loc.info.as_ref().is_some_and(|i| i.range == loc.range);
-                if shown {
-                    self.message = Some(format!("refresh failed: {e}"));
-                } else {
+                if !shown {
                     loc.error = Some(e);
+                } else if current {
+                    self.message = Some(format!("refresh failed: {e}"));
                 }
                 return;
             }
@@ -802,15 +817,17 @@ impl App {
                 .as_ref()
                 .is_some_and(|i| i.commits.iter().any(|c| c.id == id))
         {
-            let short = id.to_hex_with_len(7).to_string();
-            self.message = Some(format!("{short} is no longer on this branch"));
             loc.range = Range::Everything;
-            self.request();
+            if current {
+                let short = id.to_hex_with_len(7).to_string();
+                self.message = Some(format!("{short} is no longer on this branch"));
+                self.request();
+            }
             return;
         }
         let fingerprint = snap.fingerprint();
         if fingerprint == loc.fingerprint {
-            if manual {
+            if manual && current {
                 self.message = Some("no changes since the last load".to_string());
             }
             return;
@@ -824,12 +841,12 @@ impl App {
             && !loc.view.narrow_to_path(Some(path))
         {
             // While a list previews, a file missing from one commit is not news.
-            if self.panel.is_none() {
+            if self.panel.is_none() || !current {
                 self.message = Some(format!("{path} has no changes here; showing all files"));
                 loc.focus = Focus::All;
             }
         }
-        match anchor.or(loc.pending_anchor.take()) {
+        match anchor.or(pending) {
             Some(a) => loc.view.restore(a),
             None if !same_range => {
                 loc.view.scroll = 0;
@@ -839,9 +856,11 @@ impl App {
         }
         loc.info = Some(info);
         loc.desc_dirty = true;
-        self.hl.clear();
-        if manual {
-            self.message = Some("reloaded".to_string());
+        if current {
+            self.hl.clear();
+            if manual {
+                self.message = Some("reloaded".to_string());
+            }
         }
     }
 
@@ -885,7 +904,7 @@ impl App {
                 };
                 match self.panel.as_mut() {
                     Some(p) => {
-                        let before = p.selected_action();
+                        let before = p.selected_key();
                         p.move_by(delta.signum());
                         self.preview(before);
                     }
@@ -907,7 +926,7 @@ impl App {
     fn key(&mut self, k: KeyEvent) {
         if self.panel.is_some() {
             let rows = self.panel_rows();
-            let before = self.panel.as_ref().and_then(|p| p.selected_action());
+            let before = self.panel.as_ref().and_then(|p| p.selected_key());
             let outcome = self.panel.as_mut().map(|p| p.key(k, rows));
             match outcome {
                 Some(Outcome::Close) => self.close_panel(true),
@@ -917,9 +936,13 @@ impl App {
                     if let Some(kind) = kind {
                         let list = self.recent.entry(kind).or_default();
                         list.retain(|k| *k != key);
-                        list.insert(0, key);
+                        list.insert(0, key.clone());
                     }
-                    self.perform(action);
+                    match action {
+                        // Files are chosen by path: the list may predate a reload.
+                        Action::GoToFile => self.go_to_path(&key),
+                        _ => self.perform(action),
+                    }
                 }
                 Some(Outcome::Submit { input, selected }) => self.submit_open(&input, selected),
                 Some(Outcome::Complete) => {
@@ -1061,6 +1084,40 @@ impl App {
         }
     }
 
+    fn go_to_path(&mut self, path: &str) {
+        let fi = self
+            .cur()
+            .and_then(|l| l.view.files.iter().position(|f| f.path == path));
+        if let Some(fi) = fi {
+            self.go_to_file(fi);
+        }
+    }
+
+    /// Keep focus and the screen in agreement once a list has closed: a
+    /// narrowed file the shown range lacks means showing all files.
+    fn reconcile_focus(&mut self) {
+        let Some(loc) = self.cur_mut() else { return };
+        let Focus::File(path) = loc.focus.clone() else {
+            return;
+        };
+        // A load for the asked range is on its way and will decide.
+        if loc.info.as_ref().is_none_or(|i| i.range != loc.range) {
+            return;
+        }
+        if loc
+            .view
+            .narrowed()
+            .is_some_and(|fi| loc.view.files[fi].path == path)
+        {
+            return;
+        }
+        if !loc.view.narrow_to_path(Some(&path)) {
+            loc.focus = Focus::All;
+            loc.desc_dirty = true;
+            self.message = Some(format!("{path} has no changes here; showing all files"));
+        }
+    }
+
     /// Move to file `fi`: jump in the full view, switch file while narrowed.
     fn go_to_file(&mut self, fi: usize) {
         let Some(loc) = self.cur_mut() else { return };
@@ -1075,17 +1132,23 @@ impl App {
     }
 
     /// Show what a previewing list has highlighted, if it changed.
-    fn preview(&mut self, before: Option<Action>) {
+    /// `before` is the key of the row highlighted before the last key press.
+    fn preview(&mut self, before: Option<String>) {
         let Some(panel) = &self.panel else { return };
         if !panel.kind.previews() {
             return;
         }
-        let now = panel.selected_action();
-        if now == before {
+        let now_key = panel.selected_key();
+        if now_key == before {
             return;
         }
+        let now = panel.selected_action();
         match now {
-            Some(Action::GoToFile(fi)) => self.go_to_file(fi),
+            Some(Action::GoToFile) => {
+                if let Some(path) = now_key {
+                    self.go_to_path(&path);
+                }
+            }
             Some(Action::RangeEverything) => self.set_range(Range::Everything),
             Some(Action::RangeUncommitted) => self.set_range(Range::Uncommitted),
             Some(Action::ShowCommit(id)) => self.set_range(Range::Commit(id)),
@@ -1100,6 +1163,7 @@ impl App {
             return;
         };
         if !revert {
+            self.reconcile_focus();
             return;
         }
         let Some(loc) = self.cur_mut() else { return };
@@ -1120,6 +1184,7 @@ impl App {
         if let Some(a) = origin.anchor {
             loc.view.restore(a);
         }
+        self.reconcile_focus();
     }
 
     /// Enter in the Open prompt: a typed path that exists wins, else the
@@ -1283,7 +1348,7 @@ impl App {
         let Some(loc) = self.cur() else {
             return Vec::new();
         };
-        if loc.focus != Focus::All || !self.show_commit_desc {
+        if loc.focus != Focus::All {
             return Vec::new();
         }
         let Some(info) = &loc.info else {
@@ -1297,6 +1362,9 @@ impl App {
             } else {
                 Vec::new()
             };
+        }
+        if !self.show_commit_desc {
+            return Vec::new();
         }
         let (Range::Commit(id), Some(c)) = (info.range, &info.commit) else {
             return Vec::new();
@@ -1334,8 +1402,7 @@ impl App {
             .view
             .files
             .iter()
-            .enumerate()
-            .map(|(fi, f)| {
+            .map(|f| {
                 let (tag, color) = match f.status {
                     crate::diff::Status::Added => ("A", Color::Green),
                     crate::diff::Status::Deleted => ("D", Color::Red),
@@ -1350,7 +1417,7 @@ impl App {
                     } else {
                         format!("+{} −{}", f.added, f.removed)
                     },
-                    action: Action::GoToFile(fi),
+                    action: Action::GoToFile,
                     key: f.path.clone(),
                 }
             })
@@ -1397,7 +1464,7 @@ impl App {
                 matches!(loc.range, Range::Commit(_))
                     || loc.pr.is_some() && loc.range == Range::Everything
             }
-            Action::Files | Action::Narrow | Action::GoToFile(_) => has_rows,
+            Action::Files | Action::Narrow | Action::GoToFile => has_rows,
             Action::NextHunk
             | Action::PrevHunk
             | Action::NextFile
@@ -1466,13 +1533,8 @@ impl App {
             Action::PreviousLocation => self.flip(),
             Action::PrunePrs => {
                 if let Some(cache) = &self.opts.cache_dir {
-                    let keep: Vec<PathBuf> = self
-                        .locations
-                        .iter()
-                        .filter(|l| l.pr.is_some() && l.repo)
-                        .map(|l| l.dir.clone())
-                        .collect();
-                    let n = crate::pr::prune(cache, Duration::ZERO, &keep);
+                    // PRs open in any viewer hold a lock and are kept.
+                    let n = crate::pr::prune(cache, Duration::ZERO);
                     let noun = if n == 1 { "checkout" } else { "checkouts" };
                     self.message = Some(format!("removed {n} PR {noun}; open ones were kept"));
                 }
@@ -1495,7 +1557,8 @@ impl App {
                     loc.desc_dirty = true;
                 }
             }
-            Action::GoToFile(fi) => self.go_to_file(fi),
+            // Handled where the file list's path is known.
+            Action::GoToFile => {}
             Action::Narrow => {
                 let Some(loc) = self.cur() else { return };
                 if loc.focus != Focus::All {
@@ -1779,6 +1842,7 @@ impl App {
         let cursor = self
             .panel
             .as_mut()
+            .filter(|_| panel_area.height >= 2)
             .map(|p| p.render(panel_area, buf, &self.palette, &info));
         if let Some((x, y)) = cursor {
             frame.set_cursor_position((x, y));
@@ -1788,6 +1852,9 @@ impl App {
     fn render_notice(&self, lines: &[String], body: Rect, buf: &mut Buffer) {
         let top = body.y + body.height.saturating_sub(lines.len() as u16) / 2;
         for (i, text) in lines.iter().enumerate() {
+            if top + i as u16 >= body.bottom() {
+                break;
+            }
             let line = Line::from(Span::styled(
                 text.clone(),
                 Style::default().fg(self.palette.note_fg),

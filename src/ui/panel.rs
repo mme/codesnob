@@ -129,6 +129,13 @@ impl Panel {
         self.refilter();
     }
 
+    /// The key of the highlighted row.
+    pub fn selected_key(&self) -> Option<String> {
+        self.shown
+            .get(self.selected)
+            .map(|&i| self.items[i].key.clone())
+    }
+
     /// The action of the highlighted row.
     pub fn selected_action(&self) -> Option<Action> {
         self.shown.get(self.selected).map(|&i| self.items[i].action)

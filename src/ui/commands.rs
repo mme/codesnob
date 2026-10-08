@@ -19,8 +19,9 @@ pub enum Action {
     Files,
     /// Narrow to the current file, or show all files again.
     Narrow,
-    /// Move to file `n`: jump in the full view, switch file while narrowed.
-    GoToFile(usize),
+    /// Move to the file chosen in the file list (by path): jump in the full
+    /// view, switch file while narrowed.
+    GoToFile,
     NextHunk,
     PrevHunk,
     NextFile,
