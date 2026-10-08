@@ -9,6 +9,7 @@ pub enum Action {
     Locations,
     SwitchLocation(u64),
     PreviousLocation,
+    NextLocation,
     CloseLocation,
     Commits,
     OlderCommit,
@@ -55,7 +56,12 @@ pub const COMMANDS: &[Command] = &[
     Command {
         action: Action::PreviousLocation,
         name: "Previous location",
-        keys: "-",
+        keys: "Alt-←",
+    },
+    Command {
+        action: Action::NextLocation,
+        name: "Next location",
+        keys: "Alt-→",
     },
     Command {
         action: Action::Commits,

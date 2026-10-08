@@ -105,6 +105,8 @@ impl Harness {
                     "bs" => KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
                     "a-up" => KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
                     "a-down" => KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
+                    "a-left" => KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+                    "a-right" => KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
                     c if c.starts_with("c-") => KeyEvent::new(
                         KeyCode::Char(c.chars().nth(2).unwrap()),
                         KeyModifiers::CONTROL,
@@ -1321,4 +1323,40 @@ fn the_palette_lists_keys_users_know_and_no_housekeeping() {
         h.keys("<esc>");
     }
     cleanup(dir);
+}
+
+#[test]
+fn alt_left_and_right_walk_the_locations_both_ways() {
+    let a = small_repo("ui-alt-loc-a");
+    let b = small_repo("ui-alt-loc-b");
+    let c = small_repo("ui-alt-loc-c");
+    let mut h = Harness::open(&a);
+    h.keys(&format!("o{}<enter>", b.display()));
+    h.keys(&format!("o{}<enter>", c.display()));
+    let at = |h: &Harness| h.app.cur().unwrap().dir.clone();
+
+    h.keys("<a-left>");
+    assert_eq!(at(&h), b, "back one");
+    h.keys("<a-left>");
+    assert_eq!(at(&h), a, "and one further");
+    h.keys("<a-right>");
+    assert_eq!(at(&h), b, "Alt-Right walks back along the same strip");
+    assert!(
+        h.status().contains("ui-alt-loc-c"),
+        "the strip is showing: {}",
+        h.status()
+    );
+
+    // Settled, Alt-Right starts at the least recently used location.
+    h.keys("j<a-right>");
+    assert_eq!(at(&h), c, "most recent order is b, a, c");
+    h.keys("j:next loc");
+    assert!(
+        h.screen().contains("Next location [Alt-→]"),
+        "{}",
+        h.screen()
+    );
+    cleanup(a);
+    cleanup(b);
+    cleanup(c);
 }

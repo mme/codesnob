@@ -550,22 +550,28 @@ impl App {
     }
 
     /// `-`: flip to the previous location; quick repeats go further back.
-    fn flip(&mut self) {
+    /// Walk the locations in most-recently-used order: `back` toward older
+    /// ones (Alt-Left, `-`), otherwise the other way round (Alt-Right). Quick
+    /// repeats keep walking the same strip, so either key undoes the other.
+    fn flip(&mut self, back: bool) {
         if self.locations.len() < 2 {
             self.message = Some("no other location open; o opens one".to_string());
             return;
         }
-        let flip = match self.flip.take() {
-            Some(f) if f.last.elapsed() < self.flip_window => Flip {
-                depth: f.depth + 1,
-                last: Instant::now(),
-                order: f.order,
-            },
-            _ => Flip {
-                order: self.locations.iter().map(|l| l.id).collect(),
-                depth: 1,
-                last: Instant::now(),
-            },
+        let (order, depth) = match self.flip.take() {
+            Some(f) if f.last.elapsed() < self.flip_window => (f.order, f.depth),
+            _ => (self.locations.iter().map(|l| l.id).collect::<Vec<_>>(), 0),
+        };
+        let len = order.len();
+        let depth = if back {
+            (depth + 1) % len
+        } else {
+            (depth + len - 1) % len
+        };
+        let flip = Flip {
+            order,
+            depth,
+            last: Instant::now(),
         };
         let target = flip.order[flip.depth % flip.order.len()];
         if let Some(i) = self.locations.iter().position(|l| l.id == target) {
@@ -973,11 +979,13 @@ impl App {
         }
 
         self.message = None;
-        if k.code != KeyCode::Char('-') {
-            self.flip = None;
-        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
+        let flips =
+            k.code == KeyCode::Char('-') || alt && matches!(k.code, KeyCode::Left | KeyCode::Right);
+        if !flips {
+            self.flip = None;
+        }
         let page = self.body_h.saturating_sub(2).max(1) as isize;
         let half = (self.body_h / 2).max(1) as isize;
         let scroll = |app: &mut App, d: isize| {
@@ -1001,7 +1009,10 @@ impl App {
             }
             (KeyCode::Char('f'), false, false) => self.perform(Action::Files),
             (KeyCode::Char('o'), false, false) => self.perform(Action::Open),
-            (KeyCode::Char('-'), false, false) => self.perform(Action::PreviousLocation),
+            (KeyCode::Char('-'), false, false) | (KeyCode::Left, false, true) => {
+                self.perform(Action::PreviousLocation)
+            }
+            (KeyCode::Right, false, true) => self.perform(Action::NextLocation),
             (KeyCode::Char('c'), false, false) => self.perform(Action::Commits),
             (KeyCode::Char('<'), false, false) => self.perform(Action::OlderCommit),
             (KeyCode::Char('>'), false, false) => self.perform(Action::NewerCommit),
@@ -1495,7 +1506,7 @@ impl App {
         match action {
             Action::Open | Action::OpenRecent(_) => true,
             Action::Locations | Action::SwitchLocation(_) => several,
-            Action::PreviousLocation | Action::CloseLocation => several,
+            Action::PreviousLocation | Action::NextLocation | Action::CloseLocation => several,
             Action::Commits => has_info,
             Action::OlderCommit | Action::NewerCommit => loc
                 .info
@@ -1570,7 +1581,8 @@ impl App {
                     self.switch_to(i);
                 }
             }
-            Action::PreviousLocation => self.flip(),
+            Action::PreviousLocation => self.flip(true),
+            Action::NextLocation => self.flip(false),
             Action::CloseLocation => self.close_location(),
             Action::Commits => self.open_commits(),
             Action::OlderCommit => self.step(true),
