@@ -654,7 +654,10 @@ fn tab_completes_directories_and_a_bad_path_says_so() {
 
     h.keys("<c-u>nowhere<enter>");
     let screen = h.screen();
-    assert!(screen.contains("no such directory: nowhere"), "{screen}");
+    assert!(
+        screen.contains("no such directory, PR or revision: nowhere"),
+        "{screen}"
+    );
     assert!(
         screen.contains("Open ›"),
         "the prompt stays open to fix the path"
@@ -1359,4 +1362,178 @@ fn alt_left_and_right_walk_the_locations_both_ways() {
     cleanup(a);
     cleanup(b);
     cleanup(c);
+}
+
+// ---- comparisons and agent views --------------------------------------------
+
+fn view(range: Option<&str>, files: &[&str]) -> crate::proto::ViewSpec {
+    crate::proto::ViewSpec {
+        range: range.map(str::to_owned),
+        files: files.iter().map(|f| f.to_string()).collect(),
+    }
+}
+
+fn target(dir: &Path) -> Target {
+    Target {
+        dir: dir.to_path_buf(),
+        base: None,
+        repo: true,
+    }
+}
+
+#[test]
+fn the_open_prompt_takes_comparisons_in_git_syntax() {
+    let dir = branch_with_history("ui-open-compare");
+    crate::testutil::git(&dir, &["add", "b.txt"]);
+    let mut h = Harness::open(&dir);
+
+    h.keys("ostaged<enter>");
+    assert!(
+        h.status().starts_with("feature · staged changes"),
+        "{}",
+        h.status()
+    );
+    assert!(
+        h.status().contains("1 file"),
+        "only the staged b.txt: {}",
+        h.status()
+    );
+
+    h.keys("ounstaged<enter>");
+    assert!(
+        h.status().starts_with("feature · unstaged changes"),
+        "{}",
+        h.status()
+    );
+    assert!(
+        !h.screen().contains("new.txt"),
+        "untracked files are not unstaged changes"
+    );
+
+    h.keys("omain..feature<enter>");
+    assert!(
+        h.status().starts_with("feature · main..feature"),
+        "{}",
+        h.status()
+    );
+    assert!(h.status().contains("3 files"), "{}", h.status());
+
+    h.keys("<esc>");
+    assert!(
+        h.status().contains("since main"),
+        "Esc returns to everything: {}",
+        h.status()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn tab_completes_branch_names_after_dots() {
+    let dir = branch_with_history("ui-ref-tab");
+    crate::testutil::git(&dir, &["branch", "release-1"]);
+    let mut h = Harness::open(&dir);
+    let tab = |h: &mut Harness| {
+        h.app.dispatch(Msg::Input(Event::Key(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        ))))
+    };
+    h.keys("omain...rel");
+    tab(&mut h);
+    assert!(
+        h.screen().contains("Open › main...release-1"),
+        "{}",
+        h.screen()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn an_agent_updates_the_location_in_place_and_esc_returns() {
+    let dir = branch_with_history("ui-agent-here");
+    let mut h = Harness::open(&dir);
+    h.keys("NN");
+    let before = h.app.cur().unwrap().view.scroll;
+
+    h.app.show_view(
+        target(&dir.join("src")),
+        view(Some("main..feature"), &["a.txt", "gone.txt"]),
+    );
+    h.settle();
+    assert_eq!(
+        h.app.locations.len(),
+        1,
+        "the same checkout, updated in place"
+    );
+    let status = h.status();
+    assert!(
+        status.starts_with("2 files only · feature · main..feature · Esc returns"),
+        "{status}"
+    );
+    assert!(!h.screen().contains("one.rs"), "only the two files show");
+    assert!(
+        status.contains("2 of 3 files"),
+        "counts the files shown: {status}"
+    );
+
+    h.keys("<esc>");
+    let status = h.status();
+    assert!(
+        status.starts_with("feature · 2 commits and uncommitted work since main"),
+        "{status}"
+    );
+    assert!(!status.contains("Esc returns"));
+    assert_eq!(
+        h.app.cur().unwrap().view.scroll,
+        before,
+        "back at the same spot"
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn an_agent_view_of_another_repo_returns_to_the_previous_location() {
+    let a = branch_with_history("ui-agent-a");
+    let b = small_repo("ui-agent-b");
+    let mut h = Harness::open(&a);
+    h.app.show_view(target(&b), view(None, &["readme.md"]));
+    h.settle();
+    assert_eq!(h.app.cur().unwrap().dir, b);
+    assert!(
+        h.status().starts_with("readme.md only · main · "),
+        "{}",
+        h.status()
+    );
+    assert!(h.status().contains("Esc returns"), "{}", h.status());
+    h.keys("<esc>");
+    assert_eq!(
+        h.app.cur().unwrap().dir,
+        a,
+        "Esc goes back to what was on screen"
+    );
+    assert_eq!(h.app.locations.len(), 2);
+    cleanup(a);
+    cleanup(b);
+}
+
+#[test]
+fn an_agent_view_without_a_range_shows_everything_and_a_branch_name_sets_the_base() {
+    let dir = branch_with_history("ui-agent-base");
+    crate::testutil::git(&dir, &["branch", "older", "main"]);
+    let mut h = Harness::open(&dir);
+    h.keys("u");
+    h.app.show_view(target(&dir), view(None, &[]));
+    h.settle();
+    let scope = h.app.scope();
+    assert!(scope.ends_with("since main · Esc returns"), "{scope}");
+    h.app.show_view(target(&dir), view(Some("older"), &[]));
+    h.settle();
+    assert!(h.app.scope().contains("since older"), "{}", h.app.scope());
+    h.keys("<esc>");
+    assert!(
+        h.status().starts_with("feature · uncommitted changes"),
+        "the first view before the agent: {}",
+        h.status()
+    );
+    cleanup(dir);
 }

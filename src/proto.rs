@@ -80,6 +80,19 @@ pub struct Target {
     pub repo: bool,
 }
 
+/// What an agent asks a viewer to show in a checkout. Fields are optional
+/// and unknown ones ignored, so older and newer versions can talk.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewSpec {
+    /// A comparison in git syntax, `worktree`, `staged`, `unstaged`, or a
+    /// PR. None: everything since the branch point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<String>,
+    /// Only these files, relative to the repository root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+}
+
 /// A connected viewer. Re-sent in full whenever anything changes; the
 /// daemon keeps it until the viewer's connection closes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +132,9 @@ pub enum Method {
         /// The caller's own workspace, when it could be determined.
         #[serde(default)]
         workspace: Option<String>,
+        /// What to show there, for an agent's request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ViewSpec>,
     },
     Status,
     Subscribe,
@@ -180,6 +196,8 @@ pub enum Event {
     Show {
         viewer: String,
         target: Target,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ViewSpec>,
     },
     ViewerConnected(ViewerEntry),
     ViewerUpdated(ViewerEntry),

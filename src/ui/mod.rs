@@ -154,6 +154,22 @@ enum Focus {
     All,
     /// One file, by path.
     File(String),
+    /// Several files, by path, as an agent asked for.
+    Files(Vec<String>),
+}
+
+/// What Esc returns to after an agent changed the view.
+enum AgentReturn {
+    /// The view this location had before the agent's call.
+    View {
+        range: Range,
+        base: Option<String>,
+        label: Option<String>,
+        focus: Focus,
+        anchor: Option<Anchor>,
+    },
+    /// The location that was on screen before the agent's call.
+    Switch(u64),
 }
 
 /// Where the view was when a previewing list opened, to return to on Esc.
@@ -180,6 +196,10 @@ struct Location {
     repo: bool,
     /// The range asked for; `info.range` is the one on screen.
     range: Range,
+    /// Words for a comparison range, as it was asked for: "main...feature".
+    range_label: Option<String>,
+    /// Set while an agent's view is on screen: where Esc goes back to.
+    agent_return: Option<AgentReturn>,
     focus: Focus,
     view: DiffView,
     info: Option<Info>,
@@ -268,11 +288,16 @@ impl App {
     /// Display a target: switch to it if this viewer has it open, else open
     /// it as a new location. Not being in a repository shows a placeholder.
     pub fn open(&mut self, target: Target) {
-        if let Some(i) = self
-            .locations
-            .iter()
-            .position(|l| l.dir == target.dir && l.base == target.base)
-        {
+        // One location per checkout, however it is named.
+        let target = Target {
+            dir: if target.repo {
+                checkout_root(&target.dir)
+            } else {
+                target.dir
+            },
+            ..target
+        };
+        if let Some(i) = self.locations.iter().position(|l| l.dir == target.dir) {
             self.switch_to(i);
             return;
         }
@@ -284,6 +309,8 @@ impl App {
             base: target.base.clone(),
             repo: target.repo,
             range: Range::Everything,
+            range_label: None,
+            agent_return: None,
             focus: Focus::All,
             view: DiffView::default(),
             info: None,
@@ -358,6 +385,12 @@ impl App {
 
     /// Open a PR as a new location, or switch to it when it is open here.
     fn open_pr(&mut self, spec: crate::pr::Spec) {
+        let cwd = self.cur().filter(|l| l.repo).map(|l| l.dir.clone());
+        self.open_pr_from(spec, cwd);
+    }
+
+    /// Open a PR; `#123` is resolved in the repository at `cwd`.
+    fn open_pr_from(&mut self, spec: crate::pr::Spec, cwd: Option<PathBuf>) {
         let Some(cache) = self.opts.cache_dir.clone() else {
             self.message = Some("pull requests need a cache directory".to_string());
             return;
@@ -372,7 +405,6 @@ impl App {
             self.switch_to(i);
             return;
         }
-        let cwd = self.cur().filter(|l| l.repo).map(|l| l.dir.clone());
         let id = self.next_id;
         self.next_id += 1;
         let loc = Location {
@@ -381,6 +413,8 @@ impl App {
             base: None,
             repo: false,
             range: Range::Everything,
+            range_label: None,
+            agent_return: None,
             focus: Focus::All,
             view: DiffView::default(),
             info: None,
@@ -632,7 +666,45 @@ impl App {
     }
 
     /// Tab in the Open prompt: complete the directory name being typed.
+    /// Tab in the Open prompt: a directory name, else a branch or tag name.
     fn complete(&self, input: &str) -> Option<String> {
+        self.complete_path(input)
+            .or_else(|| self.complete_ref(input))
+    }
+
+    /// Complete the ref being typed, also after `..` or `...`.
+    fn complete_ref(&self, input: &str) -> Option<String> {
+        let loc = self.cur().filter(|l| l.repo)?;
+        let cut = input
+            .rfind("..")
+            .map(|i| {
+                if input[i + 2..].starts_with('.') {
+                    i + 3
+                } else {
+                    i + 2
+                }
+            })
+            .unwrap_or(0);
+        let (head, prefix) = input.split_at(cut);
+        let names: Vec<String> = git::ref_names(&loc.dir)
+            .into_iter()
+            .filter(|n| n.starts_with(prefix))
+            .collect();
+        let first = names.first()?;
+        if names.len() == 1 {
+            return Some(format!("{head}{first}"));
+        }
+        let common = names.iter().fold(first.clone(), |acc, n| {
+            acc.chars()
+                .zip(n.chars())
+                .take_while(|(a, b)| a == b)
+                .map(|(a, _)| a)
+                .collect()
+        });
+        (common.len() > prefix.len()).then(|| format!("{head}{common}"))
+    }
+
+    fn complete_path(&self, input: &str) -> Option<String> {
         let (dir_part, prefix) = match input.rfind('/') {
             Some(i) => (&input[..=i], &input[i + 1..]),
             None => ("", input),
@@ -753,6 +825,10 @@ impl App {
                 Some(i) => format!("commit {} of {}", i + 1, info.commits.len()),
                 None => id.to_hex_with_len(7).to_string(),
             },
+            Range::Compare(..) => l
+                .range_label
+                .clone()
+                .unwrap_or_else(|| "comparison".to_string()),
         };
         format!("{} · {range}", info.head_label)
     }
@@ -856,12 +932,10 @@ impl App {
         let (info, files) = Info::split(snap);
         loc.fingerprint = fingerprint;
         loc.view.set_files(files, context);
-        if let Focus::File(path) = &loc.focus
-            && !loc.view.narrow_to_path(Some(path))
-        {
+        if !narrow_view(&mut loc.view, &loc.focus) {
             // While a list previews, a file missing from one commit is not news.
             if self.panel.is_none() || !current {
-                self.message = Some(format!("{path} has no changes here; showing all files"));
+                self.message = Some(focus_lost(&loc.focus));
                 loc.focus = Focus::All;
             }
         }
@@ -895,6 +969,7 @@ impl App {
             }
             Msg::Loaded { loc, seq, result } => self.apply_loaded(loc, seq, *result),
             Msg::Show(target) => self.open(target),
+            Msg::View(target, view) => self.show_view(target, *view),
             Msg::Link(up) => self.linked = up,
             Msg::Pr { loc, progress } => self.apply_pr(loc, *progress),
             Msg::Watching { loc, mode } => {
@@ -1097,6 +1172,10 @@ impl App {
 
     /// Esc: leave the narrowest thing first, and never quit.
     fn back_out(&mut self) {
+        if self.cur().is_some_and(|l| l.agent_return.is_some()) {
+            self.return_from_agent();
+            return;
+        }
         let Some(loc) = self.cur() else { return };
         if loc.pr.as_ref().is_some_and(|p| !p.ready) {
             // Esc while a PR is still being fetched cancels opening it.
@@ -1107,6 +1186,152 @@ impl App {
             self.narrow(None);
         } else if loc.range != Range::Everything {
             self.set_range(Range::Everything);
+        }
+    }
+
+    /// Show a comparison typed in the Open prompt in the current location.
+    fn apply_spec(&mut self, spec: git::Spec) {
+        let Some(loc) = self.cur_mut() else { return };
+        match spec {
+            git::Spec::Range(range, label) => {
+                loc.range = range;
+                loc.range_label = Some(label);
+            }
+            git::Spec::Base(name) => {
+                loc.base = Some(name);
+                loc.range = Range::Everything;
+                loc.range_label = None;
+            }
+        }
+        loc.error = None;
+        self.settle_view(None);
+    }
+
+    /// Bring the screen in line with the current location's range and focus:
+    /// narrow and place it at once when that range is already shown, else
+    /// when it has loaded. `None` places it at the top.
+    fn settle_view(&mut self, anchor: Option<Anchor>) {
+        let Some(loc) = self.cur_mut() else { return };
+        loc.desc_dirty = true;
+        let shown = loc.info.as_ref().is_some_and(|i| i.range == loc.range);
+        if shown {
+            narrow_view(&mut loc.view, &loc.focus);
+            match anchor {
+                Some(a) => loc.view.restore(a),
+                None => loc.view.scroll = 0,
+            }
+            loc.pending_anchor = None;
+        } else {
+            loc.pending_anchor = anchor;
+        }
+        // A changed base or range loads; an unchanged one is a cheap no-op.
+        self.request();
+    }
+
+    /// An agent's view: update the location for that checkout in place, or
+    /// open one, remembering what was on screen so Esc can go back to it.
+    pub fn show_view(&mut self, target: Target, view: crate::proto::ViewSpec) {
+        let before = self.cur().map(|l| l.id);
+        let focus = match view.files.as_slice() {
+            [] => Focus::All,
+            [one] => Focus::File(one.clone()),
+            many => Focus::Files(many.to_vec()),
+        };
+        if let Some(spec) = view.range.as_deref().and_then(crate::pr::parse) {
+            self.open_pr_from(spec, Some(target.dir.clone()));
+            if let Some(loc) = self.cur_mut() {
+                loc.focus = focus;
+                if loc.agent_return.is_none() && Some(loc.id) != before {
+                    loc.agent_return = before.map(AgentReturn::Switch);
+                }
+            }
+            self.settle_view(None);
+            return;
+        }
+        let dir = if target.repo {
+            checkout_root(&target.dir)
+        } else {
+            target.dir.clone()
+        };
+        let here = self.cur().is_some_and(|l| l.dir == dir);
+        if here {
+            if let Some(loc) = self.cur_mut()
+                && loc.agent_return.is_none()
+            {
+                loc.agent_return = Some(AgentReturn::View {
+                    range: loc.range,
+                    base: loc.base.clone(),
+                    label: loc.range_label.clone(),
+                    focus: loc.focus.clone(),
+                    anchor: loc.view.anchor(),
+                });
+            }
+        } else {
+            self.open(Target { dir, ..target });
+            if let Some(loc) = self.cur_mut()
+                && loc.agent_return.is_none()
+                && Some(loc.id) != before
+            {
+                loc.agent_return = before.map(AgentReturn::Switch);
+            }
+        }
+        let parsed = match &view.range {
+            Some(r) => self
+                .cur()
+                .filter(|l| l.repo)
+                .map(|l| git::parse_spec(&l.dir, r).map_err(|e| e.to_string())),
+            None => None,
+        };
+        let Some(loc) = self.cur_mut() else { return };
+        loc.focus = focus;
+        loc.error = None;
+        match parsed {
+            Some(Ok(git::Spec::Range(range, label))) => {
+                loc.range = range;
+                loc.range_label = Some(label);
+            }
+            Some(Ok(git::Spec::Base(name))) => {
+                loc.base = Some(name);
+                loc.range = Range::Everything;
+                loc.range_label = None;
+            }
+            Some(Err(e)) => self.message = Some(e),
+            None => {
+                // No range: everything since the branch point.
+                loc.base = None;
+                loc.range = Range::Everything;
+                loc.range_label = None;
+            }
+        }
+        self.settle_view(None);
+    }
+
+    /// Esc after an agent's call: back to exactly what was on screen.
+    fn return_from_agent(&mut self) {
+        let Some(ret) = self.cur_mut().and_then(|l| l.agent_return.take()) else {
+            return;
+        };
+        match ret {
+            AgentReturn::Switch(id) => {
+                if let Some(i) = self.locations.iter().position(|l| l.id == id) {
+                    self.switch_to(i);
+                }
+            }
+            AgentReturn::View {
+                range,
+                base,
+                label,
+                focus,
+                anchor,
+            } => {
+                let Some(loc) = self.cur_mut() else { return };
+                loc.range = range;
+                loc.base = base;
+                loc.range_label = label;
+                loc.focus = focus;
+                loc.error = None;
+                self.settle_view(anchor);
+            }
         }
     }
 
@@ -1172,10 +1397,10 @@ impl App {
         let Some(path) = loc.view.files.get(fi).map(|f| f.path.clone()) else {
             return;
         };
-        if loc.focus == Focus::All {
-            loc.view.scroll_to_file(fi);
-        } else {
-            self.narrow(Some(path));
+        match &loc.focus {
+            Focus::All => loc.view.scroll_to_file(fi),
+            Focus::Files(paths) if paths.contains(&path) => loc.view.scroll_to_file(fi),
+            _ => self.narrow(Some(path)),
         }
     }
 
@@ -1224,11 +1449,7 @@ impl App {
             self.request();
             return;
         }
-        let path = match &loc.focus {
-            Focus::File(p) => Some(p.clone()),
-            Focus::All => None,
-        };
-        loc.view.narrow_to_path(path.as_deref());
+        narrow_view(&mut loc.view, &loc.focus);
         if let Some(a) = origin.anchor {
             loc.view.restore(a);
         }
@@ -1245,6 +1466,15 @@ impl App {
             return;
         }
         let typed = (!input.is_empty()).then(|| self.resolve_path(input));
+        // Not a path: a comparison in the current repository, in git's syntax.
+        if matches!(typed, Some(Err(_)))
+            && let Some(dir) = self.cur().filter(|l| l.repo).map(|l| l.dir.clone())
+            && let Ok(spec) = git::parse_spec(&dir, input)
+        {
+            self.close_panel(false);
+            self.apply_spec(spec);
+            return;
+        }
         match (typed, selected) {
             (Some(Ok(dir)), _) => {
                 self.close_panel(false);
@@ -1254,9 +1484,9 @@ impl App {
                 self.close_panel(false);
                 self.perform(action);
             }
-            (Some(Err(e)), None) => {
+            (Some(Err(_)), None) => {
                 if let Some(p) = self.panel.as_mut() {
-                    p.note = Some(e);
+                    p.note = Some(format!("no such directory, PR or revision: {input}"));
                 }
             }
             (None, None) => self.close_panel(false),
@@ -1316,6 +1546,7 @@ impl App {
             Range::Everything if info.base.name.is_some() => "everything".to_string(),
             Range::Everything | Range::Uncommitted => "uncommitted".to_string(),
             Range::Commit(id) => id.to_string(),
+            Range::Compare(..) => String::new(),
         };
         self.origin = Some(Origin {
             range: loc.range,
@@ -1613,7 +1844,9 @@ impl App {
                 }
             }
             Action::NextFile | Action::PrevFile
-                if self.cur().is_some_and(|l| l.focus != Focus::All) =>
+                if self
+                    .cur()
+                    .is_some_and(|l| matches!(l.focus, Focus::File(_))) =>
             {
                 // While narrowed, next and previous file move the narrowing.
                 let Some(loc) = self.cur() else { return };
@@ -1662,10 +1895,22 @@ impl App {
     /// What the screen shows, in words: the left side of the status bar.
     fn scope(&self) -> String {
         let scope = self.range_scope();
-        match self.cur().map(|l| &l.focus) {
+        let Some(loc) = self.cur() else {
+            return scope;
+        };
+        // After an agent's call, Esc goes back to where you were instead.
+        let agent = loc.agent_return.is_some();
+        let esc = if agent { "" } else { " · Esc for all" };
+        let scope = match &loc.focus {
             // Narrowed first: on a narrow terminal the scope is what gets cut.
-            Some(Focus::File(path)) => format!("{path} only · Esc for all · {scope}"),
-            _ => scope,
+            Focus::File(path) => format!("{path} only{esc} · {scope}"),
+            Focus::Files(paths) => format!("{} files only{esc} · {scope}", paths.len()),
+            Focus::All => scope,
+        };
+        if agent {
+            format!("{scope} · Esc returns")
+        } else {
+            scope
         }
     }
 
@@ -1700,7 +1945,7 @@ impl App {
                     return s;
                 }
                 Range::Uncommitted => return format!("#{n} · local edits"),
-                Range::Commit(_) => {}
+                Range::Commit(_) | Range::Compare(..) => {}
             }
         }
         if !loc.repo {
@@ -1740,6 +1985,10 @@ impl App {
                 }
             },
             Range::Uncommitted => format!("{head} · uncommitted changes"),
+            Range::Compare(..) => format!(
+                "{head} · {}",
+                loc.range_label.as_deref().unwrap_or("comparison")
+            ),
             Range::Commit(id) => {
                 let n = info.commits.len();
                 match info.commits.iter().position(|c| c.id == *id) {
@@ -1807,6 +2056,7 @@ impl App {
             (Range::Everything, None) => "no changes".to_string(),
             (Range::Uncommitted, _) => "no uncommitted changes".to_string(),
             (Range::Commit(_), _) => "this commit changes no files".to_string(),
+            (Range::Compare(..), _) => "no differences".to_string(),
         }])
     }
 
@@ -1941,11 +2191,20 @@ impl App {
                 }
                 (_, cur) => {
                     let (added, removed) = loc.view.totals();
+                    let shown = loc.view.shown();
+                    let k = shown.len();
                     let noun = if n == 1 { "file" } else { "files" };
-                    match cur {
-                        Some(_) => format!(" {n} {noun}  +{added} −{removed}  ·  {pos}/{n}  ·"),
+                    // Several files of the diff, as an agent asked for.
+                    let count = if k < n {
+                        format!("{k} of {n} {noun}")
+                    } else {
+                        format!("{n} {noun}")
+                    };
+                    let at = cur.and_then(|fi| shown.iter().position(|&s| s == fi));
+                    match at {
+                        Some(i) => format!(" {count}  +{added} −{removed}  ·  {}/{k}  ·", i + 1),
                         // Above the first file, in the description.
-                        None => format!(" {n} {noun}  +{added} −{removed}  ·"),
+                        None => format!(" {count}  +{added} −{removed}  ·"),
                     }
                 }
             };
@@ -1958,6 +2217,37 @@ impl App {
             buf.set_span(area.right() - rw, area.y, &Span::styled(right, style), rw);
         }
     }
+}
+
+/// Narrow `view` to what `focus` names. False when the shown range has none
+/// of it, in which case every file shows.
+fn narrow_view(view: &mut DiffView, focus: &Focus) -> bool {
+    match focus {
+        Focus::All => {
+            view.narrow_to(None);
+            true
+        }
+        Focus::File(path) => view.narrow_to_path(Some(path)),
+        Focus::Files(paths) => view.narrow_to_paths(paths) > 0,
+    }
+}
+
+/// What to say when a focus can no longer be shown.
+fn focus_lost(focus: &Focus) -> String {
+    match focus {
+        Focus::File(path) => format!("{path} has no changes here; showing all files"),
+        _ => "none of those files has changes here; showing all files".to_string(),
+    }
+}
+
+/// The root of the checkout `dir` is in, so every way of naming a
+/// repository lands on the same location.
+fn checkout_root(dir: &std::path::Path) -> PathBuf {
+    gix::discover(dir)
+        .ok()
+        .and_then(|r| r.workdir().map(|w| w.to_path_buf()))
+        .and_then(|w| std::fs::canonicalize(w).ok())
+        .unwrap_or_else(|| dir.to_path_buf())
 }
 
 /// A directory's short name.

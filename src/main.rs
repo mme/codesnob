@@ -63,9 +63,10 @@ enum Cmd {
     /// Ask the running viewer(s) to display this directory's repository.
     Show {
         path: PathBuf,
-        /// Compare against the merge-base with this revision.
+        /// What to compare, in git syntax ("main...feature", "HEAD~3..HEAD",
+        /// a commit), "worktree", "staged", "unstaged", or a PR.
         #[arg(long)]
-        base: Option<String>,
+        range: Option<String>,
     },
     /// Show the daemon's current target and the connected viewers.
     Status {
@@ -89,9 +90,9 @@ fn main() -> Result<()> {
     let args = Args::parse();
     match args.cmd {
         Some(Cmd::Daemon) => return daemon::run(),
-        Some(Cmd::Show { path, base }) => {
+        Some(Cmd::Show { path, range }) => {
             let dir = canonical(&path)?;
-            return link::show(dir, base).map_err(|e| anyhow::anyhow!(e));
+            return link::show(dir, range).map_err(|e| anyhow::anyhow!(e));
         }
         Some(Cmd::Status { json }) => return link::status(json).map_err(|e| anyhow::anyhow!(e)),
         Some(Cmd::Mcp) => return mcp::serve(),
