@@ -268,6 +268,15 @@ struct Origin {
 }
 
 impl Location {
+    /// Has only ever shown a message: not a repository, a pull request
+    /// that could not be fetched, or a first load that failed.
+    fn invalid(&self) -> bool {
+        if self.pr.as_ref().is_some_and(|p| !p.ready) {
+            return self.error.is_some();
+        }
+        !self.repo || (self.error.is_some() && self.info.is_none() && self.code_shown.is_none())
+    }
+
     /// The short name: "#142" for a PR, else the directory's name.
     fn name(&self) -> String {
         match &self.pr {
@@ -462,8 +471,40 @@ impl App {
         }
     }
 
+    /// Once something valid is open, locations that only ever showed a
+    /// message go, except the one on screen.
+    fn drop_invalid(&mut self) {
+        if !self.locations.iter().any(|l| !l.invalid()) {
+            return;
+        }
+        let gone: Vec<u64> = self
+            .locations
+            .iter()
+            .skip(1)
+            .filter(|l| l.invalid())
+            .map(|l| l.id)
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        self.locations.retain(|l| !gone.contains(&l.id));
+        // A walk in progress forgets them too, keeping its place.
+        if let Some(f) = self.flip.as_mut() {
+            let before = f.order[..f.depth.min(f.order.len())]
+                .iter()
+                .filter(|id| gone.contains(id))
+                .count();
+            f.order.retain(|id| !gone.contains(id));
+            f.depth -= before;
+            if f.order.is_empty() {
+                self.flip = None;
+            }
+        }
+    }
+
     /// Start watching the front location and bring it up to date.
     fn activate(&mut self) {
+        self.drop_invalid();
         self.panel = None;
         self.origin = None;
         self.hl.clear();
@@ -678,8 +719,14 @@ impl App {
                 }
                 if ready {
                     self.message = Some(format!("fetch failed: {e}"));
-                } else {
+                } else if idx == 0 {
                     loc.error = Some(e);
+                } else {
+                    // Failed out of sight: say so, as it may not stay.
+                    let n = loc.pr.as_ref().map_or(0, |p| p.spec.number);
+                    self.message = Some(format!("fetching #{n} failed: {e}"));
+                    loc.error = Some(e);
+                    self.drop_invalid();
                 }
             }
         }

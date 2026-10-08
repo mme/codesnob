@@ -1330,6 +1330,82 @@ fn alt_left_and_right_walk_the_locations_both_ways() {
     cleanup(c);
 }
 
+#[test]
+fn invalid_locations_go_once_a_valid_one_is_open() {
+    let n1 = fresh_dir("ui-invalid-n1");
+    let n2 = fresh_dir("ui-invalid-n2");
+    let a = small_repo("ui-invalid-a");
+    let mut h = Harness::open(&n1);
+    h.keys(&format!("o{}<enter>", n2.display()));
+    assert_eq!(h.app.locations.len(), 2, "with nothing valid, both stay");
+    h.keys(&format!("o{}<enter>", a.display()));
+    let dirs: Vec<PathBuf> = h.app.locations.iter().map(|l| l.dir.clone()).collect();
+    assert_eq!(
+        dirs,
+        std::slice::from_ref(&a),
+        "only the repository is left"
+    );
+    h.keys("<a-left>");
+    assert!(
+        h.status().contains("no other location open"),
+        "{}",
+        h.status()
+    );
+    cleanup(n1);
+    cleanup(n2);
+    cleanup(a);
+}
+
+#[test]
+fn leaving_an_invalid_location_drops_it_and_the_walk_goes_on() {
+    let a = small_repo("ui-leave-invalid-a");
+    let b = small_repo("ui-leave-invalid-b");
+    let n = fresh_dir("ui-leave-invalid-n");
+    let mut h = Harness::open(&a);
+    h.keys(&format!("o{}<enter>", b.display()));
+    h.keys(&format!("o{}<enter>", n.display()));
+    assert!(
+        h.screen().contains("not inside a git repository"),
+        "{}",
+        h.screen()
+    );
+    assert_eq!(h.app.locations.len(), 3, "it stays while on screen");
+    let at = |h: &Harness| h.app.cur().unwrap().dir.clone();
+
+    h.keys("<a-left>");
+    assert_eq!(at(&h), b);
+    assert_eq!(h.app.locations.len(), 2, "gone once left");
+    assert!(
+        !h.status().contains("ui-leave-invalid-n"),
+        "the strip forgets it: {}",
+        h.status()
+    );
+    h.keys("<a-left>");
+    assert_eq!(at(&h), a, "the walk goes on");
+    h.keys("<a-right>");
+    assert_eq!(at(&h), b, "and back");
+    cleanup(a);
+    cleanup(b);
+    cleanup(n);
+}
+
+#[test]
+fn a_pull_request_failing_out_of_sight_says_so_and_goes() {
+    let a = small_repo("ui-pr-fail-behind");
+    let mut h = Harness::open(&a);
+    // Messages wait until the keys are in, so the fetch fails behind.
+    h.keys("o#99<enter><a-left>");
+    wait_until(&mut h, &|h| h.app.locations.len() == 1);
+    assert_eq!(h.app.locations.len(), 1, "the failed PR is gone");
+    assert_eq!(h.app.cur().unwrap().dir, a);
+    // The status line says so once the location strip is gone.
+    assert_eq!(
+        h.app.message.as_deref(),
+        Some("fetching #99 failed: no pull request #99")
+    );
+    cleanup(a);
+}
+
 // ---- comparisons and agent views --------------------------------------------
 
 fn view(range: Option<&str>, files: &[&str]) -> crate::proto::ViewSpec {
