@@ -98,7 +98,7 @@ fn tools() -> Value {
                         "type": "object",
                         "properties": {
                             "path": { "type": "string", "description": "Relative to your working directory, or absolute." },
-                            "line": { "type": "integer", "minimum": 1, "description": "Open at this line, marked. With highlights the view opens at ①; give a line inside another highlight to open at that one instead." },
+                            "line": { "type": "integer", "minimum": 1, "description": "Open at this line, marked." },
                             "highlights": {
                                 "type": "array",
                                 "description": "Line ranges to highlight in this file. The viewer numbers all of a call's highlights by where they sit, not by the order you list them: by file in the order of files, then by line, so the first file's highlights come first. At most 20 per call, ① to ⑳. The user steps through them with < and >; the result lists each number with its file and lines, so refer to them by those numbers.",
@@ -118,7 +118,10 @@ fn tools() -> Value {
                 "rev": { "type": "string", "description": "Show the files as of this revision instead of the working tree." },
                 "repo": { "type": "string", "description": "A directory in the repository. Defaults to your working directory." }
             },
-            "required": ["files"]
+            "required": ["files"],
+            // With highlights the view opens at ①, so no file takes a line.
+            "if": { "properties": { "files": { "contains": { "required": ["highlights"] } } } },
+            "then": { "properties": { "files": { "items": { "not": { "required": ["line"] } } } } }
         }
     }, {
         "name": "show_diff",
@@ -668,5 +671,20 @@ mod tests {
             "{err}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn show_code_schema_keeps_line_and_highlights_apart() {
+        let tools = tools();
+        let schema = &tools[0]["inputSchema"];
+        assert_eq!(tools[0]["name"], "show_code");
+        assert_eq!(
+            schema["if"]["properties"]["files"]["contains"]["required"],
+            json!(["highlights"])
+        );
+        assert_eq!(
+            schema["then"]["properties"]["files"]["items"]["not"]["required"],
+            json!(["line"])
+        );
     }
 }
