@@ -2058,3 +2058,29 @@ fn one_of_several_files_can_show_whole() {
     assert!(view.row_of_line("src/deep/one.rs", 1).is_some());
     cleanup(dir);
 }
+
+#[test]
+fn the_open_prompt_shows_a_file_as_of_a_revision() {
+    let dir = repo_with_long_file("ui-open-at-rev");
+    let mut h = Harness::open(&dir);
+    // a.txt changed on the branch; main still has the first version.
+    h.keys("omain:a.txt<enter>");
+    assert!(h.app.scope().starts_with("a.txt @ "), "{}", h.app.scope());
+    let screen = h.screen();
+    assert!(screen.contains("a.txt"), "{screen}");
+    assert!(!screen.contains("a changed"), "the old text: {screen}");
+    h.keys("<esc>");
+    assert!(
+        !h.app.scope().contains('@'),
+        "Esc leaves the file view: {}",
+        h.app.scope()
+    );
+
+    h.keys("omain:nope.txt<enter>");
+    assert!(
+        h.screen().contains("nope.txt does not exist at main"),
+        "{}",
+        h.screen()
+    );
+    cleanup(dir);
+}
