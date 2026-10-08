@@ -81,10 +81,34 @@ fn initialize(params: &Value) -> Value {
 }
 
 /// Always in the agent's context, so this is what makes it reach for codesnob.
-const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a terminal beside you. When the user wants to see changes, show them there instead of pasting diffs into the chat: `show_diff` shows what changed between any two states (the branch point, commits, branches, staged work, a pull request). Typical requests: \"what changed\", \"show me the diff\", \"compare main and this branch\", \"show me PR 123\". A call updates that repository's view in the viewer; the user gets back to where they were with Esc.";
+const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a terminal beside you. When the user wants to see code, show it there instead of pasting it into the chat: `show_code` for files and lines, with highlights and short notes; `show_diff` for what changed between any two states (the branch point, commits, branches, staged work, a pull request). Typical requests: \"show me the code\", \"where is this handled\", \"open that file\", \"what changed\", \"show me the diff\", \"compare main and this branch\", \"show me PR 123\". A call updates that repository's view in the viewer; the user gets back to where they were with Esc. Read files with your own tools; codesnob is for showing.";
 
 fn tools() -> Value {
     json!([{
+        "name": "show_code",
+        "description": "Show source code to the user in their codesnob viewer: one file, or excerpts from several, optionally opened at a line. Use it when the user asks to see, open or look at code, or where something is defined or handled, and whenever they ask you to show code while explaining.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "The files to show. One shows whole; several show as excerpts around their line.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Relative to your working directory, or absolute." },
+                            "line": { "type": "integer", "minimum": 1, "description": "Open at this line, marked." }
+                        },
+                        "required": ["path"]
+                    }
+                },
+                "rev": { "type": "string", "description": "Show the files as of this revision instead of the working tree." },
+                "repo": { "type": "string", "description": "A directory in the repository. Defaults to your working directory." }
+            },
+            "required": ["files"]
+        }
+    }, {
         "name": "show_diff",
         "description": "Show the user a diff in their codesnob viewer. range takes git syntax (\"main...feature\", \"HEAD~3..HEAD\", a single commit, \"stash@{0}\"), \"worktree\", \"staged\" or \"unstaged\", or a pull request (\"#123\", \"owner/repo#123\", a URL). Without a range it shows everything since the branch point, uncommitted work included. Use it when the user asks what changed, to see or review a diff, to compare branches or commits, or to look at a pull request. Optionally narrow to files.",
         "inputSchema": {
@@ -103,6 +127,7 @@ fn call(params: &Value) -> Value {
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
     match name {
         "show_diff" => tool_result(show_diff(&args)),
+        "show_code" => tool_result(show_code(&args)),
         _ => tool_result(Err(format!("unknown tool: {name}"))),
     }
 }
@@ -123,6 +148,83 @@ fn show_diff(args: &Value) -> Result<String, String> {
         "{}: {what}; the user gets back to their previous view with Esc",
         link::describe(&r)
     ))
+}
+
+fn show_code(args: &Value) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let (root, view, what) = prepare_code(args, &cwd)?;
+    let mut client = link::connect()?;
+    let r = link::request_show(&mut client, root, Some(view)).map_err(no_viewer)?;
+    Ok(format!(
+        "{}: {what}; the user gets back to their previous view with Esc",
+        link::describe(&r)
+    ))
+}
+
+/// Check a show_code call: the repository, the revision, and that every file
+/// exists there. Returns the checkout root, what to send, and words for it.
+fn prepare_code(
+    args: &Value,
+    cwd: &Path,
+) -> Result<(PathBuf, crate::proto::ViewSpec, String), String> {
+    let root = repo_root(args, cwd)?;
+    let rev = args
+        .get("rev")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_owned);
+    let items = match args.get("files") {
+        Some(Value::Array(items)) if !items.is_empty() => items,
+        _ => return Err("files must list at least one file".to_string()),
+    };
+    let mut files = Vec::new();
+    for item in items {
+        let (path, line) = match item {
+            Value::String(p) => (p.as_str(), None),
+            Value::Object(o) => (
+                o.get("path")
+                    .and_then(Value::as_str)
+                    .ok_or("each file needs a path")?,
+                o.get("line").and_then(Value::as_u64),
+            ),
+            _ => return Err("each file is an object with a path".to_string()),
+        };
+        if line == Some(0) {
+            return Err(format!("{path}: lines start at 1"));
+        }
+        files.push(crate::proto::CodeFile {
+            path: relative_to(&root, cwd, path)?,
+            line: line.map(|l| l as usize),
+        });
+    }
+    // Every file must be there to be shown.
+    let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+    let snap = crate::git::read_code(&root, rev.as_deref(), &paths).map_err(|e| e.to_string())?;
+    for (f, (_, data)) in files.iter().zip(&snap.files) {
+        if let Some(l) = f.line {
+            let n = data.split(|&b| b == b'\n').count() - usize::from(data.ends_with(b"\n"));
+            if l > n.max(1) {
+                return Err(format!("{} has {n} lines; line {l} does not exist", f.path));
+            }
+        }
+    }
+    let mut what = files
+        .iter()
+        .map(|f| match f.line {
+            Some(l) => format!("{} at line {l}", f.path),
+            None => f.path.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(r) = &rev {
+        what.push_str(&format!(" as of {r}"));
+    }
+    let view = crate::proto::ViewSpec {
+        code: Some(crate::proto::CodeSpec { rev, files }),
+        ..Default::default()
+    };
+    Ok((root, view, what))
 }
 
 fn no_viewer(e: String) -> String {
@@ -170,7 +272,12 @@ fn prepare_diff(
     if !files.is_empty() {
         what.push_str(&format!(", narrowed to {}", files.join(", ")));
     }
-    Ok((root, crate::proto::ViewSpec { range, files }, what))
+    let view = crate::proto::ViewSpec {
+        range,
+        files,
+        ..Default::default()
+    };
+    Ok((root, view, what))
 }
 
 /// The checkout root of `repo`, or of the working directory.
@@ -251,6 +358,36 @@ mod tests {
             Some("#12"),
             "PRs are left to the viewer"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_code_call_is_checked_before_it_is_sent() {
+        let dir = branch_with_history("mcp-code");
+        let sub = dir.join("src");
+        let (root, view, what) = prepare_code(
+            &json!({ "files": [{ "path": "deep/one.rs", "line": 1 }, { "path": "../a.txt" }] }),
+            &sub,
+        )
+        .unwrap();
+        assert_eq!(root, dir);
+        let code = view.code.unwrap();
+        assert_eq!(code.files[0].path, "src/deep/one.rs");
+        assert_eq!(code.files[0].line, Some(1));
+        assert_eq!(code.files[1].path, "a.txt");
+        assert_eq!(what, "src/deep/one.rs at line 1, a.txt");
+
+        let (_, view, what) =
+            prepare_code(&json!({ "files": ["gone.txt"], "rev": "main" }), &dir).unwrap();
+        assert_eq!(view.code.unwrap().rev.as_deref(), Some("main"));
+        assert_eq!(what, "gone.txt as of main");
+
+        let err = prepare_code(&json!({ "files": ["gone.txt"] }), &dir).unwrap_err();
+        assert!(err.contains("gone.txt does not exist"), "{err}");
+        let err =
+            prepare_code(&json!({ "files": [{ "path": "a.txt", "line": 99 }] }), &dir).unwrap_err();
+        assert!(err.contains("has 1 lines"), "{err}");
+        assert!(prepare_code(&json!({ "files": [] }), &dir).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

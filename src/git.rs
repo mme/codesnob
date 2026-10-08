@@ -107,6 +107,54 @@ fn commit_of(repo: &gix::Repository, rev: &str) -> Result<ObjectId> {
         .id)
 }
 
+/// Files as they are, for showing code rather than changes.
+pub struct CodeSnapshot {
+    /// The revision shown, as a short id; `None` is the working tree.
+    pub rev: Option<String>,
+    pub files: Vec<(String, Vec<u8>)>,
+}
+
+impl CodeSnapshot {
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.rev.hash(&mut h);
+        self.files.hash(&mut h);
+        h.finish()
+    }
+}
+
+/// Read `paths` (relative to the checkout root) from the working tree, or as
+/// of `rev`.
+pub fn read_code(dir: &Path, rev: Option<&str>, paths: &[String]) -> Result<CodeSnapshot> {
+    let repo = gix::discover(dir)
+        .with_context(|| format!("{} is not inside a git repository", dir.display()))?;
+    let workdir = repo
+        .workdir()
+        .context("bare repositories have no working tree")?
+        .to_path_buf();
+    let tree = match rev {
+        Some(r) => Some(tree_of(&repo, Some(commit_of(&repo, r)?))?),
+        None => None,
+    };
+    let mut files = Vec::new();
+    for path in paths {
+        let data = match (&tree, rev) {
+            (Some(tree), Some(r)) => blob_at(&repo, tree, &BString::from(path.as_str()))?
+                .map(|(_, d)| d)
+                .with_context(|| format!("{path} does not exist at {r}"))?,
+            _ => read_worktree(&workdir.join(path))
+                .with_context(|| format!("{path} does not exist"))?,
+        };
+        files.push((path.clone(), data));
+    }
+    let rev = match rev {
+        Some(r) => Some(short(&commit_of(&repo, r)?)),
+        None => None,
+    };
+    Ok(CodeSnapshot { rev, files })
+}
+
 /// Branch, remote branch and tag names, for completing comparisons.
 pub fn ref_names(dir: &Path) -> Vec<String> {
     let Ok(repo) = gix::discover(dir) else {

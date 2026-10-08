@@ -44,6 +44,10 @@ pub struct DiffView {
     desc: Vec<Line<'static>>,
     pub scroll: usize,
     pub hscroll: usize,
+    /// A line to mark with ▶ in a plain file: (path, line number).
+    pub target: Option<(String, usize)>,
+    /// Scroll to `target` at the next draw, once the screen height is known.
+    pub place_target: bool,
 }
 
 impl DiffView {
@@ -53,7 +57,27 @@ impl DiffView {
             .map(|c| diff::build(c, context))
             .collect();
         self.only.clear();
+        self.target = None;
         self.build_rows();
+    }
+
+    /// Show files built elsewhere, such as plain files.
+    pub fn set_built(&mut self, files: Vec<FileDiff>) {
+        self.files = files;
+        self.only.clear();
+        self.target = None;
+        self.build_rows();
+    }
+
+    /// The row showing `line` of `path`, if it is on screen.
+    pub fn row_of_line(&self, path: &str, line: usize) -> Option<usize> {
+        self.rows.iter().position(|r| match *r {
+            Row::Line(fi, hi, li) => {
+                self.files[fi].path == path
+                    && self.files[fi].hunks[hi].lines[li].new_no == Some(line)
+            }
+            _ => false,
+        })
     }
 
     /// Narrow to one file, or show all with `None`. Returns false, and shows
@@ -181,9 +205,16 @@ impl DiffView {
                 self.rows.push(Row::Note("no textual changes"));
             }
             max_no = max_no.max(f.old_lines.len()).max(f.new_lines.len());
+            // A plain file shown whole needs no hunk header.
+            let whole = f.plain
+                && f.hunks.len() == 1
+                && f.hunks[0].new_start == 1
+                && f.hunks[0].new_count == f.new_lines.len();
             for (hi, h) in f.hunks.iter().enumerate() {
                 self.hunk_starts.push(self.rows.len());
-                self.rows.push(Row::Hunk(fi, hi));
+                if !whole {
+                    self.rows.push(Row::Hunk(fi, hi));
+                }
                 for li in 0..h.lines.len() {
                     self.rows.push(Row::Line(fi, hi, li));
                 }
@@ -374,10 +405,16 @@ impl DiffView {
             }
             Row::Hunk(fi, hi) => {
                 let h = &self.files[fi].hunks[hi];
-                let mut text = format!(
-                    "@@ -{},{} +{},{} @@",
-                    h.old_start, h.old_count, h.new_start, h.new_count
-                );
+                let mut text = if self.files[fi].plain {
+                    // An excerpt of a plain file says which lines it shows.
+                    let end = h.new_start + h.new_count.saturating_sub(1);
+                    format!("  ⋯ lines {}–{end}", h.new_start)
+                } else {
+                    format!(
+                        "@@ -{},{} +{},{} @@",
+                        h.old_start, h.old_count, h.new_start, h.new_count
+                    )
+                };
                 if let Some(f) = &h.func {
                     text.push(' ');
                     text.push_str(f);
@@ -398,15 +435,29 @@ impl DiffView {
             Status::Renamed => ("R", Color::Magenta),
         };
         let base = Style::default().bg(p.header_bg);
-        let mut spans = vec![
-            Span::styled(
-                format!(" {tag} "),
-                base.fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(f.display_path(), base.add_modifier(Modifier::BOLD)),
-        ];
+        let mut spans = if f.plain {
+            // A file as it is: no change to label.
+            vec![Span::styled(
+                format!(" {}", f.display_path()),
+                base.add_modifier(Modifier::BOLD),
+            )]
+        } else {
+            vec![
+                Span::styled(
+                    format!(" {tag} "),
+                    base.fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(f.display_path(), base.add_modifier(Modifier::BOLD)),
+            ]
+        };
         if f.binary {
             spans.push(Span::styled("  binary", base.fg(p.note_fg)));
+        } else if f.plain {
+            let n = f.new_lines.len();
+            spans.push(Span::styled(
+                format!("  {n} line{}", if n == 1 { "" } else { "s" }),
+                base.fg(p.note_fg),
+            ));
         } else {
             spans.push(Span::styled(
                 format!("  +{}", f.added),
@@ -454,15 +505,29 @@ impl DiffView {
         buf.set_style(area, row_style);
 
         let w = self.gutter_w;
-        let gutter = format!(
-            "{:>w$} {:>w$} ",
-            l.old_no.map(|n| n.to_string()).unwrap_or_default(),
-            l.new_no.map(|n| n.to_string()).unwrap_or_default(),
-        );
-        let marker_style = match l.kind {
-            Kind::Add => row_style.fg(Color::Green),
-            Kind::Del => row_style.fg(Color::Red),
-            Kind::Context => row_style,
+        let plain = self.files[fi].plain;
+        let gutter = if plain {
+            // A file as it is has one numbering.
+            format!(
+                "{:>w$} ",
+                l.new_no.map(|n| n.to_string()).unwrap_or_default()
+            )
+        } else {
+            format!(
+                "{:>w$} {:>w$} ",
+                l.old_no.map(|n| n.to_string()).unwrap_or_default(),
+                l.new_no.map(|n| n.to_string()).unwrap_or_default(),
+            )
+        };
+        let is_target = plain
+            && self.target.as_ref().is_some_and(|(path, line)| {
+                *path == self.files[fi].path && l.new_no == Some(*line)
+            });
+        let (marker, marker_style) = match l.kind {
+            _ if is_target => ("▶", row_style.fg(p.hunk_fg)),
+            Kind::Add => (marker, row_style.fg(Color::Green)),
+            Kind::Del => (marker, row_style.fg(Color::Red)),
+            Kind::Context => (marker, row_style),
         };
         let mut spans = vec![
             Span::styled(gutter, row_style.fg(p.gutter_fg)),

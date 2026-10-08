@@ -1370,6 +1370,7 @@ fn view(range: Option<&str>, files: &[&str]) -> crate::proto::ViewSpec {
     crate::proto::ViewSpec {
         range: range.map(str::to_owned),
         files: files.iter().map(|f| f.to_string()).collect(),
+        ..Default::default()
     }
 }
 
@@ -1534,6 +1535,158 @@ fn an_agent_view_without_a_range_shows_everything_and_a_branch_name_sets_the_bas
         h.status().starts_with("feature · uncommitted changes"),
         "the first view before the agent: {}",
         h.status()
+    );
+    cleanup(dir);
+}
+
+// ---- files as they are ----------------------------------------------------------
+
+fn code(rev: Option<&str>, files: &[(&str, Option<usize>)]) -> crate::proto::ViewSpec {
+    crate::proto::ViewSpec {
+        code: Some(crate::proto::CodeSpec {
+            rev: rev.map(str::to_owned),
+            files: files
+                .iter()
+                .map(|(p, l)| crate::proto::CodeFile {
+                    path: p.to_string(),
+                    line: *l,
+                })
+                .collect(),
+        }),
+        ..Default::default()
+    }
+}
+
+/// A repo whose src/long.rs has 60 numbered lines.
+fn repo_with_long_file(name: &str) -> PathBuf {
+    let dir = branch_with_history(name);
+    let body: String = (1..=60).map(|i| format!("// line {i}\n")).collect();
+    std::fs::write(dir.join("src/long.rs"), body).unwrap();
+    crate::testutil::git(&dir, &["add", "src/long.rs"]);
+    crate::testutil::git(&dir, &["commit", "-q", "-m", "long"]);
+    dir
+}
+
+#[test]
+fn show_code_opens_a_whole_file_at_its_line_and_esc_returns() {
+    let dir = repo_with_long_file("ui-code-one");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", Some(40))]));
+    h.settle();
+    let status = h.app.scope();
+    assert_eq!(status, "src/long.rs · working tree · Esc returns");
+    let screen = h.screen();
+    let marked = screen
+        .lines()
+        .find(|l| l.contains('▶'))
+        .expect("the line is marked");
+    assert!(
+        marked.contains("40") && marked.contains("// line 40"),
+        "{marked}"
+    );
+    let row = screen.lines().position(|l| l.contains('▶')).unwrap();
+    assert!(
+        (5..15).contains(&row),
+        "about a third of the way down: row {row}\n{screen}"
+    );
+    assert!(!screen.contains("@@"), "a whole file has no hunk headers");
+    assert!(h.status().contains("src/long.rs"), "{}", h.status());
+
+    h.keys("<esc>");
+    assert!(h.app.scope().contains("since main"), "{}", h.app.scope());
+    assert!(!h.screen().contains('▶'));
+    cleanup(dir);
+}
+
+#[test]
+fn show_code_with_several_files_shows_excerpts() {
+    let dir = repo_with_long_file("ui-code-many");
+    let mut h = Harness::open(&dir);
+    h.app.show_view(
+        target(&dir),
+        code(
+            None,
+            &[("src/long.rs", Some(30)), ("src/deep/one.rs", Some(1))],
+        ),
+    );
+    h.settle();
+    assert!(
+        h.app.scope().starts_with("2 files · working tree"),
+        "{}",
+        h.app.scope()
+    );
+    let screen = h.screen();
+    assert!(
+        screen.contains("⋯ lines 22–38"),
+        "an excerpt around line 30: {screen}"
+    );
+    assert!(!screen.contains("// line 50"), "not the whole file");
+    cleanup(dir);
+}
+
+#[test]
+fn show_code_at_a_revision_reads_it_from_there() {
+    let dir = branch_with_history("ui-code-rev");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(Some("main"), &[("gone.txt", None)]));
+    h.settle();
+    let scope = h.app.scope();
+    assert!(scope.starts_with("gone.txt @ "), "{scope}");
+    assert!(!scope.contains("working tree"));
+    assert!(h.screen().contains("gone.txt"), "{}", h.screen());
+    cleanup(dir);
+}
+
+#[test]
+fn the_open_prompt_shows_a_file_and_diff_keys_leave_it() {
+    let dir = repo_with_long_file("ui-code-open");
+    let mut h = Harness::open(&dir);
+    h.keys(&format!("o{}<enter>", dir.join("src/long.rs").display()));
+    assert_eq!(h.app.scope(), "src/long.rs · working tree");
+    assert_eq!(h.app.locations.len(), 1, "in the repository's location");
+    h.keys("u");
+    assert!(
+        h.app.scope().contains("uncommitted changes"),
+        "{}",
+        h.app.scope()
+    );
+    h.keys(&format!("o{}<enter>", dir.join("src/long.rs").display()));
+    h.keys("<esc>");
+    assert!(
+        h.app.scope().contains("uncommitted changes"),
+        "Esc leaves the file view: {}",
+        h.app.scope()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn a_file_view_follows_edits_without_moving() {
+    let dir = repo_with_long_file("ui-code-live");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", Some(40))]));
+    h.settle();
+    h.keys("jjj");
+    let first_numbered = |h: &mut Harness| {
+        h.screen()
+            .lines()
+            .find(|l| l.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+            .unwrap()
+            .to_string()
+    };
+    let before = first_numbered(&mut h);
+    let body: String = (1..=60).map(|i| format!("// line {i} edited\n")).collect();
+    std::fs::write(dir.join("src/long.rs"), body).unwrap();
+    wait_until(&mut h, &|h| h.screen().contains("edited"));
+    let after = first_numbered(&mut h);
+    assert!(after.contains("edited"), "{after}");
+    assert_eq!(
+        before.split_whitespace().next(),
+        after.split_whitespace().next(),
+        "same line number at the top: {before} / {after}"
     );
     cleanup(dir);
 }
