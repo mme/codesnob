@@ -184,8 +184,8 @@ fn the_palette_lists_commands_with_their_keys_and_runs_them() {
     assert!(screen.contains("Commands ›"), "{screen}");
     let commits = screen.lines().find(|l| l.contains("Commits…")).unwrap();
     assert!(
-        commits.trim_end().ends_with('c'),
-        "the shortcut is shown: {commits}"
+        commits.trim_end().ends_with("Commits… [c]"),
+        "the shortcut follows the name: {commits}"
     );
     assert!(
         !screen.contains("Everything since branch point"),
@@ -195,10 +195,7 @@ fn the_palette_lists_commands_with_their_keys_and_runs_them() {
     h.keys("next h");
     let screen = h.screen();
     let first = screen.lines().find(|l| l.starts_with("› ")).unwrap();
-    assert!(
-        first.contains("Next hunk") && first.trim_end().ends_with('n'),
-        "{first}"
-    );
+    assert!(first.trim_end().ends_with("Next hunk [n]"), "{first}");
     h.keys("<esc>:uncom<enter>");
     assert!(h.status().starts_with("feature · uncommitted changes"));
     assert!(h.status().contains("2 files"), "{}", h.status());
@@ -1250,7 +1247,7 @@ fn stepping_on_a_branch_without_commits_says_so() {
 }
 
 #[test]
-fn question_mark_no_longer_opens_the_palette_and_keys_show_as_keycaps() {
+fn question_mark_no_longer_opens_the_palette_and_keys_follow_names() {
     let dir = branch_with_history("ui-keycaps");
     let mut h = Harness::open(&dir);
     h.keys("?");
@@ -1259,18 +1256,18 @@ fn question_mark_no_longer_opens_the_palette_and_keys_show_as_keycaps() {
     h.keys(":older");
     let screen = h.screen();
     let row = screen.lines().find(|l| l.contains("Older commit")).unwrap();
-    assert!(row.trim_end().ends_with("Alt-↑"), "{row}");
-    // The keycap has its own background.
+    assert!(row.trim_end().ends_with("Older commit [Alt-↑]"), "{row}");
+    // The key is colored, with no background of its own.
     let y = screen
         .lines()
         .position(|l| l.contains("Older commit"))
         .unwrap() as u16;
     let buf = h.term.backend().buffer();
     let x = (0..buf.area.width)
-        .rev()
         .find(|&x| buf[(x, y)].symbol() == "A")
         .unwrap();
-    assert_eq!(buf[(x, y)].bg, Palette::dark().key_bg);
+    assert_eq!(buf[(x, y)].fg, Palette::dark().key_fg);
+    assert_eq!(buf[(x, y)].bg, buf[(1, y)].bg, "same background as the row");
     cleanup(dir);
 }
 
