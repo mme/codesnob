@@ -32,6 +32,8 @@ impl Harness {
             state_dir: Some(state),
         };
         let mut app = App::new(opts, Palette::dark(), hl, tx, Link::new());
+        // Loads between key presses must not outlast the strip on slow machines.
+        app.flip_window = Duration::from_secs(60);
         app.open(Target {
             dir: dir.to_path_buf(),
             base: None,

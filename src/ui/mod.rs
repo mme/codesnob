@@ -188,6 +188,8 @@ pub struct App {
     /// Commit messages are shown above a commit's diff unless turned off.
     show_commit_desc: bool,
     flip: Option<Flip>,
+    /// How long the location strip stays after the last `-`.
+    flip_window: Duration,
     /// The recent entries the Open list was built from.
     open_choices: Vec<crate::recent::Entry>,
     pub quit: bool,
@@ -219,6 +221,7 @@ impl App {
             body_h: 1,
             show_commit_desc: true,
             flip: None,
+            flip_window: FLIP_WINDOW,
             open_choices: Vec::new(),
             quit: false,
         }
@@ -322,7 +325,7 @@ impl App {
             return;
         }
         let flip = match self.flip.take() {
-            Some(f) if f.last.elapsed() < FLIP_WINDOW => Flip {
+            Some(f) if f.last.elapsed() < self.flip_window => Flip {
                 depth: f.depth + 1,
                 last: Instant::now(),
                 order: f.order,
