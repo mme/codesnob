@@ -455,44 +455,10 @@ fn the_commit_list_previews_each_commit_and_esc_reverts() {
 }
 
 #[test]
-fn angle_brackets_walk_the_branch_and_esc_comes_back() {
-    let dir = branch_with_history("ui-step");
-    let mut h = Harness::open(&dir);
-    h.keys("<");
-    assert!(
-        h.status().contains("uncommitted changes"),
-        "older from everything starts at the end: {}",
-        h.status()
-    );
-    h.keys("<");
-    assert!(h.status().contains("commit 2 of 2 · "), "{}", h.status());
-    h.keys("<");
-    assert!(h.status().contains("commit 1 of 2 · "), "{}", h.status());
-    h.keys("<");
-    assert!(
-        h.status().contains("this is the oldest commit"),
-        "{}",
-        h.status()
-    );
-    h.keys(">>");
-    assert!(h.status().contains("uncommitted changes"), "{}", h.status());
-    h.keys(">");
-    assert!(h.status().contains("nothing newer"), "{}", h.status());
-    h.keys("<esc>");
-    assert!(
-        h.status()
-            .contains("2 commits and uncommitted work since main"),
-        "{}",
-        h.status()
-    );
-    cleanup(dir);
-}
-
-#[test]
 fn a_commit_shows_its_message_above_the_diff_and_d_hides_it() {
     let dir = branch_with_history("ui-desc");
     let mut h = Harness::open(&dir);
-    h.keys(">");
+    h.keys("<a-down>");
     let screen = h.screen();
     let top: Vec<&str> = screen.lines().take(4).collect();
     assert!(
@@ -514,7 +480,7 @@ fn a_commit_shows_its_message_above_the_diff_and_d_hides_it() {
         "the subject stays in the status bar"
     );
 
-    h.keys(">");
+    h.keys("<a-down>");
     assert!(
         !h.screen().contains("· t ·"),
         "hidden stays hidden for the session"
@@ -531,7 +497,7 @@ fn a_commit_shows_its_message_above_the_diff_and_d_hides_it() {
 fn an_amended_commit_falls_back_to_everything() {
     let dir = branch_with_history("ui-amend");
     let mut h = Harness::open(&dir);
-    h.keys("<<");
+    h.keys("<a-up><a-up>");
     assert!(h.status().contains("commit 2 of 2 · "), "{}", h.status());
     crate::testutil::git(&dir, &["commit", "-q", "--amend", "-m", "two, amended"]);
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -572,7 +538,7 @@ fn open_a_typed_path_and_flip_back_with_dash() {
     let a = branch_with_history("ui-loc-a");
     let b = small_repo("ui-loc-b");
     let mut h = Harness::open(&a);
-    h.keys("<<");
+    h.keys("<a-up><a-up>");
     assert!(h.status().contains("commit 2 of 2 · "), "{}", h.status());
 
     h.keys(&format!("o{}<enter>", b.display()));
@@ -986,7 +952,7 @@ fn a_reverted_preview_does_not_leak_its_position_into_the_next_range() {
     let mut h = Harness::open(&dir);
     h.keys("jjjjjjjjjjjj");
     h.keys("c<down><esc>");
-    h.keys("<");
+    h.keys("<a-up>");
     assert!(h.status().contains("uncommitted changes"), "{}", h.status());
     assert_eq!(
         h.app.cur().unwrap().view.scroll,
@@ -1045,7 +1011,7 @@ fn a_tiny_terminal_does_not_panic() {
 fn the_pr_description_does_not_depend_on_the_commit_toggle() {
     let (mut h, origin, user, cache) = pr_harness("ui-pr-desc-toggle");
     h.keys("o#7<enter>");
-    h.keys("<");
+    h.keys("<a-up>");
     h.keys("d<esc>");
     assert!(!h.screen().contains("Retries twice"));
     h.keys("d");
@@ -1688,5 +1654,150 @@ fn a_file_view_follows_edits_without_moving() {
         after.split_whitespace().next(),
         "same line number at the top: {before} / {after}"
     );
+    cleanup(dir);
+}
+
+// ---- highlights ---------------------------------------------------------------
+
+fn hl(path: &str, start: usize, end: usize, note: Option<&str>) -> crate::proto::HighlightSpec {
+    crate::proto::HighlightSpec {
+        path: path.to_string(),
+        start,
+        end,
+        note: note.map(str::to_owned),
+    }
+}
+
+#[test]
+fn highlights_are_numbered_tinted_and_stepped_through() {
+    let dir = repo_with_long_file("ui-marks");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![
+        hl("src/long.rs", 20, 22, Some("the loop")),
+        hl("src/long.rs", 45, 45, None),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    let note = screen.lines().find(|l| l.contains('①')).expect("numbered");
+    assert!(note.contains("the loop"), "{note}");
+    let row = screen.lines().position(|l| l.contains('①')).unwrap();
+    assert!(
+        (5..15).contains(&row),
+        "opens at the first highlight: row {row}"
+    );
+    let marked: Vec<&str> = screen.lines().filter(|l| l.starts_with('▌')).collect();
+    assert_eq!(marked.len(), 3, "lines 20-22 carry the bar: {screen}");
+    assert!(
+        marked.iter().all(|l| l.contains(" 2")),
+        "the bar sits beside the number, not on it: {marked:?}"
+    );
+    assert!(h.status().contains("highlight 1 of 2"), "{}", h.status());
+
+    h.keys(">");
+    assert!(h.screen().lines().any(|l| l.contains('②')));
+    assert!(h.status().contains("highlight 2 of 2"), "{}", h.status());
+    h.keys("<");
+    assert!(h.status().contains("highlight 1 of 2"), "{}", h.status());
+    h.keys(":");
+    assert!(h.screen().contains("Next highlight [>]"), "{}", h.screen());
+    h.keys("<esc><esc>");
+    assert!(
+        !h.screen().contains('①'),
+        "Esc returns and the highlights go"
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn a_highlight_on_an_unchanged_line_shows_it_in_the_diff() {
+    let dir = repo_with_long_file("ui-marks-diff");
+    let body: String = (1..=60)
+        .map(|i| {
+            if i == 5 {
+                "// line 5 changed\n".to_string()
+            } else {
+                format!("// line {i}\n")
+            }
+        })
+        .collect();
+    std::fs::write(dir.join("src/long.rs"), body).unwrap();
+    let mut h = Harness::open(&dir);
+    let mut spec = view(Some("worktree"), &["src/long.rs"]);
+    spec.highlights = vec![hl("src/long.rs", 50, 50, Some("not changed, but look"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    assert!(screen.contains("not changed, but look"), "{screen}");
+    let line50 = screen
+        .lines()
+        .find(|l| l.contains("// line 50"))
+        .expect("line 50 shows");
+    assert!(line50.starts_with('▌'), "{line50}");
+    cleanup(dir);
+}
+
+#[test]
+fn highlights_follow_their_code_and_go_when_it_does() {
+    let dir = repo_with_long_file("ui-marks-follow");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![hl("src/long.rs", 30, 31, Some("watch me"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+
+    // Two lines inserted at the top: the highlight moves down with its text.
+    let body: String = std::iter::once("// new a\n// new b\n".to_string())
+        .chain((1..=60).map(|i| format!("// line {i}\n")))
+        .collect();
+    std::fs::write(dir.join("src/long.rs"), body).unwrap();
+    wait_until(&mut h, &|h| {
+        h.screen().contains("new a") || h.app.cur().unwrap().marks[0].start == 32
+    });
+    let m = &h.app.cur().unwrap().marks[0];
+    assert_eq!(
+        (m.start, m.end),
+        (32, 33),
+        "follows lines 30-31 to their new place"
+    );
+
+    // Its text replaced: the highlight is removed, and the status bar says so.
+    let body: String = (1..=60).map(|i| format!("// other {i}\n")).collect();
+    std::fs::write(dir.join("src/long.rs"), body).unwrap();
+    wait_until(&mut h, &|h| h.app.cur().unwrap().marks.is_empty());
+    assert!(h.app.cur().unwrap().marks.is_empty());
+    assert!(
+        h.status()
+            .contains("highlight 1 no longer matches its code; removed"),
+        "{}",
+        h.status()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn angle_brackets_move_between_hunks_without_highlights() {
+    let dir = repo_with_long_file("ui-marks-none");
+    let body: String = (1..=60)
+        .map(|i| {
+            if i == 5 || i == 50 {
+                format!("// line {i} changed\n")
+            } else {
+                format!("// line {i}\n")
+            }
+        })
+        .collect();
+    std::fs::write(dir.join("src/long.rs"), body).unwrap();
+    let mut h = Harness::open(&dir);
+    h.keys("u");
+    let first = h.app.cur().unwrap().view.scroll;
+    h.keys(">");
+    assert!(
+        h.app.cur().unwrap().view.scroll > first,
+        "> goes to the next hunk"
+    );
+    h.keys("<");
+    assert!(!h.status().contains("highlight"));
     cleanup(dir);
 }

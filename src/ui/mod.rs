@@ -47,6 +47,9 @@ const LOADING_DELAY: Duration = Duration::from_millis(150);
 pub struct Palette {
     /// Shortcuts in the palette.
     pub key_fg: Color,
+    /// Highlights: their tint and their numbers and notes.
+    pub mark_bg: Color,
+    pub mark_fg: Color,
     pub add_bg: Color,
     pub add_emph: Color,
     pub del_bg: Color,
@@ -61,6 +64,8 @@ impl Palette {
     pub fn dark() -> Self {
         Self {
             key_fg: Color::Cyan,
+            mark_bg: Color::Rgb(0x2d, 0x2a, 0x50),
+            mark_fg: Color::Rgb(0xc4, 0xa7, 0xff),
             add_bg: Color::Rgb(0x12, 0x33, 0x1c),
             add_emph: Color::Rgb(0x1f, 0x6b, 0x2f),
             del_bg: Color::Rgb(0x3b, 0x12, 0x19),
@@ -75,6 +80,8 @@ impl Palette {
     pub fn light() -> Self {
         Self {
             key_fg: Color::Blue,
+            mark_bg: Color::Rgb(0xec, 0xe6, 0xff),
+            mark_fg: Color::Rgb(0x6a, 0x3d, 0xd1),
             add_bg: Color::Rgb(0xe2, 0xf5, 0xe6),
             add_emph: Color::Rgb(0xa8, 0xe8, 0xb5),
             del_bg: Color::Rgb(0xff, 0xe3, 0xe6),
@@ -169,6 +176,93 @@ enum AgentReturn {
     Switch(u64),
 }
 
+/// A highlight, with the text it was placed on so it can follow that text.
+struct LocMark {
+    path: String,
+    start: usize,
+    end: usize,
+    note: Option<String>,
+    number: usize,
+    /// The highlighted lines as first seen; `None` until then.
+    text: Option<Vec<String>>,
+}
+
+impl LocMark {
+    fn drawn(&self) -> diffview::Mark {
+        diffview::Mark {
+            path: self.path.clone(),
+            start: self.start,
+            end: self.end,
+            number: self.number,
+            note: self.note.clone(),
+        }
+    }
+}
+
+/// Find a highlight's text in `lines`: where it was, else the nearest exact
+/// match. On first sight, record the text. False when it cannot be placed.
+fn anchor_mark(m: &mut LocMark, lines: &[String]) -> bool {
+    if m.start == 0 || m.start > m.end {
+        return false;
+    }
+    let Some(text) = &m.text else {
+        if m.end > lines.len() {
+            return false;
+        }
+        m.text = Some(lines[m.start - 1..m.end].to_vec());
+        return true;
+    };
+    let len = text.len();
+    if lines.get(m.start - 1..m.start - 1 + len) == Some(&text[..]) {
+        return true;
+    }
+    if len > lines.len() {
+        return false;
+    }
+    let best = (0..=lines.len() - len)
+        .filter(|&i| lines[i..i + len] == text[..])
+        .min_by_key(|&i| i.abs_diff(m.start - 1));
+    match best {
+        Some(i) => {
+            m.start = i + 1;
+            m.end = i + len;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Follow every highlight to its text; returns the numbers of those gone.
+/// Highlights on files `lines_of` does not know stay as they are.
+fn reanchor(
+    marks: &mut Vec<LocMark>,
+    lines_of: &dyn Fn(&str) -> Option<Vec<String>>,
+) -> Vec<usize> {
+    let mut gone = Vec::new();
+    marks.retain_mut(|m| {
+        let Some(lines) = lines_of(&m.path) else {
+            return true;
+        };
+        let kept = anchor_mark(m, &lines);
+        if !kept {
+            gone.push(m.number);
+        }
+        kept
+    });
+    gone
+}
+
+fn gone_message(gone: &[usize]) -> Option<String> {
+    match gone {
+        [] => None,
+        [n] => Some(format!("highlight {n} no longer matches its code; removed")),
+        many => Some(format!(
+            "{} highlights no longer match their code; removed",
+            many.len()
+        )),
+    }
+}
+
 /// A location's view, kept to return to.
 struct SavedView {
     range: Range,
@@ -214,6 +308,10 @@ struct Location {
     /// The revision the code on screen was read at, as a short id.
     code_rev: Option<String>,
     code_fp: u64,
+    /// Highlights an agent asked for, following their text through edits.
+    marks: Vec<LocMark>,
+    /// Open at the target line or first highlight once the view has loaded.
+    place_pending: bool,
     focus: Focus,
     view: DiffView,
     info: Option<Info>,
@@ -329,6 +427,8 @@ impl App {
             code_shown: None,
             code_rev: None,
             code_fp: 0,
+            marks: Vec::new(),
+            place_pending: false,
             focus: Focus::All,
             view: DiffView::default(),
             info: None,
@@ -437,6 +537,8 @@ impl App {
             code_shown: None,
             code_rev: None,
             code_fp: 0,
+            marks: Vec::new(),
+            place_pending: false,
             focus: Focus::All,
             view: DiffView::default(),
             info: None,
@@ -888,6 +990,7 @@ impl App {
 
     fn set_range(&mut self, range: Range) {
         let Some(loc) = self.cur_mut() else { return };
+        clear_marks(loc);
         if loc.range == range {
             return;
         }
@@ -937,37 +1040,56 @@ impl App {
             return;
         }
         let anchor = if same_view { loc.view.anchor() } else { None };
-        // One file shows whole; several show as excerpts around their line.
+        let gone = reanchor(&mut loc.marks, &|path| {
+            code.files
+                .iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, d)| crate::diff::text_lines(d))
+        });
+        // One file shows whole; several show as excerpts around their line
+        // and their highlights.
         let several = spec.files.len() > 1;
+        let marks = &loc.marks;
         let files = code
             .files
             .into_iter()
             .map(|(path, data)| {
-                let line = spec
-                    .files
-                    .iter()
-                    .find(|f| f.path == path)
-                    .and_then(|f| f.line);
-                let windows = match (several, line) {
-                    (true, Some(l)) => vec![(l.saturating_sub(EXCERPT).max(1), l + EXCERPT)],
-                    _ => Vec::new(),
-                };
+                let mut windows = Vec::new();
+                if several {
+                    let line = spec
+                        .files
+                        .iter()
+                        .find(|f| f.path == path)
+                        .and_then(|f| f.line);
+                    if let Some(l) = line {
+                        windows.push((l.saturating_sub(EXCERPT).max(1), l + EXCERPT));
+                    }
+                    for m in marks.iter().filter(|m| m.path == path) {
+                        windows.push((m.start.saturating_sub(3).max(1), m.end + 3));
+                    }
+                }
                 crate::diff::plain(path, &data, &windows)
             })
             .collect();
         loc.view.set_built(files);
+        loc.view
+            .set_marks(loc.marks.iter().map(LocMark::drawn).collect());
+        if current && let Some(text) = gone_message(&gone) {
+            self.message = Some(text);
+        }
         loc.view.target = spec
             .files
             .iter()
             .find_map(|f| f.line.map(|l| (f.path.clone(), l)));
         narrow_view(&mut loc.view, &loc.focus);
+        let place = std::mem::take(&mut loc.place_pending);
         match anchor.or(pending) {
-            Some(a) => loc.view.restore(a),
-            None => {
+            Some(a) if !place => loc.view.restore(a),
+            _ => {
                 // Placed at the next draw, when the screen height is known.
                 loc.view.scroll = 0;
                 loc.view.hscroll = 0;
-                loc.view.place_target = loc.view.target.is_some();
+                loc.view.place_target = loc.view.target.is_some() || loc.view.has_marks();
             }
         }
         loc.code_shown = Some(spec);
@@ -1047,7 +1169,30 @@ impl App {
         let anchor = if same_range { loc.view.anchor() } else { None };
         let (info, files) = Info::split(snap);
         loc.fingerprint = fingerprint;
-        loc.view.set_files(files, context);
+        let gone = reanchor(&mut loc.marks, &|path| {
+            files
+                .iter()
+                .find(|f| f.new_path.as_deref().or(f.old_path.as_deref()) == Some(path))
+                .and_then(|f| f.new.as_deref().or(f.old.as_deref()))
+                .map(crate::diff::text_lines)
+        });
+        let ranges: Vec<(String, usize, usize)> = loc
+            .marks
+            .iter()
+            .map(|m| (m.path.clone(), m.start, m.end))
+            .collect();
+        loc.view.set_files_showing(files, context, &|path| {
+            ranges
+                .iter()
+                .filter(|(p, ..)| p == path)
+                .map(|&(_, a, b)| (a, b))
+                .collect()
+        });
+        loc.view
+            .set_marks(loc.marks.iter().map(LocMark::drawn).collect());
+        if current && let Some(text) = gone_message(&gone) {
+            self.message = Some(text);
+        }
         if !narrow_view(&mut loc.view, &loc.focus) {
             // While a list previews, a file missing from one commit is not news.
             if self.panel.is_none() || !current {
@@ -1056,12 +1201,17 @@ impl App {
             }
         }
         match anchor.or(pending) {
-            Some(a) => loc.view.restore(a),
+            Some(a) if !loc.place_pending => loc.view.restore(a),
+            _ if std::mem::take(&mut loc.place_pending) => {
+                loc.view.scroll = 0;
+                loc.view.hscroll = 0;
+                loc.view.place_target = loc.view.has_marks();
+            }
             None if !same_range => {
                 loc.view.scroll = 0;
                 loc.view.hscroll = 0;
             }
-            None => {}
+            _ => {}
         }
         loc.info = Some(info);
         loc.desc_dirty = true;
@@ -1205,8 +1355,8 @@ impl App {
             }
             (KeyCode::Right, false, true) => self.perform(Action::NextLocation),
             (KeyCode::Char('c'), false, false) => self.perform(Action::Commits),
-            (KeyCode::Char('<'), false, false) => self.perform(Action::OlderCommit),
-            (KeyCode::Char('>'), false, false) => self.perform(Action::NewerCommit),
+            (KeyCode::Char('<'), false, false) => self.perform(Action::PrevMark),
+            (KeyCode::Char('>'), false, false) => self.perform(Action::NextMark),
             (KeyCode::Char('d'), false, false) => self.perform(Action::ToggleDescription),
             (KeyCode::Char('u'), false, false) => self.toggle_uncommitted(),
             (KeyCode::Char('L'), false, false) => {
@@ -1315,6 +1465,7 @@ impl App {
         if let Some(loc) = self.cur_mut()
             && loc.code.take().is_some()
         {
+            clear_marks(loc);
             self.settle_view(None);
         }
     }
@@ -1356,6 +1507,7 @@ impl App {
     /// Show a comparison typed in the Open prompt in the current location.
     fn apply_spec(&mut self, spec: git::Spec) {
         let Some(loc) = self.cur_mut() else { return };
+        clear_marks(loc);
         loc.code = None;
         match spec {
             git::Spec::Range(range, label) => {
@@ -1398,6 +1550,37 @@ impl App {
     /// An agent's view: update the location for that checkout in place, or
     /// open one, remembering what was on screen so Esc can go back to it.
     pub fn show_view(&mut self, target: Target, view: crate::proto::ViewSpec) {
+        let marks: Vec<LocMark> = view
+            .highlights
+            .iter()
+            .enumerate()
+            .map(|(i, h)| LocMark {
+                path: h.path.clone(),
+                start: h.start,
+                end: h.end,
+                note: h.note.clone(),
+                number: i + 1,
+                text: None,
+            })
+            .collect();
+        let placed = !marks.is_empty()
+            || view
+                .code
+                .as_ref()
+                .is_some_and(|c| c.files.iter().any(|f| f.line.is_some()));
+        self.show_view_inner(target, view);
+        if let Some(loc) = self.cur_mut() {
+            loc.view.set_marks(Vec::new());
+            loc.marks = marks;
+            loc.place_pending = placed;
+            // Rebuild even if the content is unchanged: highlights need lines.
+            loc.fingerprint = 0;
+            loc.code_fp = 0;
+        }
+        self.request();
+    }
+
+    fn show_view_inner(&mut self, target: Target, view: crate::proto::ViewSpec) {
         let before = self.cur().map(|l| l.id);
         let focus = match view.files.as_slice() {
             [] => Focus::All,
@@ -1506,6 +1689,7 @@ impl App {
                     code,
                 } = *saved;
                 let Some(loc) = self.cur_mut() else { return };
+                clear_marks(loc);
                 loc.range = range;
                 loc.base = base;
                 loc.range_label = label;
@@ -1930,6 +2114,7 @@ impl App {
             Action::Locations | Action::SwitchLocation(_) => several,
             Action::PreviousLocation | Action::NextLocation | Action::CloseLocation => several,
             Action::Commits => has_info,
+            Action::NextMark | Action::PrevMark => loc.view.has_marks(),
             Action::OlderCommit | Action::NewerCommit => loc
                 .info
                 .as_ref()
@@ -2020,6 +2205,18 @@ impl App {
             Action::NextLocation => self.flip(false),
             Action::CloseLocation => self.close_location(),
             Action::Commits => self.open_commits(),
+            Action::NextMark | Action::PrevMark => {
+                let body_h = self.body_h;
+                let Some(loc) = self.cur_mut() else { return };
+                let v = &mut loc.view;
+                // Highlights when there are any, else hunks.
+                match (action == Action::NextMark, v.has_marks()) {
+                    (true, true) => v.next_mark(body_h),
+                    (false, true) => v.prev_mark(body_h),
+                    (true, false) => v.next_hunk(),
+                    (false, false) => v.prev_hunk(),
+                }
+            }
             Action::OlderCommit => self.step(true),
             Action::NewerCommit => self.step(false),
             Action::ShowCommit(id) => self.set_range(Range::Commit(id)),
@@ -2329,6 +2526,7 @@ impl App {
                     .target
                     .clone()
                     .and_then(|(p, l)| loc.view.row_of_line(&p, l))
+                    .or_else(|| loc.view.first_mark_row())
             {
                 loc.view.scroll = row.saturating_sub(self.body_h / 3);
             }
@@ -2448,6 +2646,9 @@ impl App {
                 }
             };
         }
+        if let Some((i, n)) = self.cur().and_then(|l| l.view.mark_position(self.body_h)) {
+            right.insert_str(0, &format!(" highlight {i} of {n}  ·"));
+        }
         right.push_str(" : commands ");
         let rw = right.chars().count() as u16;
         let lw = area.width.saturating_sub(rw);
@@ -2476,6 +2677,16 @@ fn focus_lost(focus: &Focus) -> String {
     match focus {
         Focus::File(path) => format!("{path} has no changes here; showing all files"),
         _ => "none of those files has changes here; showing all files".to_string(),
+    }
+}
+
+/// Drop a location's highlights, and the lines shown only for them.
+fn clear_marks(loc: &mut Location) {
+    if !loc.marks.is_empty() {
+        loc.marks.clear();
+        loc.view.set_marks(Vec::new());
+        loc.fingerprint = 0;
+        loc.code_fp = 0;
     }
 }
 

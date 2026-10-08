@@ -86,7 +86,7 @@ const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a termin
 fn tools() -> Value {
     json!([{
         "name": "show_code",
-        "description": "Show source code to the user in their codesnob viewer: one file, or excerpts from several, optionally opened at a line. Use it when the user asks to see, open or look at code, or where something is defined or handled, and whenever they ask you to show code while explaining.",
+        "description": "Show source code to the user in their codesnob viewer: one file, or excerpts from several, optionally opened at a line and with highlighted line ranges, each with a short note. Use it when the user asks to see, open or look at code, or where something is defined or handled, and whenever they ask you to show code while explaining. Prefer a few precise highlights with notes over large ranges.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -98,7 +98,19 @@ fn tools() -> Value {
                         "type": "object",
                         "properties": {
                             "path": { "type": "string", "description": "Relative to your working directory, or absolute." },
-                            "line": { "type": "integer", "minimum": 1, "description": "Open at this line, marked." }
+                            "line": { "type": "integer", "minimum": 1, "description": "Open at this line, marked." },
+                            "highlights": {
+                                "type": "array",
+                                "description": "Line ranges to highlight, numbered in order; the user steps through them with < and >.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "lines": { "type": "string", "description": "1-based and inclusive: \"40-60\", or \"42\" for one line." },
+                                        "note": { "type": "string", "description": "A short note shown above the lines." }
+                                    },
+                                    "required": ["lines"]
+                                }
+                            }
                         },
                         "required": ["path"]
                     }
@@ -110,12 +122,25 @@ fn tools() -> Value {
         }
     }, {
         "name": "show_diff",
-        "description": "Show the user a diff in their codesnob viewer. range takes git syntax (\"main...feature\", \"HEAD~3..HEAD\", a single commit, \"stash@{0}\"), \"worktree\", \"staged\" or \"unstaged\", or a pull request (\"#123\", \"owner/repo#123\", a URL). Without a range it shows everything since the branch point, uncommitted work included. Use it when the user asks what changed, to see or review a diff, to compare branches or commits, or to look at a pull request. Optionally narrow to files.",
+        "description": "Show the user a diff in their codesnob viewer. range takes git syntax (\"main...feature\", \"HEAD~3..HEAD\", a single commit, \"stash@{0}\"), \"worktree\", \"staged\" or \"unstaged\", or a pull request (\"#123\", \"owner/repo#123\", a URL). Without a range it shows everything since the branch point, uncommitted work included. Use it when the user asks what changed, to see or review a diff, to compare branches or commits, or to look at a pull request. Optionally narrow to files and highlight lines with notes.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "range": { "type": "string", "description": "What to compare. Git syntax: \"a...b\" is b since it diverged from a, \"a..b\" is a against b, a branch or tag alone is everything since the branch point with it, any other revision is that commit against its parent. Also \"worktree\", \"staged\", \"unstaged\", or a pull request. Omit for everything since the branch point." },
                 "files": { "type": "array", "items": { "type": "string" }, "description": "Show only these files. Paths are relative to your working directory." },
+                "highlights": {
+                    "type": "array",
+                    "description": "Line ranges to highlight, numbered in order. Lines are the new side's, or the old side's in a deleted file; unchanged lines are shown too.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Relative to your working directory." },
+                            "lines": { "type": "string", "description": "1-based and inclusive: \"40-60\", or \"42\"." },
+                            "note": { "type": "string", "description": "A short note shown above the lines." }
+                        },
+                        "required": ["path", "lines"]
+                    }
+                },
                 "repo": { "type": "string", "description": "A directory in the repository. Defaults to your working directory." }
             }
         }
@@ -179,7 +204,22 @@ fn prepare_code(
         _ => return Err("files must list at least one file".to_string()),
     };
     let mut files = Vec::new();
+    let mut marks: Vec<(usize, crate::proto::HighlightSpec)> = Vec::new();
     for item in items {
+        if let Value::Object(_) = item {
+            for h in list(item, "highlights")? {
+                let (start, end) = parse_lines(h.get("lines"))?;
+                marks.push((
+                    files.len(),
+                    crate::proto::HighlightSpec {
+                        path: String::new(),
+                        start,
+                        end,
+                        note: note(h),
+                    },
+                ));
+            }
+        }
         let (path, line) = match item {
             Value::String(p) => (p.as_str(), None),
             Value::Object(o) => (
@@ -201,14 +241,31 @@ fn prepare_code(
     // Every file must be there to be shown.
     let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
     let snap = crate::git::read_code(&root, rev.as_deref(), &paths).map_err(|e| e.to_string())?;
-    for (f, (_, data)) in files.iter().zip(&snap.files) {
-        if let Some(l) = f.line {
-            let n = data.split(|&b| b == b'\n').count() - usize::from(data.ends_with(b"\n"));
-            if l > n.max(1) {
-                return Err(format!("{} has {n} lines; line {l} does not exist", f.path));
-            }
+    let lengths: Vec<usize> = snap
+        .files
+        .iter()
+        .map(|(_, data)| data.split(|&b| b == b'\n').count() - usize::from(data.ends_with(b"\n")))
+        .collect();
+    for (f, &n) in files.iter().zip(&lengths) {
+        if let Some(l) = f.line
+            && l > n.max(1)
+        {
+            return Err(format!("{} has {n} lines; line {l} does not exist", f.path));
         }
     }
+    let highlights: Vec<crate::proto::HighlightSpec> = marks
+        .into_iter()
+        .map(|(i, mut h)| {
+            if h.end > lengths[i] {
+                return Err(format!(
+                    "{} has {} lines; lines {}-{} do not exist",
+                    files[i].path, lengths[i], h.start, h.end
+                ));
+            }
+            h.path = files[i].path.clone();
+            Ok(h)
+        })
+        .collect::<Result<_, String>>()?;
     let mut what = files
         .iter()
         .map(|f| match f.line {
@@ -220,11 +277,69 @@ fn prepare_code(
     if let Some(r) = &rev {
         what.push_str(&format!(" as of {r}"));
     }
+    what.push_str(&count_highlights(highlights.len()));
     let view = crate::proto::ViewSpec {
         code: Some(crate::proto::CodeSpec { rev, files }),
+        highlights,
         ..Default::default()
     };
     Ok((root, view, what))
+}
+
+/// An optional list argument.
+fn list<'a>(args: &'a Value, key: &str) -> Result<&'a [Value], String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(&[]),
+        Some(Value::Array(items)) => Ok(items),
+        Some(_) => Err(format!("{key} must be a list")),
+    }
+}
+
+fn note(h: &Value) -> Option<String> {
+    h.get("note")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+}
+
+/// "40-60" (or with an en dash), "42", or 42: 1-based and inclusive.
+fn parse_lines(v: Option<&Value>) -> Result<(usize, usize), String> {
+    let bad = || "lines must look like \"40-60\" or \"42\"".to_string();
+    let (start, end) = match v {
+        Some(Value::Number(n)) => {
+            let n = n.as_u64().ok_or_else(bad)? as usize;
+            (n, n)
+        }
+        Some(Value::String(s)) => {
+            let s = s.trim();
+            match s.split_once(['-', '–']) {
+                Some((a, b)) => (
+                    a.trim().parse().map_err(|_| bad())?,
+                    b.trim().parse().map_err(|_| bad())?,
+                ),
+                None => {
+                    let n = s.parse().map_err(|_| bad())?;
+                    (n, n)
+                }
+            }
+        }
+        _ => return Err(bad()),
+    };
+    if start == 0 || end < start {
+        return Err(format!(
+            "lines {start}-{end}: lines start at 1 and run forward"
+        ));
+    }
+    Ok((start, end))
+}
+
+fn count_highlights(n: usize) -> String {
+    match n {
+        0 => String::new(),
+        1 => ", 1 highlight".to_string(),
+        n => format!(", {n} highlights"),
+    }
 }
 
 fn no_viewer(e: String) -> String {
@@ -266,15 +381,31 @@ fn prepare_diff(
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => return Err("files must be a list of paths".to_string()),
     };
+    let mut highlights = Vec::new();
+    for h in list(args, "highlights")? {
+        let path = h
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or("each highlight needs a path")?;
+        let (start, end) = parse_lines(h.get("lines"))?;
+        highlights.push(crate::proto::HighlightSpec {
+            path: relative_to(&root, cwd, path)?,
+            start,
+            end,
+            note: note(h),
+        });
+    }
     let mut what = range
         .clone()
         .unwrap_or_else(|| "everything since the branch point".to_string());
     if !files.is_empty() {
         what.push_str(&format!(", narrowed to {}", files.join(", ")));
     }
+    what.push_str(&count_highlights(highlights.len()));
     let view = crate::proto::ViewSpec {
         range,
         files,
+        highlights,
         ..Default::default()
     };
     Ok((root, view, what))
@@ -388,6 +519,52 @@ mod tests {
             prepare_code(&json!({ "files": [{ "path": "a.txt", "line": 99 }] }), &dir).unwrap_err();
         assert!(err.contains("has 1 lines"), "{err}");
         assert!(prepare_code(&json!({ "files": [] }), &dir).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn highlights_are_checked_and_carried() {
+        let dir = branch_with_history("mcp-highlights");
+        let (_, view, what) = prepare_code(
+            &json!({ "files": [{ "path": "a.txt", "highlights": [{ "lines": "1", "note": " here " }] }] }),
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(
+            view.highlights,
+            [crate::proto::HighlightSpec {
+                path: "a.txt".into(),
+                start: 1,
+                end: 1,
+                note: Some("here".into()),
+            }]
+        );
+        assert_eq!(what, "a.txt, 1 highlight");
+        let err = prepare_code(
+            &json!({ "files": [{ "path": "a.txt", "highlights": [{ "lines": "1-5" }] }] }),
+            &dir,
+        )
+        .unwrap_err();
+        assert!(err.contains("do not exist"), "{err}");
+
+        let (_, view, what) = prepare_diff(
+            &json!({ "highlights": [{ "path": "src/deep/one.rs", "lines": "2–3" }, { "path": "a.txt", "lines": 1 }] }),
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(view.highlights.len(), 2);
+        assert_eq!((view.highlights[0].start, view.highlights[0].end), (2, 3));
+        assert!(what.ends_with(", 2 highlights"), "{what}");
+        for bad in ["0-2", "5-3", "x"] {
+            assert!(
+                prepare_diff(
+                    &json!({ "highlights": [{ "path": "a.txt", "lines": bad }] }),
+                    &dir
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

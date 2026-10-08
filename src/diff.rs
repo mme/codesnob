@@ -64,6 +64,21 @@ impl FileDiff {
 }
 
 pub fn build(change: FileChange, context: usize) -> FileDiff {
+    build_with(change, context, &[])
+}
+
+/// One entry of a file aligned against its other version.
+#[derive(Clone, Copy)]
+enum Al {
+    /// Unchanged: (old index, new index).
+    Same(usize, usize),
+    Del(usize),
+    Add(usize),
+}
+
+/// Like `build`, also showing the new-side lines in `extra` (1-based,
+/// inclusive; the old side's for a deleted file) even where nothing changed.
+pub fn build_with(change: FileChange, context: usize, extra: &[(usize, usize)]) -> FileDiff {
     let status = match (&change.old_path, &change.new_path) {
         (Some(a), Some(b)) if a != b => Status::Renamed,
         (Some(_), Some(_)) => Status::Modified,
@@ -129,77 +144,123 @@ pub fn build(change: FileChange, context: usize) -> FileDiff {
         })
         .collect();
 
-    let mut groups: Vec<Vec<(usize, usize, usize, usize)>> = Vec::new();
-    for h in raw {
-        match groups.last_mut() {
-            Some(g) if h.0 <= g.last().unwrap().1 + 2 * context => g.push(h),
-            _ => groups.push(vec![h]),
+    // The whole file aligned: lines on both sides, the old side only, or the
+    // new side only.
+    let mut al: Vec<Al> = Vec::with_capacity(old_lines.len().max(new_lines.len()));
+    let (mut o, mut n) = (0, 0);
+    for (os, oe, ns, ne) in raw {
+        while o < os && n < new_lines.len() {
+            al.push(Al::Same(o, n));
+            o += 1;
+            n += 1;
+        }
+        al.extend((os..oe).map(Al::Del));
+        al.extend((ns..ne).map(Al::Add));
+        (o, n) = (oe, ne);
+    }
+    while o < old_lines.len() && n < new_lines.len() {
+        al.push(Al::Same(o, n));
+        o += 1;
+        n += 1;
+    }
+
+    // What shows: every change with its context, and the lines asked for.
+    let len = al.len();
+    let mut visible = vec![false; len];
+    let mut show = |k: usize| {
+        let (lo, hi) = (k.saturating_sub(context), (k + context + 1).min(len));
+        visible[lo..hi].iter_mut().for_each(|v| *v = true);
+    };
+    let deleted = status == Status::Deleted;
+    for (k, e) in al.iter().enumerate() {
+        let asked = match *e {
+            Al::Same(_, n) | Al::Add(n) => Some(n + 1),
+            Al::Del(o) if deleted => Some(o + 1),
+            Al::Del(_) => None,
+        }
+        .is_some_and(|line| extra.iter().any(|&(a, b)| (a..=b).contains(&line)));
+        if !matches!(e, Al::Same(..)) || asked {
+            show(k);
+        }
+    }
+
+    let (added, removed) = al.iter().fold((0, 0), |(a, r), e| match e {
+        Al::Add(_) => (a + 1, r),
+        Al::Del(_) => (a, r + 1),
+        Al::Same(..) => (a, r),
+    });
+    // Lines before each entry, on each side, for hunk headers.
+    let mut before = Vec::with_capacity(len);
+    let (mut bo, mut bn) = (0, 0);
+    for e in &al {
+        before.push((bo, bn));
+        match e {
+            Al::Same(..) => (bo, bn) = (bo + 1, bn + 1),
+            Al::Del(_) => bo += 1,
+            Al::Add(_) => bn += 1,
         }
     }
 
     let mut hunks = Vec::new();
-    let (mut added, mut removed) = (0, 0);
-    for g in groups {
-        let first = g[0];
-        let last = *g.last().unwrap();
-        let old_from = first.0.saturating_sub(context);
-        let old_to = (last.1 + context).min(old_lines.len());
-        let new_from = first.2.saturating_sub(context);
-        let new_to = (last.3 + context).min(new_lines.len());
-
+    let mut k = 0;
+    while k < len {
+        if !visible[k] {
+            k += 1;
+            continue;
+        }
+        let start = k;
+        while k < len && visible[k] {
+            k += 1;
+        }
         let mut lines = Vec::new();
-        let (mut o, mut n) = (old_from, new_from);
-        for (os, oe, ns, ne) in g {
-            while o < os {
-                lines.push(DiffLine {
-                    kind: Kind::Context,
-                    old_no: Some(o + 1),
-                    new_no: Some(n + 1),
-                    text: new_lines[n].clone(),
-                    emph: Vec::new(),
-                });
-                o += 1;
-                n += 1;
+        let mut i = start;
+        while i < k {
+            match al[i] {
+                Al::Same(o, n) => {
+                    lines.push(DiffLine {
+                        kind: Kind::Context,
+                        old_no: Some(o + 1),
+                        new_no: Some(n + 1),
+                        text: new_lines[n].clone(),
+                        emph: Vec::new(),
+                    });
+                    i += 1;
+                }
+                _ => {
+                    // A block of removed lines, then added ones: pair them up.
+                    let del_start = lines.len();
+                    while let Some(&Al::Del(o)) = al.get(i).filter(|_| i < k) {
+                        lines.push(DiffLine {
+                            kind: Kind::Del,
+                            old_no: Some(o + 1),
+                            new_no: None,
+                            text: old_lines[o].clone(),
+                            emph: Vec::new(),
+                        });
+                        i += 1;
+                    }
+                    let add_start = lines.len();
+                    while let Some(&Al::Add(n)) = al.get(i).filter(|_| i < k) {
+                        lines.push(DiffLine {
+                            kind: Kind::Add,
+                            old_no: None,
+                            new_no: Some(n + 1),
+                            text: new_lines[n].clone(),
+                            emph: Vec::new(),
+                        });
+                        i += 1;
+                    }
+                    let end = lines.len();
+                    emphasize(&mut lines, del_start, add_start, end);
+                }
             }
-            let del_start = lines.len();
-            for (i, text) in old_lines.iter().enumerate().take(oe).skip(os) {
-                lines.push(DiffLine {
-                    kind: Kind::Del,
-                    old_no: Some(i + 1),
-                    new_no: None,
-                    text: text.clone(),
-                    emph: Vec::new(),
-                });
-            }
-            let add_start = lines.len();
-            for (i, text) in new_lines.iter().enumerate().take(ne).skip(ns) {
-                lines.push(DiffLine {
-                    kind: Kind::Add,
-                    old_no: None,
-                    new_no: Some(i + 1),
-                    text: text.clone(),
-                    emph: Vec::new(),
-                });
-            }
-            removed += oe - os;
-            added += ne - ns;
-            let end = lines.len();
-            emphasize(&mut lines, del_start, add_start, end);
-            o = oe;
-            n = ne;
         }
-        while o < old_to && n < new_to {
-            lines.push(DiffLine {
-                kind: Kind::Context,
-                old_no: Some(o + 1),
-                new_no: Some(n + 1),
-                text: new_lines[n].clone(),
-                emph: Vec::new(),
-            });
-            o += 1;
-            n += 1;
-        }
-
+        let (old_from, new_from) = before[start];
+        let (old_to, new_to) = if k < len {
+            before[k]
+        } else {
+            (old_lines.len(), new_lines.len())
+        };
         let func = match status {
             Status::Added => find_func(&new_lines, new_from),
             _ => find_func(&old_lines, old_from),
@@ -335,6 +396,14 @@ fn expand_tabs(s: &str) -> String {
     out
 }
 
+/// A file's lines as the views show them: tabs expanded, endings stripped.
+pub fn text_lines(content: &[u8]) -> Vec<String> {
+    split_lines(&expand_tabs(&String::from_utf8_lossy(content)))
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Same tokenization as imara-diff's line source, with line endings stripped.
 fn split_lines(s: &str) -> Vec<&str> {
     let mut out = Vec::new();
@@ -451,4 +520,69 @@ fn word_diff(old: &str, new: &str) -> (Ranges, Ranges) {
         ranges(&old_tokens, &|i| diff.is_removed(i)),
         ranges(&new_tokens, &|i| diff.is_added(i)),
     )
+}
+
+#[cfg(test)]
+mod hunk_tests {
+    use super::*;
+
+    fn change(old: &str, new: &str) -> FileChange {
+        FileChange {
+            old_path: Some("f.txt".into()),
+            new_path: Some("f.txt".into()),
+            old: Some(old.as_bytes().to_vec()),
+            new: Some(new.as_bytes().to_vec()),
+        }
+    }
+
+    fn numbered(n: usize, edit: Option<usize>) -> String {
+        (1..=n)
+            .map(|i| {
+                if Some(i) == edit {
+                    format!("line {i} edited\n")
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hunks_match_git_shapes() {
+        let d = build(change(&numbered(50, None), &numbered(50, Some(10))), 3);
+        assert_eq!(d.hunks.len(), 1);
+        let h = &d.hunks[0];
+        assert_eq!(
+            (h.old_start, h.old_count, h.new_start, h.new_count),
+            (7, 7, 7, 7)
+        );
+        assert_eq!((d.added, d.removed), (1, 1));
+
+        // Two changes six lines apart share a hunk; farther apart they don't.
+        let mut new = numbered(50, Some(10));
+        new = new.replace("line 17\n", "line 17 edited\n");
+        assert_eq!(build(change(&numbered(50, None), &new), 3).hunks.len(), 1);
+        new = new
+            .replace("line 17 edited\n", "line 17\n")
+            .replace("line 30\n", "line 30 edited\n");
+        assert_eq!(build(change(&numbered(50, None), &new), 3).hunks.len(), 2);
+    }
+
+    #[test]
+    fn extra_lines_show_even_where_nothing_changed() {
+        let d = build_with(
+            change(&numbered(50, None), &numbered(50, Some(10))),
+            3,
+            &[(40, 41)],
+        );
+        assert_eq!(d.hunks.len(), 2);
+        let h = &d.hunks[1];
+        assert_eq!(
+            (h.new_start, h.new_count),
+            (37, 8),
+            "40-41 with three lines either side"
+        );
+        assert!(h.lines.iter().all(|l| l.kind == Kind::Context));
+        assert_eq!((d.added, d.removed), (1, 1), "counts are of changes only");
+    }
 }

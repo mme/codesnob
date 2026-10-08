@@ -45,6 +45,7 @@ need to start:
 | `o` | open a directory or a file, a PR (`#123`, `owner/repo#123`, a URL), or a comparison (`main...feature`, `HEAD~3`, `staged`) |
 | `c` | the branch's commits; moving through the list previews each one |
 | Alt-↑ Alt-↓ | older and newer commit, directly |
+| `<` `>` | previous and next highlight an agent placed, or hunk when there are none |
 | `u` | only the uncommitted changes, and back |
 | `f` | the changed files; `z` narrows the view to one |
 | `d` | show or hide the commit message or PR description |

@@ -15,11 +15,23 @@ use crate::highlight::Highlighter;
 pub enum Row {
     /// A line of the description block above the files.
     Desc(usize),
+    /// A highlight's number and note, above its lines.
+    Mark(usize),
     File(usize),
     Hunk(usize, usize),
     Line(usize, usize, usize),
     Note(&'static str),
     Blank,
+}
+
+/// A highlight as drawn: its file, its lines, its number and note.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mark {
+    pub path: String,
+    pub start: usize,
+    pub end: usize,
+    pub number: usize,
+    pub note: Option<String>,
 }
 
 /// Where the view is, expressed in terms that survive a reload.
@@ -48,17 +60,95 @@ pub struct DiffView {
     pub target: Option<(String, usize)>,
     /// Scroll to `target` at the next draw, once the screen height is known.
     pub place_target: bool,
+    /// Highlights, drawn over their lines.
+    marks: Vec<Mark>,
+    /// The row of each highlight's note, in screen order.
+    mark_rows: Vec<usize>,
 }
 
 impl DiffView {
-    pub fn set_files(&mut self, changes: Vec<FileChange>, context: usize) {
+    /// Show a diff, also showing the lines `extra` names per path even where
+    /// nothing changed.
+    pub fn set_files_showing(
+        &mut self,
+        changes: Vec<FileChange>,
+        context: usize,
+        extra: &dyn Fn(&str) -> Vec<(usize, usize)>,
+    ) {
         self.files = changes
             .into_iter()
-            .map(|c| diff::build(c, context))
+            .map(|c| {
+                let path = c
+                    .new_path
+                    .clone()
+                    .or(c.old_path.clone())
+                    .unwrap_or_default();
+                diff::build_with(c, context, &extra(&path))
+            })
             .collect();
         self.only.clear();
         self.target = None;
         self.build_rows();
+    }
+
+    /// Replace the highlights, keeping the line in view.
+    pub fn set_marks(&mut self, marks: Vec<Mark>) {
+        if self.marks != marks {
+            let anchor = self.anchor();
+            self.marks = marks;
+            self.build_rows();
+            if let Some(a) = anchor {
+                self.restore(a);
+            }
+        }
+    }
+
+    pub fn has_marks(&self) -> bool {
+        !self.mark_rows.is_empty()
+    }
+
+    /// The first highlight's row, to open at.
+    pub fn first_mark_row(&self) -> Option<usize> {
+        self.mark_rows.first().copied()
+    }
+
+    /// Highlights are read a third of the way down the screen, where the
+    /// view places them.
+    fn reading_row(&self, body_h: usize) -> usize {
+        self.scroll + body_h / 3
+    }
+
+    /// Which highlight is being read, and how many there are.
+    pub fn mark_position(&self, body_h: usize) -> Option<(usize, usize)> {
+        if self.mark_rows.is_empty() {
+            return None;
+        }
+        let reading = self.reading_row(body_h);
+        let passed = self.mark_rows.iter().filter(|&&r| r <= reading).count();
+        Some((passed.max(1), self.mark_rows.len()))
+    }
+
+    pub fn next_mark(&mut self, body_h: usize) {
+        let reading = self.reading_row(body_h);
+        if let Some(&r) = self.mark_rows.iter().find(|&&r| r > reading) {
+            self.scroll = r.saturating_sub(body_h / 3);
+        }
+    }
+
+    pub fn prev_mark(&mut self, body_h: usize) {
+        let reading = self.reading_row(body_h);
+        if let Some(&r) = self.mark_rows.iter().rev().find(|&&r| r < reading) {
+            self.scroll = r.saturating_sub(body_h / 3);
+        }
+    }
+
+    /// The highlight covering a line of file `fi`, if any.
+    fn mark_on(&self, fi: usize, line: &crate::diff::DiffLine) -> Option<&Mark> {
+        let f = &self.files[fi];
+        let no = line_no(f, line)?;
+        self.marks
+            .iter()
+            .find(|m| m.path == f.path && (m.start..=m.end).contains(&no))
     }
 
     /// Show files built elsewhere, such as plain files.
@@ -186,6 +276,8 @@ impl DiffView {
         self.rows.clear();
         self.file_starts.clear();
         self.hunk_starts.clear();
+        self.mark_rows.clear();
+        let mut placed = vec![false; self.marks.len()];
         let mut max_no = 1;
         for i in 0..self.desc.len() {
             self.rows.push(Row::Desc(i));
@@ -216,6 +308,19 @@ impl DiffView {
                     self.rows.push(Row::Hunk(fi, hi));
                 }
                 for li in 0..h.lines.len() {
+                    // A highlight's note goes above its first line shown.
+                    if let Some(no) = line_no(f, &h.lines[li]) {
+                        for (m, mark) in self.marks.iter().enumerate() {
+                            if !placed[m]
+                                && mark.path == f.path
+                                && (mark.start..=mark.end).contains(&no)
+                            {
+                                placed[m] = true;
+                                self.mark_rows.push(self.rows.len());
+                                self.rows.push(Row::Mark(m));
+                            }
+                        }
+                    }
                     self.rows.push(Row::Line(fi, hi, li));
                 }
             }
@@ -224,7 +329,8 @@ impl DiffView {
             self.rows.push(Row::Blank);
             self.rows.push(Row::Note("no files changed"));
         }
-        self.gutter_w = max_no.to_string().len().max(3);
+        // With highlights, one more column so the bar never covers a digit.
+        self.gutter_w = max_no.to_string().len().max(3) + usize::from(!self.marks.is_empty());
         self.clamp();
     }
 
@@ -389,6 +495,19 @@ impl DiffView {
         hl: &mut Highlighter,
     ) {
         match row {
+            Row::Mark(m) => {
+                let mark = &self.marks[m];
+                let tint = Style::default().bg(p.mark_bg);
+                buf.set_style(area, tint);
+                let mut spans = vec![Span::styled(
+                    format!("  {} ", numbered(mark.number)),
+                    tint.fg(p.mark_fg).add_modifier(Modifier::BOLD),
+                )];
+                if let Some(note) = &mark.note {
+                    spans.push(Span::styled(note.clone(), tint.fg(p.mark_fg)));
+                }
+                buf.set_line(area.x, area.y, &Line::from(spans), area.width);
+            }
             Row::Desc(i) => {
                 let mut spans = vec![Span::raw("  ")];
                 spans.extend(self.desc[i].spans.iter().cloned());
@@ -498,6 +617,13 @@ impl DiffView {
             Kind::Del => (Some(p.del_bg), p.del_emph, "-"),
             Kind::Context => (None, Color::Reset, " "),
         };
+        // Highlighted context lines take the highlight's tint; changed lines
+        // keep their color and get the bar in the gutter only.
+        let marked = self.mark_on(fi, l).is_some();
+        let line_bg = match (line_bg, marked) {
+            (None, true) => Some(p.mark_bg),
+            (bg, _) => bg,
+        };
         let row_style = match line_bg {
             Some(bg) => Style::default().bg(bg),
             None => Style::default(),
@@ -529,13 +655,18 @@ impl DiffView {
             Kind::Del => (marker, row_style.fg(Color::Red)),
             Kind::Context => (marker, row_style),
         };
-        let mut spans = vec![
-            Span::styled(gutter, row_style.fg(p.gutter_fg)),
-            Span::styled(
-                format!("{marker} "),
-                marker_style.add_modifier(Modifier::BOLD),
-            ),
-        ];
+        let mut spans = Vec::new();
+        let gutter = if marked {
+            spans.push(Span::styled("▌", row_style.fg(p.mark_fg)));
+            gutter.chars().skip(1).collect()
+        } else {
+            gutter
+        };
+        spans.push(Span::styled(gutter, row_style.fg(p.gutter_fg)));
+        spans.push(Span::styled(
+            format!("{marker} "),
+            marker_style.add_modifier(Modifier::BOLD),
+        ));
 
         // Syntax spans for the line's source file side.
         let f = &self.files[fi];
@@ -598,5 +729,24 @@ impl DiffView {
         }
         let line = Line::from(spans);
         buf.set_line(area.x, area.y, &line, area.width);
+    }
+}
+
+/// The number a highlight is addressed by: the new side's, or the old side's
+/// in a deleted file.
+fn line_no(f: &FileDiff, line: &crate::diff::DiffLine) -> Option<usize> {
+    match f.status {
+        Status::Deleted => line.old_no,
+        _ => line.new_no,
+    }
+}
+
+/// ① to ⑳, then (21) and on.
+fn numbered(n: usize) -> String {
+    match n {
+        1..=20 => char::from_u32(0x2460 + n as u32 - 1)
+            .map(String::from)
+            .unwrap_or_else(|| format!("({n})")),
+        _ => format!("({n})"),
     }
 }

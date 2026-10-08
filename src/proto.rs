@@ -94,6 +94,22 @@ pub struct ViewSpec {
     /// Show files as they are instead of a diff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<CodeSpec>,
+    /// Line ranges to highlight, numbered in this order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub highlights: Vec<HighlightSpec>,
+}
+
+/// A highlighted line range, 1-based and inclusive, with an optional note.
+/// In a diff the lines are the new side's, or the old side's for a deleted
+/// file.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HighlightSpec {
+    /// Relative to the repository root.
+    pub path: String,
+    pub start: usize,
+    pub end: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Files to show as they are.
