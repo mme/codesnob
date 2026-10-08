@@ -346,7 +346,7 @@ impl App {
     fn flipping(&self) -> bool {
         self.flip
             .as_ref()
-            .is_some_and(|f| f.last.elapsed() < FLIP_WINDOW)
+            .is_some_and(|f| f.last.elapsed() < self.flip_window)
     }
 
     /// Whether the screen must be redrawn on a timer: a load is in flight,
