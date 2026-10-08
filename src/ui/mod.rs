@@ -2504,18 +2504,20 @@ impl App {
             }
         }
         if let Some(loc) = self.locations.first_mut() {
-            // A target line sits about a third of the way down; otherwise
-            // the view opens with ① at the top.
+            // A target line inside a highlight opens at that highlight, its
+            // note at the top; any other target line sits about a third of
+            // the way down. Without one the view opens with ① at the top.
             if std::mem::take(&mut loc.view.place_target) {
-                let line = loc
-                    .view
-                    .target
-                    .clone()
-                    .and_then(|(p, l)| loc.view.row_of_line(&p, l));
-                match line {
-                    Some(row) => loc.view.scroll = row.saturating_sub(self.body_h / 3),
-                    None => {
-                        loc.view.first_mark();
+                let target = loc.view.target.clone();
+                let on_mark = target
+                    .as_ref()
+                    .is_some_and(|(p, l)| loc.view.mark_at(p, *l));
+                if !on_mark {
+                    match target.and_then(|(p, l)| loc.view.row_of_line(&p, l)) {
+                        Some(row) => loc.view.scroll = row.saturating_sub(self.body_h / 3),
+                        None => {
+                            loc.view.first_mark();
+                        }
                     }
                 }
             }
@@ -2635,8 +2637,11 @@ impl App {
                 }
             };
         }
-        if let Some((i, n)) = self.cur().and_then(|l| l.view.mark_position()) {
-            right.insert_str(0, &format!(" highlight {i} of {n}  ·"));
+        match self.cur().and_then(|l| l.view.mark_position()) {
+            Some((Some(i), n)) => right.insert_str(0, &format!(" highlight {i} of {n}  ·")),
+            Some((None, 1)) => right.insert_str(0, " 1 highlight  ·"),
+            Some((None, n)) => right.insert_str(0, &format!(" {n} highlights  ·")),
+            None => {}
         }
         right.push_str(" : commands ");
         let rw = right.chars().count() as u16;

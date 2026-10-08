@@ -142,12 +142,21 @@ impl DiffView {
         (0..self.mark_rows.len()).any(|i| self.go_to_mark(i))
     }
 
-    /// Which highlight was jumped to last, and how many there are.
-    pub fn mark_position(&self) -> Option<(usize, usize)> {
+    /// Jump to the highlight covering `line` of `path`, if one is shown.
+    pub fn mark_at(&mut self, path: &str, line: usize) -> bool {
+        self.marks
+            .iter()
+            .position(|m| m.path == path && (m.start..=m.end).contains(&line))
+            .is_some_and(|i| self.go_to_mark(i))
+    }
+
+    /// The number of the highlight jumped to last, if any, and how many
+    /// there are.
+    pub fn mark_position(&self) -> Option<(Option<usize>, usize)> {
         if !self.has_marks() {
             return None;
         }
-        Some((self.current_mark.map_or(1, |c| c + 1), self.marks.len()))
+        Some((self.current_mark.map(|c| c + 1), self.marks.len()))
     }
 
     /// The next highlight by number; highlights not shown are skipped.

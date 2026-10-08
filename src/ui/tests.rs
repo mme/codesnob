@@ -1871,3 +1871,68 @@ fn highlights_across_files_go_in_the_order_the_files_are_shown() {
     assert!(h.status().contains("highlight 3 of 3"), "{}", h.status());
     cleanup(dir);
 }
+
+#[test]
+fn a_line_inside_a_highlight_opens_at_that_highlight() {
+    let dir = repo_with_long_file("ui-marks-line-in");
+    let mut h = Harness::open(&dir);
+    // As an agent sent it: the line, and its highlight listed first.
+    let mut spec = code(None, &[("src/long.rs", Some(40))]);
+    spec.highlights = vec![
+        hl("src/long.rs", 38, 42, Some("the point")),
+        hl("src/long.rs", 5, 6, Some("setup")),
+        hl("src/long.rs", 20, 20, Some("helper")),
+        hl("src/long.rs", 55, 55, Some("after")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen.lines().nth(1).unwrap_or("").contains("③ the point"),
+        "its note at the top:\n{screen}"
+    );
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains('▶') && l.contains("// line 40")),
+        "the line is marked:\n{screen}"
+    );
+    assert!(h.status().contains("highlight 3 of 4"), "{}", h.status());
+    h.keys(">");
+    assert!(h.status().contains("highlight 4 of 4"), "{}", h.status());
+    h.keys("<<");
+    assert!(h.status().contains("highlight 2 of 4"), "{}", h.status());
+    cleanup(dir);
+}
+
+#[test]
+fn a_line_outside_the_highlights_opens_at_the_line() {
+    let dir = repo_with_long_file("ui-marks-line-out");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", Some(30))]);
+    spec.highlights = vec![
+        hl("src/long.rs", 5, 5, Some("early")),
+        hl("src/long.rs", 55, 55, Some("late")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.contains('▶') && l.contains("// line 30")),
+        "{screen}"
+    );
+    assert!(
+        h.status().contains("2 highlights") && !h.status().contains(" of 2"),
+        "no highlight is current yet: {}",
+        h.status()
+    );
+    h.keys(">");
+    assert_eq!(
+        h.screen().lines().position(|l| l.contains("① early")),
+        Some(1)
+    );
+    assert!(h.status().contains("highlight 1 of 2"), "{}", h.status());
+    cleanup(dir);
+}

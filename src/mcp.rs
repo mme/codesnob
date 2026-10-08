@@ -98,7 +98,7 @@ fn tools() -> Value {
                         "type": "object",
                         "properties": {
                             "path": { "type": "string", "description": "Relative to your working directory, or absolute." },
-                            "line": { "type": "integer", "minimum": 1, "description": "Open at this line, marked." },
+                            "line": { "type": "integer", "minimum": 1, "description": "Open at this line, marked. With highlights the view opens at ①; give a line inside another highlight to open at that one instead." },
                             "highlights": {
                                 "type": "array",
                                 "description": "Line ranges to highlight in this file. The viewer numbers all of a call's highlights by where they sit, not by the order you list them: by file in the order of files, then by line, so the first file's highlights come first. At most 20 per call, ① to ⑳. The user steps through them with < and >; the result lists each number with its file and lines, so refer to them by those numbers.",
