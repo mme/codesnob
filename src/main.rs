@@ -17,8 +17,10 @@ use clap::{Parser, Subcommand};
 /// Fast terminal diff viewer: shows what changed since the branch point.
 #[derive(Parser)]
 #[command(version, about)]
-#[command(after_help = "The viewer talks to a per-user daemon that starts on demand; \
-`codesnob show PATH` switches every open viewer to PATH.")]
+#[command(
+    after_help = "The viewer talks to a per-user daemon that starts on demand; \
+`codesnob show PATH` switches every open viewer to PATH."
+)]
 struct Args {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -111,11 +113,27 @@ fn main() -> Result<()> {
     }
 
     let hl = highlight::Highlighter::new(&args.theme).map_err(anyhow::Error::msg)?;
-    let palette = if args.light { ui::Palette::light() } else { ui::Palette::dark() };
+    let palette = if args.light {
+        ui::Palette::light()
+    } else {
+        ui::Palette::dark()
+    };
     let (tx, rx) = std::sync::mpsc::channel();
     let link = link::Link::new();
-    let mut app = ui::App::new(ui::Options { context: args.context }, palette, hl, tx.clone(), link.clone());
-    app.open(proto::Target { dir: dir.clone(), base: base.clone(), repo });
+    let mut app = ui::App::new(
+        ui::Options {
+            context: args.context,
+        },
+        palette,
+        hl,
+        tx.clone(),
+        link.clone(),
+    );
+    app.open(proto::Target {
+        dir: dir.clone(),
+        base: base.clone(),
+        repo,
+    });
     link::spawn(tx.clone(), link);
     watch::spawn_input(tx);
     ui::run(app, rx)
@@ -124,7 +142,11 @@ fn main() -> Result<()> {
 fn print_stat(snap: git::Snapshot, context: usize) -> std::io::Result<()> {
     use std::io::Write;
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-    writeln!(out, "{} vs {} ({})", snap.head_label, snap.base_label, snap.base_reason)?;
+    writeln!(
+        out,
+        "{} vs {} ({})",
+        snap.head_label, snap.base_label, snap.base_reason
+    )?;
     let (mut added, mut removed) = (0, 0);
     for change in snap.files {
         let d = diff::build(change, context);
@@ -137,7 +159,14 @@ fn print_stat(snap: git::Snapshot, context: usize) -> std::io::Result<()> {
         if d.binary {
             writeln!(out, "{tag} {:<40} binary", d.display_path())?;
         } else {
-            writeln!(out, "{tag} {:<40} +{} -{}  {} hunks", d.display_path(), d.added, d.removed, d.hunks.len())?;
+            writeln!(
+                out,
+                "{tag} {:<40} +{} -{}  {} hunks",
+                d.display_path(),
+                d.added,
+                d.removed,
+                d.hunks.len()
+            )?;
         }
         added += d.added;
         removed += d.removed;

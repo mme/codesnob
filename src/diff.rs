@@ -68,8 +68,16 @@ pub fn build(change: FileChange, context: usize) -> FileDiff {
         (None, Some(_)) => Status::Added,
         _ => Status::Deleted,
     };
-    let path = change.new_path.clone().or(change.old_path.clone()).unwrap_or_default();
-    let old_path = if status == Status::Renamed { change.old_path.clone() } else { None };
+    let path = change
+        .new_path
+        .clone()
+        .or(change.old_path.clone())
+        .unwrap_or_default();
+    let old_path = if status == Status::Renamed {
+        change.old_path.clone()
+    } else {
+        None
+    };
 
     let binary = is_binary(change.old.as_deref()) || is_binary(change.new.as_deref());
     if binary {
@@ -86,10 +94,20 @@ pub fn build(change: FileChange, context: usize) -> FileDiff {
         };
     }
 
-    let old_text = expand_tabs(&String::from_utf8_lossy(change.old.as_deref().unwrap_or(b"")));
-    let new_text = expand_tabs(&String::from_utf8_lossy(change.new.as_deref().unwrap_or(b"")));
-    let old_lines: Vec<String> = split_lines(&old_text).into_iter().map(str::to_owned).collect();
-    let new_lines: Vec<String> = split_lines(&new_text).into_iter().map(str::to_owned).collect();
+    let old_text = expand_tabs(&String::from_utf8_lossy(
+        change.old.as_deref().unwrap_or(b""),
+    ));
+    let new_text = expand_tabs(&String::from_utf8_lossy(
+        change.new.as_deref().unwrap_or(b""),
+    ));
+    let old_lines: Vec<String> = split_lines(&old_text)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let new_lines: Vec<String> = split_lines(&new_text)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
 
     let input = InternedInput::new(old_text.as_str(), new_text.as_str());
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
@@ -98,7 +116,14 @@ pub fn build(change: FileChange, context: usize) -> FileDiff {
     // Group raw change blocks into hunks with shared context.
     let raw: Vec<(usize, usize, usize, usize)> = diff
         .hunks()
-        .map(|h| (h.before.start as usize, h.before.end as usize, h.after.start as usize, h.after.end as usize))
+        .map(|h| {
+            (
+                h.before.start as usize,
+                h.before.end as usize,
+                h.after.start as usize,
+                h.after.end as usize,
+            )
+        })
         .collect();
 
     let mut groups: Vec<Vec<(usize, usize, usize, usize)>> = Vec::new();
@@ -134,22 +159,22 @@ pub fn build(change: FileChange, context: usize) -> FileDiff {
                 n += 1;
             }
             let del_start = lines.len();
-            for i in os..oe {
+            for (i, text) in old_lines.iter().enumerate().take(oe).skip(os) {
                 lines.push(DiffLine {
                     kind: Kind::Del,
                     old_no: Some(i + 1),
                     new_no: None,
-                    text: old_lines[i].clone(),
+                    text: text.clone(),
                     emph: Vec::new(),
                 });
             }
             let add_start = lines.len();
-            for i in ns..ne {
+            for (i, text) in new_lines.iter().enumerate().take(ne).skip(ns) {
                 lines.push(DiffLine {
                     kind: Kind::Add,
                     old_no: None,
                     new_no: Some(i + 1),
-                    text: new_lines[i].clone(),
+                    text: text.clone(),
                     emph: Vec::new(),
                 });
             }
@@ -327,7 +352,10 @@ fn emphasize(lines: &mut [DiffLine], del_start: usize, add_start: usize, end: us
     }
 }
 
-fn word_diff(old: &str, new: &str) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+/// Byte ranges within a line.
+type Ranges = Vec<(usize, usize)>;
+
+fn word_diff(old: &str, new: &str) -> (Ranges, Ranges) {
     let input = InternedInput::new(Words(old), Words(new));
     let diff = Diff::compute(Algorithm::Myers, &input);
     let old_tokens: Vec<&str> = Words(old).tokenize().collect();

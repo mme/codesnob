@@ -11,7 +11,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::proto::{self, Event, HelloResult, Method, Response, RpcError, ShowResult, StatusResult, Target, ViewerEntry, to_line};
+use crate::proto::{
+    self, Event, HelloResult, Method, Response, RpcError, ShowResult, StatusResult, Target,
+    ViewerEntry, to_line,
+};
 
 #[derive(Default)]
 struct State {
@@ -23,13 +26,19 @@ struct State {
 
 impl State {
     fn broadcast(&mut self, ev: Event) {
-        self.subscribers.retain(|(_, tx)| tx.send(ev.clone()).is_ok());
+        self.subscribers
+            .retain(|(_, tx)| tx.send(ev.clone()).is_ok());
     }
 
     /// However the connection ended, everything it owned goes with it.
     fn disconnect(&mut self, conn: u64) {
         self.subscribers.retain(|(c, _)| *c != conn);
-        let gone: Vec<String> = self.viewers.iter().filter(|(c, _)| *c == conn).map(|(_, v)| v.id.clone()).collect();
+        let gone: Vec<String> = self
+            .viewers
+            .iter()
+            .filter(|(c, _)| *c == conn)
+            .map(|(_, v)| v.id.clone())
+            .collect();
         self.viewers.retain(|(c, _)| *c != conn);
         for id in gone {
             eprintln!("viewer {id} disconnected");
@@ -46,13 +55,21 @@ struct Shared {
 pub fn run() -> Result<()> {
     let socket = proto::daemon_socket();
     if let Some(dir) = socket.parent() {
-        proto::ensure_private_dir(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        proto::ensure_private_dir(dir)
+            .with_context(|| format!("cannot create {}", dir.display()))?;
     }
     let listener = bind(&socket)?;
     let identity = file_identity(&socket);
-    eprintln!("codesnobd {} listening on {}", proto::VERSION, socket.display());
+    eprintln!(
+        "codesnobd {} listening on {}",
+        proto::VERSION,
+        socket.display()
+    );
 
-    let shared = Arc::new(Shared { state: Mutex::new(State::default()), shutdown: AtomicBool::new(false) });
+    let shared = Arc::new(Shared {
+        state: Mutex::new(State::default()),
+        shutdown: AtomicBool::new(false),
+    });
     let next_conn = AtomicU64::new(1);
 
     for stream in listener.incoming() {
@@ -94,7 +111,9 @@ fn bind(socket: &std::path::Path) -> Result<UnixListener> {
         Err(e) => return Err(e).with_context(|| format!("cannot bind {}", socket.display())),
     }
     match ask_existing_daemon_to_exit(socket) {
-        Existing::Newer => bail!("a codesnob daemon of the same or newer version is already running"),
+        Existing::Newer => {
+            bail!("a codesnob daemon of the same or newer version is already running")
+        }
         Existing::Stale | Existing::Replaced => {}
     }
     for _ in 0..40 {
@@ -108,13 +127,19 @@ fn bind(socket: &std::path::Path) -> Result<UnixListener> {
 }
 
 fn ask_existing_daemon_to_exit(socket: &std::path::Path) -> Existing {
-    let Ok(stream) = UnixStream::connect(socket) else { return Existing::Stale };
+    let Ok(stream) = UnixStream::connect(socket) else {
+        return Existing::Stale;
+    };
     let timeout = Some(Duration::from_secs(2));
     if stream.set_read_timeout(timeout).is_err() || stream.set_write_timeout(timeout).is_err() {
         return Existing::Stale;
     }
-    let Ok(mut client) = proto::Client::new(stream, "takeover-") else { return Existing::Stale };
-    let Ok(hello) = client.hello() else { return Existing::Stale };
+    let Ok(mut client) = proto::Client::new(stream, "takeover-") else {
+        return Existing::Stale;
+    };
+    let Ok(hello) = client.hello() else {
+        return Existing::Stale;
+    };
     if !is_newer(proto::VERSION, &hello.version) {
         return Existing::Newer;
     }
@@ -124,7 +149,9 @@ fn ask_existing_daemon_to_exit(socket: &std::path::Path) -> Existing {
 
 fn is_newer(candidate: &str, running: &str) -> bool {
     let parse = |v: &str| -> Vec<u64> {
-        v.split(['.', '-', '+']).map(|p| p.parse().unwrap_or(0)).collect()
+        v.split(['.', '-', '+'])
+            .map(|p| p.parse().unwrap_or(0))
+            .collect()
     };
     parse(candidate) > parse(running)
 }
@@ -137,7 +164,9 @@ fn send(writer: &SharedWriter, line: &str) -> bool {
 }
 
 fn serve(conn: u64, stream: UnixStream, shared: &Arc<Shared>) {
-    let Ok(read_half) = stream.try_clone() else { return };
+    let Ok(read_half) = stream.try_clone() else {
+        return;
+    };
     let writer: SharedWriter = Arc::new(Mutex::new(stream));
     let reader = BufReader::new(read_half);
     for line in reader.lines() {
@@ -148,7 +177,11 @@ fn serve(conn: u64, stream: UnixStream, shared: &Arc<Shared>) {
         let (id, method) = match parse_request(&line) {
             Ok(x) => x,
             Err((id, code, message)) => {
-                let resp = Response { id, result: None, error: Some(RpcError { code, message }) };
+                let resp = Response {
+                    id,
+                    result: None,
+                    error: Some(RpcError { code, message }),
+                };
                 if !send(&writer, &to_line(&resp)) {
                     break;
                 }
@@ -156,8 +189,16 @@ fn serve(conn: u64, stream: UnixStream, shared: &Arc<Shared>) {
             }
         };
         let resp = match handle(conn, method, shared, &writer) {
-            Ok(result) => Response { id, result: Some(result), error: None },
-            Err(error) => Response { id, result: None, error: Some(error) },
+            Ok(result) => Response {
+                id,
+                result: Some(result),
+                error: None,
+            },
+            Err(error) => Response {
+                id,
+                result: None,
+                error: Some(error),
+            },
         };
         if !send(&writer, &to_line(&resp)) {
             break;
@@ -173,31 +214,65 @@ fn serve(conn: u64, stream: UnixStream, shared: &Arc<Shared>) {
 fn parse_request(line: &str) -> Result<(String, Method), (String, String, String)> {
     let v: Value = serde_json::from_str(line)
         .map_err(|e| (String::new(), "invalid_frame".to_string(), e.to_string()))?;
-    let id = v.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-    let method_name = v.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+    let id = v
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let method_name = v
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     match serde_json::from_value::<Method>(v) {
         Ok(m) => Ok((id, m)),
         Err(e) => {
-            let known = ["hello", "show", "status", "subscribe", "viewer.register", "daemon.shutdown"];
-            let code = if known.contains(&method_name.as_str()) { "invalid_params" } else { "unsupported_method" };
+            let known = [
+                "hello",
+                "show",
+                "status",
+                "subscribe",
+                "viewer.register",
+                "daemon.shutdown",
+            ];
+            let code = if known.contains(&method_name.as_str()) {
+                "invalid_params"
+            } else {
+                "unsupported_method"
+            };
             Err((id, code.to_string(), e.to_string()))
         }
     }
 }
 
 /// Choose the viewer for a request coming from `workspace`.
-fn pick_viewer<'a>(viewers: &'a [(u64, ViewerEntry)], workspace: Option<&str>) -> Option<(&'a ViewerEntry, &'static str)> {
+fn pick_viewer<'a>(
+    viewers: &'a [(u64, ViewerEntry)],
+    workspace: Option<&str>,
+) -> Option<(&'a ViewerEntry, &'static str)> {
     let first = viewers.first().map(|(_, v)| v)?;
-    let Some(ws) = workspace else { return Some((first, "first")) };
-    if let Some((_, v)) = viewers.iter().find(|(_, v)| v.workspace.as_deref() == Some(ws)) {
+    let Some(ws) = workspace else {
+        return Some((first, "first"));
+    };
+    if let Some((_, v)) = viewers
+        .iter()
+        .find(|(_, v)| v.workspace.as_deref() == Some(ws))
+    {
         return Some((v, "same"));
     }
     // Nearest by numeric distance; names that are not numbers are far away.
     let num = |s: &str| s.trim().parse::<i64>().ok();
-    let Some(mine) = num(ws) else { return Some((first, "first")) };
+    let Some(mine) = num(ws) else {
+        return Some((first, "first"));
+    };
     let nearest = viewers
         .iter()
-        .filter_map(|(_, v)| v.workspace.as_deref().and_then(num).map(|n| ((n - mine).abs(), v)))
+        .filter_map(|(_, v)| {
+            v.workspace
+                .as_deref()
+                .and_then(num)
+                .map(|n| ((n - mine).abs(), v))
+        })
         .min_by_key(|(d, _)| *d)
         .map(|(_, v)| v);
     match nearest {
@@ -206,18 +281,34 @@ fn pick_viewer<'a>(viewers: &'a [(u64, ViewerEntry)], workspace: Option<&str>) -
     }
 }
 
-fn handle(conn: u64, method: Method, shared: &Arc<Shared>, writer: &SharedWriter) -> Result<Value, RpcError> {
+fn handle(
+    conn: u64,
+    method: Method,
+    shared: &Arc<Shared>,
+    writer: &SharedWriter,
+) -> Result<Value, RpcError> {
     Ok(match method {
         Method::Hello { .. } => {
             let target = shared.state.lock().unwrap().target.clone();
-            json!(HelloResult { protocol: proto::PROTOCOL_VERSION, version: proto::VERSION.to_string(), target })
+            json!(HelloResult {
+                protocol: proto::PROTOCOL_VERSION,
+                version: proto::VERSION.to_string(),
+                target
+            })
         }
-        Method::Show { dir, base, workspace } => {
+        Method::Show {
+            dir,
+            base,
+            workspace,
+        } => {
             let repo = gix::discover(&dir).is_ok();
             let target = Target { dir, base, repo };
             let mut st = shared.state.lock().unwrap();
             let Some((viewer, picked_by)) = pick_viewer(&st.viewers, workspace.as_deref()) else {
-                return Err(RpcError { code: "no_viewer".to_string(), message: "no codesnob viewer is connected".to_string() });
+                return Err(RpcError {
+                    code: "no_viewer".to_string(),
+                    message: "no codesnob viewer is connected".to_string(),
+                });
             };
             let result = ShowResult {
                 repo,
@@ -233,12 +324,18 @@ fn handle(conn: u64, method: Method, shared: &Arc<Shared>, writer: &SharedWriter
                 result.workspace,
                 workspace
             );
-            st.broadcast(Event::Show { viewer: result.viewer.clone(), target });
+            st.broadcast(Event::Show {
+                viewer: result.viewer.clone(),
+                target,
+            });
             json!(result)
         }
         Method::Status => {
             let st = shared.state.lock().unwrap();
-            json!(StatusResult { target: st.target.clone(), viewers: st.viewers.iter().map(|(_, v)| v.clone()).collect() })
+            json!(StatusResult {
+                target: st.target.clone(),
+                viewers: st.viewers.iter().map(|(_, v)| v.clone()).collect()
+            })
         }
         Method::ViewerRegister(entry) => {
             let mut st = shared.state.lock().unwrap();
@@ -250,7 +347,10 @@ fn handle(conn: u64, method: Method, shared: &Arc<Shared>, writer: &SharedWriter
                     }
                 }
                 None => {
-                    eprintln!("viewer {} connected (pid {}, workspace {:?})", entry.id, entry.pid, entry.workspace);
+                    eprintln!(
+                        "viewer {} connected (pid {}, workspace {:?})",
+                        entry.id, entry.pid, entry.workspace
+                    );
                     st.viewers.push((conn, entry.clone()));
                     st.broadcast(Event::ViewerConnected(entry));
                 }

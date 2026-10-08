@@ -20,15 +20,18 @@ impl Highlighter {
     pub fn new(theme_name: &str) -> Result<Self, String> {
         let syntaxes = two_face::syntax::extra_newlines();
         let themes: ThemeSet = two_face::theme::extra().into();
-        let theme = themes
-            .themes
-            .get(theme_name)
-            .cloned()
-            .ok_or_else(|| {
-                let names: Vec<&str> = themes.themes.keys().map(String::as_str).collect();
-                format!("unknown theme {theme_name:?}; available: {}", names.join(", "))
-            })?;
-        Ok(Self { syntaxes, theme, cache: HashMap::new() })
+        let theme = themes.themes.get(theme_name).cloned().ok_or_else(|| {
+            let names: Vec<&str> = themes.themes.keys().map(String::as_str).collect();
+            format!(
+                "unknown theme {theme_name:?}; available: {}",
+                names.join(", ")
+            )
+        })?;
+        Ok(Self {
+            syntaxes,
+            theme,
+            cache: HashMap::new(),
+        })
     }
 
     pub fn theme_names() -> Vec<String> {
@@ -56,7 +59,11 @@ impl Highlighter {
             .syntaxes
             .find_syntax_by_extension(name)
             .or_else(|| self.syntaxes.find_syntax_by_extension(ext))
-            .or_else(|| lines.first().and_then(|l| self.syntaxes.find_syntax_by_first_line(l)));
+            .or_else(|| {
+                lines
+                    .first()
+                    .and_then(|l| self.syntaxes.find_syntax_by_first_line(l))
+            });
         let Some(syntax) = syntax else {
             return lines.iter().map(|_| Vec::new()).collect();
         };
@@ -68,18 +75,15 @@ impl Highlighter {
             buf.push_str(line);
             buf.push('\n');
             let mut spans = Vec::new();
-            match hl.highlight_line(&buf, &self.syntaxes) {
-                Ok(regions) => {
-                    let mut pos = 0;
-                    for (style, text) in regions {
-                        let end = (pos + text.len()).min(line.len());
-                        if end > pos {
-                            spans.push((to_style(style), pos, end));
-                        }
-                        pos = end;
+            if let Ok(regions) = hl.highlight_line(&buf, &self.syntaxes) {
+                let mut pos = 0;
+                for (style, text) in regions {
+                    let end = (pos + text.len()).min(line.len());
+                    if end > pos {
+                        spans.push((to_style(style), pos, end));
                     }
+                    pos = end;
                 }
-                Err(_) => {}
             }
             out.push(spans);
         }

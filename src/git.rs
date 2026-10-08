@@ -52,7 +52,8 @@ struct Base {
 }
 
 pub fn snapshot(dir: &Path, base_override: Option<&str>) -> Result<Snapshot> {
-    let repo = gix::discover(dir).with_context(|| format!("{} is not inside a git repository", dir.display()))?;
+    let repo = gix::discover(dir)
+        .with_context(|| format!("{} is not inside a git repository", dir.display()))?;
     let workdir = repo
         .workdir()
         .context("bare repositories have no working tree to diff")?
@@ -96,7 +97,10 @@ fn explicit_base(repo: &gix::Repository, head_id: Option<ObjectId>, spec: &str) 
         .with_context(|| format!("cannot resolve base revision {spec:?}"))?
         .detach();
     let commit = match head_id {
-        Some(head) => repo.merge_base(head, target).map(|id| id.detach()).unwrap_or(target),
+        Some(head) => repo
+            .merge_base(head, target)
+            .map(|id| id.detach())
+            .unwrap_or(target),
         None => target,
     };
     Ok(Base {
@@ -138,7 +142,9 @@ fn detect_base(repo: &gix::Repository, head_id: Option<ObjectId>) -> Result<Base
         if candidates.iter().any(|c| c.name == name) {
             return;
         }
-        let Ok(id) = repo.rev_parse_single(name) else { return };
+        let Ok(id) = repo.rev_parse_single(name) else {
+            return;
+        };
         let id = id.detach();
         // Skip refs that are this very branch (or its own remote copy), unless we
         // are sitting on a default branch and want to compare against its upstream.
@@ -150,23 +156,27 @@ fn detect_base(repo: &gix::Repository, head_id: Option<ObjectId>) -> Result<Base
             return;
         }
         let is_ref = repo.try_find_reference(name).ok().flatten().is_some();
-        candidates.push(Candidate { name: name.to_string(), id, reason, is_ref });
+        candidates.push(Candidate {
+            name: name.to_string(),
+            id,
+            reason,
+            is_ref,
+        });
     };
 
     // 1. The reflog records "branch: Created from <ref>".
-    if let Some(from) = reflog_origin(repo) {
-        if from != "HEAD" {
-            push(&mut candidates, &from, "reflog");
-        }
+    if let Some(from) = reflog_origin(repo)
+        && from != "HEAD"
+    {
+        push(&mut candidates, &from, "reflog");
     }
 
     // 2. The configured upstream.
-    if let Ok(Some(head_ref)) = repo.head_ref() {
-        if let Some(Ok(tracking)) =
+    if let Ok(Some(head_ref)) = repo.head_ref()
+        && let Some(Ok(tracking)) =
             repo.branch_remote_tracking_ref_name(head_ref.name(), gix::remote::Direction::Fetch)
-        {
-            push(&mut candidates, &tracking.shorten().to_string(), "upstream");
-        }
+    {
+        push(&mut candidates, &tracking.shorten().to_string(), "upstream");
     }
 
     // 3. Well-known names, local and on origin.
@@ -183,7 +193,9 @@ fn detect_base(repo: &gix::Repository, head_id: Option<ObjectId>) -> Result<Base
     // expression, then the earlier (higher priority) candidate wins.
     let mut best: Option<(i64, ObjectId, &Candidate)> = None;
     for cand in &candidates {
-        let Ok(mb) = repo.merge_base(head, cand.id) else { continue };
+        let Ok(mb) = repo.merge_base(head, cand.id) else {
+            continue;
+        };
         let mb = mb.detach();
         let time = repo
             .find_commit(mb)
@@ -203,7 +215,8 @@ fn detect_base(repo: &gix::Repository, head_id: Option<ObjectId>) -> Result<Base
     match best {
         Some((_, mb, cand)) => {
             let name = if cand.name == "origin/HEAD" {
-                resolve_symbolic(repo, "refs/remotes/origin/HEAD").unwrap_or_else(|| cand.name.clone())
+                resolve_symbolic(repo, "refs/remotes/origin/HEAD")
+                    .unwrap_or_else(|| cand.name.clone())
             } else {
                 cand.name.clone()
             };
@@ -242,7 +255,11 @@ fn reflog_origin(repo: &gix::Repository) -> Option<String> {
     Some(from.to_string())
 }
 
-fn collect_changes(repo: &gix::Repository, workdir: &Path, base: Option<ObjectId>) -> Result<Vec<FileChange>> {
+fn collect_changes(
+    repo: &gix::Repository,
+    workdir: &Path,
+    base: Option<ObjectId>,
+) -> Result<Vec<FileChange>> {
     let base_tree = match base {
         Some(id) => repo.find_commit(id)?.tree()?,
         None => repo.empty_tree(),
@@ -251,8 +268,8 @@ fn collect_changes(repo: &gix::Repository, workdir: &Path, base: Option<ObjectId
     let mut paths: BTreeSet<BString> = BTreeSet::new();
     {
         use gix::diff::index::Change as TreeChange;
-        use gix::status::index_worktree::Item as WtItem;
         use gix::status::Item;
+        use gix::status::index_worktree::Item as WtItem;
 
         let platform = repo
             .status(gix::progress::Discard)?
@@ -268,7 +285,11 @@ fn collect_changes(repo: &gix::Repository, workdir: &Path, base: Option<ObjectId
                     | TreeChange::Modification { location, .. } => {
                         paths.insert(location.into_owned());
                     }
-                    TreeChange::Rewrite { source_location, location, .. } => {
+                    TreeChange::Rewrite {
+                        source_location,
+                        location,
+                        ..
+                    } => {
                         paths.insert(source_location.into_owned());
                         paths.insert(location.into_owned());
                     }
@@ -282,7 +303,11 @@ fn collect_changes(repo: &gix::Repository, workdir: &Path, base: Option<ObjectId
                     WtItem::Modification { rela_path, .. } => {
                         paths.insert(rela_path.clone());
                     }
-                    WtItem::Rewrite { source, dirwalk_entry, .. } => {
+                    WtItem::Rewrite {
+                        source,
+                        dirwalk_entry,
+                        ..
+                    } => {
                         paths.insert(source.rela_path().to_owned());
                         paths.insert(dirwalk_entry.rela_path.clone());
                     }
@@ -298,19 +323,20 @@ fn collect_changes(repo: &gix::Repository, workdir: &Path, base: Option<ObjectId
     }
     let mut entries: Vec<Side> = Vec::new();
     for path in &paths {
-        let old = match base_tree.lookup_entry_by_path(gix::path::from_bstr(path.as_bstr()).as_ref())? {
-            Some(entry) => {
-                use gix::objs::tree::EntryKind::*;
-                match entry.mode().kind() {
-                    Blob | BlobExecutable | Link => {
-                        let id = entry.id().detach();
-                        Some((id, repo.find_blob(id)?.take_data()))
+        let old =
+            match base_tree.lookup_entry_by_path(gix::path::from_bstr(path.as_bstr()).as_ref())? {
+                Some(entry) => {
+                    use gix::objs::tree::EntryKind::*;
+                    match entry.mode().kind() {
+                        Blob | BlobExecutable | Link => {
+                            let id = entry.id().detach();
+                            Some((id, repo.find_blob(id)?.take_data()))
+                        }
+                        Tree | Commit => None,
                     }
-                    Tree | Commit => None,
                 }
-            }
-            None => None,
-        };
+                None => None,
+            };
         let new = read_worktree(&workdir.join(gix::path::from_bstr(path.as_bstr())));
         let same = match (&old, &new) {
             (None, None) => true,
@@ -320,7 +346,11 @@ fn collect_changes(repo: &gix::Repository, workdir: &Path, base: Option<ObjectId
         if same {
             continue;
         }
-        entries.push(Side { path: path.to_str_lossy().into_owned(), old, new });
+        entries.push(Side {
+            path: path.to_str_lossy().into_owned(),
+            old,
+            new,
+        });
     }
 
     // Pair exact renames: a deleted blob whose content reappears under a new path.
@@ -335,13 +365,17 @@ fn collect_changes(repo: &gix::Repository, workdir: &Path, base: Option<ObjectId
     let mut consumed = vec![false; entries.len()];
     if !deleted_by_id.is_empty() {
         for i in 0..entries.len() {
-            let (None, Some(data)) = (&entries[i].old, &entries[i].new) else { continue };
-            let Ok(id) = gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, data) else { continue };
-            if let Some(list) = deleted_by_id.get_mut(&id) {
-                if let Some(j) = list.pop() {
-                    rename_target[j] = Some(i);
-                    consumed[i] = true;
-                }
+            let (None, Some(data)) = (&entries[i].old, &entries[i].new) else {
+                continue;
+            };
+            let Ok(id) = gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, data) else {
+                continue;
+            };
+            if let Some(list) = deleted_by_id.get_mut(&id)
+                && let Some(j) = list.pop()
+            {
+                rename_target[j] = Some(i);
+                consumed[i] = true;
             }
         }
     }
@@ -389,4 +423,62 @@ fn read_worktree(path: &Path) -> Option<Vec<u8>> {
         return std::fs::read(path).ok();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .output()
+            .expect("git runs")
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn a_branch_diffs_against_where_it_was_created_including_uncommitted_work() {
+        let dir = std::env::temp_dir().join(format!("codesnob-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "base"]);
+        git(&dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "feature work"]);
+        std::fs::write(dir.join("a.txt"), "a changed\n").unwrap();
+        std::fs::write(dir.join("untracked.txt"), "new\n").unwrap();
+
+        let snap = snapshot(&dir, None).unwrap();
+        assert_eq!(snap.head_label, "feature");
+        assert!(
+            snap.base_label.starts_with("main @ "),
+            "base was {}",
+            snap.base_label
+        );
+        let paths: Vec<_> = snap
+            .files
+            .iter()
+            .filter_map(|f| f.new_path.clone())
+            .collect();
+        assert_eq!(paths, ["a.txt", "b.txt", "untracked.txt"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
