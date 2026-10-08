@@ -3,6 +3,11 @@
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Action {
+    Commits,
+    OlderCommit,
+    NewerCommit,
+    ShowCommit(gix::ObjectId),
+    ToggleDescription,
     Files,
     /// Narrow to the current file, or show all files again.
     Narrow,
@@ -31,6 +36,11 @@ pub struct Command {
 /// In palette order: what the palette is for first, movement after.
 pub const COMMANDS: &[Command] = &[
     Command {
+        action: Action::Commits,
+        name: "Commits…",
+        keys: "c",
+    },
+    Command {
         action: Action::Files,
         name: "Files…",
         keys: "f",
@@ -49,6 +59,21 @@ pub const COMMANDS: &[Command] = &[
         action: Action::RangeUncommitted,
         name: "Uncommitted changes only",
         keys: "",
+    },
+    Command {
+        action: Action::OlderCommit,
+        name: "Older commit",
+        keys: "<",
+    },
+    Command {
+        action: Action::NewerCommit,
+        name: "Newer commit",
+        keys: ">",
+    },
+    Command {
+        action: Action::ToggleDescription,
+        name: "Toggle description",
+        keys: "d",
     },
     Command {
         action: Action::ExplainBase,

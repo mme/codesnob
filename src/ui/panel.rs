@@ -17,6 +17,7 @@ use super::commands::Action;
 pub enum Kind {
     Commands,
     Files,
+    Commits,
 }
 
 impl Kind {
@@ -24,6 +25,7 @@ impl Kind {
         match self {
             Kind::Commands => "Commands",
             Kind::Files => "Files",
+            Kind::Commits => "Commits",
         }
     }
 
@@ -31,13 +33,13 @@ impl Kind {
     fn recent_first(self) -> bool {
         match self {
             Kind::Commands => true,
-            Kind::Files => false,
+            Kind::Files | Kind::Commits => false,
         }
     }
 
     /// Moving the selection previews the choice behind the panel.
     pub fn previews(self) -> bool {
-        matches!(self, Kind::Files)
+        matches!(self, Kind::Files | Kind::Commits)
     }
 }
 
@@ -70,6 +72,9 @@ pub struct Panel {
     offset: usize,
     /// Item keys, most recently used first.
     recent: Vec<String>,
+    /// Shown on the input line in place of the viewer's status, e.g. why a
+    /// list is short.
+    pub note: Option<String>,
     matcher: Matcher,
 }
 
@@ -84,6 +89,7 @@ impl Panel {
             selected: 0,
             offset: 0,
             recent,
+            note: None,
             matcher: Matcher::new(Config::DEFAULT),
         };
         p.refilter();
@@ -202,6 +208,7 @@ impl Panel {
             Span::styled(self.input.clone(), bar),
         ]);
         let used = buf.set_line(area.x, area.y, &line, area.width).0;
+        let info = self.note.as_deref().unwrap_or(info);
         let iw = info.chars().count() as u16 + 1;
         if area.right() > used + iw + 2 {
             buf.set_span(
