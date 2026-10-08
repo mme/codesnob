@@ -62,8 +62,10 @@ pub struct DiffView {
     pub place_target: bool,
     /// Highlights, drawn over their lines.
     marks: Vec<Mark>,
-    /// The row of each highlight's note, in screen order.
-    mark_rows: Vec<usize>,
+    /// The row of each highlight's note, by number; `None` when not shown.
+    mark_rows: Vec<Option<usize>>,
+    /// The highlight last jumped to, by index; `<` and `>` go on from here.
+    current_mark: Option<usize>,
 }
 
 impl DiffView {
@@ -95,6 +97,10 @@ impl DiffView {
     pub fn set_marks(&mut self, marks: Vec<Mark>) {
         if self.marks != marks {
             let anchor = self.anchor();
+            // The same highlights after a reload keep their place in order.
+            if self.marks.len() != marks.len() {
+                self.current_mark = None;
+            }
             self.marks = marks;
             self.build_rows();
             if let Some(a) = anchor {
@@ -104,42 +110,46 @@ impl DiffView {
     }
 
     pub fn has_marks(&self) -> bool {
-        !self.mark_rows.is_empty()
+        self.mark_rows.iter().any(Option::is_some)
     }
 
-    /// The first highlight's row, to open at.
-    pub fn first_mark_row(&self) -> Option<usize> {
-        self.mark_rows.first().copied()
+    /// Jump to highlight `i` (by index): its note at the top of the view.
+    fn go_to_mark(&mut self, i: usize) -> bool {
+        match self.mark_rows.get(i).copied().flatten() {
+            Some(row) => {
+                self.scroll = row;
+                self.current_mark = Some(i);
+                true
+            }
+            None => false,
+        }
     }
 
-    /// Highlights are read a third of the way down the screen, where the
-    /// view places them.
-    fn reading_row(&self, body_h: usize) -> usize {
-        self.scroll + body_h / 3
+    /// Open at ①, or the first highlight shown.
+    pub fn first_mark(&mut self) -> bool {
+        (0..self.mark_rows.len()).any(|i| self.go_to_mark(i))
     }
 
-    /// Which highlight is being read, and how many there are.
-    pub fn mark_position(&self, body_h: usize) -> Option<(usize, usize)> {
-        if self.mark_rows.is_empty() {
+    /// Which highlight was jumped to last, and how many there are.
+    pub fn mark_position(&self) -> Option<(usize, usize)> {
+        if !self.has_marks() {
             return None;
         }
-        let reading = self.reading_row(body_h);
-        let passed = self.mark_rows.iter().filter(|&&r| r <= reading).count();
-        Some((passed.max(1), self.mark_rows.len()))
+        Some((self.current_mark.map_or(1, |c| c + 1), self.marks.len()))
     }
 
-    pub fn next_mark(&mut self, body_h: usize) {
-        let reading = self.reading_row(body_h);
-        if let Some(&r) = self.mark_rows.iter().find(|&&r| r > reading) {
-            self.scroll = r.saturating_sub(body_h / 3);
-        }
+    /// The next highlight by number; highlights not shown are skipped.
+    pub fn next_mark(&mut self) {
+        let from = self.current_mark.map_or(0, |c| c + 1);
+        let _ = (from..self.mark_rows.len()).any(|i| self.go_to_mark(i));
     }
 
-    pub fn prev_mark(&mut self, body_h: usize) {
-        let reading = self.reading_row(body_h);
-        if let Some(&r) = self.mark_rows.iter().rev().find(|&&r| r < reading) {
-            self.scroll = r.saturating_sub(body_h / 3);
-        }
+    pub fn prev_mark(&mut self) {
+        let Some(c) = self.current_mark else {
+            self.first_mark();
+            return;
+        };
+        let _ = (0..c).rev().any(|i| self.go_to_mark(i));
     }
 
     /// The highlight covering a line of file `fi`, if any.
@@ -276,7 +286,7 @@ impl DiffView {
         self.rows.clear();
         self.file_starts.clear();
         self.hunk_starts.clear();
-        self.mark_rows.clear();
+        self.mark_rows = vec![None; self.marks.len()];
         let mut placed = vec![false; self.marks.len()];
         let mut max_no = 1;
         for i in 0..self.desc.len() {
@@ -316,7 +326,7 @@ impl DiffView {
                                 && (mark.start..=mark.end).contains(&no)
                             {
                                 placed[m] = true;
-                                self.mark_rows.push(self.rows.len());
+                                self.mark_rows[m] = Some(self.rows.len());
                                 self.rows.push(Row::Mark(m));
                             }
                         }
