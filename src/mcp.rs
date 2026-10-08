@@ -93,7 +93,7 @@ fn tools() -> Value {
                 "files": {
                     "type": "array",
                     "minItems": 1,
-                    "description": "The files to show. One shows whole; several show as excerpts around their line.",
+                    "description": "The files to show, in this order. One shows whole; several show as excerpts around their line and highlights.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -101,7 +101,7 @@ fn tools() -> Value {
                             "line": { "type": "integer", "minimum": 1, "description": "Open at this line, marked." },
                             "highlights": {
                                 "type": "array",
-                                "description": "Line ranges to highlight, numbered in order; the user steps through them with < and >.",
+                                "description": "Line ranges to highlight in this file. The viewer numbers all of a call's highlights by where they sit, not by the order you list them: by file in the order of files, then by line, so the first file's highlights come first. At most 20 per call, ① to ⑳. The user steps through them with < and >; the result lists each number with its file and lines, so refer to them by those numbers.",
                                 "items": {
                                     "type": "object",
                                     "properties": {
@@ -130,7 +130,7 @@ fn tools() -> Value {
                 "files": { "type": "array", "items": { "type": "string" }, "description": "Show only these files. Paths are relative to your working directory." },
                 "highlights": {
                     "type": "array",
-                    "description": "Line ranges to highlight, numbered in order. Lines are the new side's, or the old side's in a deleted file; unchanged lines are shown too.",
+                    "description": "Line ranges to highlight. Lines are the new side's, or the old side's in a deleted file; unchanged lines are shown too. The viewer numbers them by where they sit, not by the order you list them: by file in path order, as the diff lists its files, then by line. At most 20 per call, ① to ⑳. The user steps through them with < and >; the result lists each number with its file and lines, so refer to them by those numbers.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -238,6 +238,7 @@ fn prepare_code(
             line: line.map(|l| l as usize),
         });
     }
+    check_count(marks.len())?;
     // Every file must be there to be shown.
     let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
     let snap = crate::git::read_code(&root, rev.as_deref(), &paths).map_err(|e| e.to_string())?;
@@ -253,7 +254,7 @@ fn prepare_code(
             return Err(format!("{} has {n} lines; line {l} does not exist", f.path));
         }
     }
-    let highlights: Vec<crate::proto::HighlightSpec> = marks
+    let mut highlights: Vec<crate::proto::HighlightSpec> = marks
         .into_iter()
         .map(|(i, mut h)| {
             if h.end > lengths[i] {
@@ -266,6 +267,9 @@ fn prepare_code(
             Ok(h)
         })
         .collect::<Result<_, String>>()?;
+    // Numbered as the viewer shows them: by file in the listed order, then line.
+    let at = |path: &str| files.iter().position(|f| f.path == path);
+    highlights.sort_by_key(|h| (at(&h.path), h.start, h.end));
     let mut what = files
         .iter()
         .map(|f| match f.line {
@@ -277,7 +281,7 @@ fn prepare_code(
     if let Some(r) = &rev {
         what.push_str(&format!(" as of {r}"));
     }
-    what.push_str(&count_highlights(highlights.len()));
+    what.push_str(&list_highlights(&highlights));
     let view = crate::proto::ViewSpec {
         code: Some(crate::proto::CodeSpec { rev, files }),
         highlights,
@@ -334,12 +338,34 @@ fn parse_lines(v: Option<&Value>) -> Result<(usize, usize), String> {
     Ok((start, end))
 }
 
-fn count_highlights(n: usize) -> String {
-    match n {
-        0 => String::new(),
-        1 => ", 1 highlight".to_string(),
-        n => format!(", {n} highlights"),
+fn check_count(n: usize) -> Result<(), String> {
+    let max = crate::proto::MAX_HIGHLIGHTS;
+    if n > max {
+        return Err(format!(
+            "at most {max} highlights per call (got {n}); keep the ones that matter most"
+        ));
     }
+    Ok(())
+}
+
+/// The highlights with the numbers the user sees, in order.
+fn list_highlights(highlights: &[crate::proto::HighlightSpec]) -> String {
+    if highlights.is_empty() {
+        return String::new();
+    }
+    let each: Vec<String> = highlights
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let lines = if h.start == h.end {
+                h.start.to_string()
+            } else {
+                format!("{}-{}", h.start, h.end)
+            };
+            format!("{} {} {lines}", crate::proto::circled(i + 1), h.path)
+        })
+        .collect();
+    format!("; highlights {}", each.join(", "))
 }
 
 fn no_viewer(e: String) -> String {
@@ -395,13 +421,17 @@ fn prepare_diff(
             note: note(h),
         });
     }
+    check_count(highlights.len())?;
+    // Numbered as the viewer shows them: by path, as the diff orders files,
+    // then line.
+    highlights.sort_by(|a, b| (&a.path, a.start, a.end).cmp(&(&b.path, b.start, b.end)));
     let mut what = range
         .clone()
         .unwrap_or_else(|| "everything since the branch point".to_string());
     if !files.is_empty() {
         what.push_str(&format!(", narrowed to {}", files.join(", ")));
     }
-    what.push_str(&count_highlights(highlights.len()));
+    what.push_str(&list_highlights(&highlights));
     let view = crate::proto::ViewSpec {
         range,
         files,
@@ -539,7 +569,7 @@ mod tests {
                 note: Some("here".into()),
             }]
         );
-        assert_eq!(what, "a.txt, 1 highlight");
+        assert_eq!(what, "a.txt; highlights ① a.txt 1");
         let err = prepare_code(
             &json!({ "files": [{ "path": "a.txt", "highlights": [{ "lines": "1-5" }] }] }),
             &dir,
@@ -553,8 +583,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(view.highlights.len(), 2);
-        assert_eq!((view.highlights[0].start, view.highlights[0].end), (2, 3));
-        assert!(what.ends_with(", 2 highlights"), "{what}");
+        assert_eq!((view.highlights[1].start, view.highlights[1].end), (2, 3));
+        assert!(
+            what.ends_with("; highlights ① a.txt 1, ② src/deep/one.rs 2-3"),
+            "{what}"
+        );
         for bad in ["0-2", "5-3", "x"] {
             assert!(
                 prepare_diff(
@@ -565,6 +598,75 @@ mod tests {
                 "{bad}"
             );
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn highlights_are_numbered_by_where_they_sit() {
+        let dir = branch_with_history("mcp-numbering");
+        // show_code: by file in the order listed, then by line.
+        let (_, view, what) = prepare_code(
+            &json!({ "files": [
+                { "path": "b.txt", "highlights": [{ "lines": "1", "note": "b" }] },
+                { "path": "a.txt", "highlights": [{ "lines": "1", "note": "a" }] },
+            ], "rev": "HEAD~2" }),
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(
+            what,
+            "b.txt, a.txt as of HEAD~2; highlights ① b.txt 1, ② a.txt 1"
+        );
+        let notes: Vec<_> = view.highlights.iter().map(|h| h.note.as_deref()).collect();
+        assert_eq!(notes, [Some("b"), Some("a")]);
+
+        // show_diff: by path, as the diff orders its files, then by line.
+        let (_, view, what) = prepare_diff(
+            &json!({ "highlights": [
+                { "path": "src/deep/one.rs", "lines": "9" },
+                { "path": "b.txt", "lines": "7-8" },
+                { "path": "src/deep/one.rs", "lines": "3" },
+                { "path": "a.txt", "lines": "5" },
+            ] }),
+            &dir,
+        )
+        .unwrap();
+        assert!(
+            what.ends_with(
+                "; highlights ① a.txt 5, ② b.txt 7-8, ③ src/deep/one.rs 3, ④ src/deep/one.rs 9"
+            ),
+            "{what}"
+        );
+        let starts: Vec<_> = view.highlights.iter().map(|h| h.start).collect();
+        assert_eq!(starts, [5, 7, 3, 9]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn at_most_twenty_highlights_per_call() {
+        let dir = branch_with_history("mcp-cap");
+        let many = |n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|_| json!({ "path": "a.txt", "lines": "1" }))
+                .collect()
+        };
+        let (_, view, what) = prepare_diff(&json!({ "highlights": many(20) }), &dir).unwrap();
+        assert_eq!(view.highlights.len(), 20);
+        assert!(what.contains("⑳ a.txt 1"), "{what}");
+        let err = prepare_diff(&json!({ "highlights": many(21) }), &dir).unwrap_err();
+        assert_eq!(
+            err,
+            "at most 20 highlights per call (got 21); keep the ones that matter most"
+        );
+        let err = prepare_code(
+            &json!({ "files": [{ "path": "a.txt", "highlights": many(21) }] }),
+            &dir,
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("at most 20 highlights per call (got 21)"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }
