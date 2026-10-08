@@ -214,14 +214,14 @@ fn the_palette_lists_commands_with_their_keys_and_runs_them() {
 fn recently_used_commands_come_first() {
     let dir = branch_with_history("ui-recent");
     let mut h = Harness::open(&dir);
-    h.keys(":how<enter>");
+    h.keys(":reload<enter>");
     h.keys(":");
     let screen = h.screen();
     let first = screen
         .lines()
         .find(|l| l.starts_with("› "))
         .expect("a selected row");
-    assert!(first.contains("How the base was chosen"), "{screen}");
+    assert!(first.contains("Reload"), "{screen}");
     cleanup(dir);
 }
 
@@ -241,19 +241,6 @@ fn esc_never_quits_and_q_does() {
     assert!(!h.app.quit);
     h.keys("q");
     assert!(h.app.quit);
-    cleanup(dir);
-}
-
-#[test]
-fn the_base_explanation_is_one_command_away() {
-    let dir = branch_with_history("ui-explain");
-    let mut h = Harness::open(&dir);
-    h.keys(":how the base<enter>");
-    let status = h.status();
-    assert!(
-        status.contains("Base: feature was created from main"),
-        "{status}"
-    );
     cleanup(dir);
 }
 
@@ -897,12 +884,7 @@ fn pr_checkouts_are_remembered_and_removed_on_request() {
     h.keys("o#7<enter>");
     let checkout = h.app.cur().unwrap().dir.clone();
 
-    h.keys(":remove pr<enter>");
-    assert!(
-        h.status().contains("removed 0 PR checkouts"),
-        "{}",
-        h.status()
-    );
+    assert_eq!(crate::pr::prune(&cache, Duration::ZERO), 0);
     assert!(checkout.exists(), "an open PR is kept");
 
     h.keys("-o");
@@ -912,12 +894,7 @@ fn pr_checkouts_are_remembered_and_removed_on_request() {
         h.screen()
     );
     h.keys("<esc>-:close loc<enter>");
-    h.keys(":remove pr<enter>");
-    assert!(
-        h.status().contains("removed 1 PR checkout"),
-        "{}",
-        h.status()
-    );
+    assert_eq!(crate::pr::prune(&cache, Duration::ZERO), 1);
     assert!(!checkout.exists());
     let refs = std::process::Command::new("git")
         .current_dir(&user)
@@ -1285,4 +1262,63 @@ fn fetching_a_pr_again_reports_when_it_is_done() {
     cleanup(origin);
     cleanup(user);
     cleanup(cache);
+}
+
+#[test]
+fn u_toggles_the_uncommitted_changes_and_capital_l_lists_locations() {
+    let a = branch_with_history("ui-u-key");
+    let b = small_repo("ui-l-key");
+    let mut h = Harness::open(&a);
+    h.keys("u");
+    assert!(
+        h.status().starts_with("feature · uncommitted changes"),
+        "{}",
+        h.status()
+    );
+    h.keys("u");
+    assert!(
+        h.status().contains("since main"),
+        "u again goes back: {}",
+        h.status()
+    );
+
+    h.keys("L");
+    assert!(
+        h.status().contains("no other location open"),
+        "{}",
+        h.status()
+    );
+    h.keys(&format!("o{}<enter>", b.display()));
+    h.keys("L");
+    assert!(h.screen().contains("Locations ›"), "{}", h.screen());
+    cleanup(a);
+    cleanup(b);
+}
+
+#[test]
+fn the_palette_lists_keys_users_know_and_no_housekeeping() {
+    let dir = branch_with_history("ui-palette-keys");
+    let mut h = Harness::open(&dir);
+    h.keys(":top");
+    assert!(h.screen().contains("Top [Home]"), "{}", h.screen());
+    h.keys("<c-u>bottom");
+    assert!(h.screen().contains("Bottom [End]"), "{}", h.screen());
+    h.keys("<c-u>uncommitted");
+    assert!(
+        h.screen().contains("Uncommitted changes only [u]"),
+        "{}",
+        h.screen()
+    );
+    h.keys("<esc>");
+    for gone in ["How the base was chosen", "Remove PR checkouts"] {
+        h.keys(":");
+        let mut all = String::new();
+        for _ in 0..30 {
+            all.push_str(&h.screen());
+            h.keys("<down>");
+        }
+        assert!(!all.contains(gone), "{gone} is not a palette command");
+        h.keys("<esc>");
+    }
+    cleanup(dir);
 }

@@ -25,6 +25,7 @@ codesnob [PATH]        open the viewer (default: current directory)
 codesnob show PATH     show PATH in the viewer on your workspace
 codesnob status        list connected viewers and their workspaces
 codesnob mcp           MCP server over stdio, for agents
+codesnob prune         remove PR checkouts no viewer has open
 ```
 
 Give Claude Code the `show_diff` tool:
@@ -41,14 +42,16 @@ need to start:
 | `o` | open a path, or a PR: `#123`, `owner/repo#123` or its URL |
 | `c` | the branch's commits; moving through the list previews each one |
 | Alt-↑ Alt-↓ | older and newer commit, directly |
+| `u` | only the uncommitted changes, and back |
 | `f` | the changed files; `z` narrows the view to one |
 | `d` | show or hide the commit message or PR description |
 | `-` | back to the previous location; quick repeats go further |
+| `L` | all locations open in this viewer |
 | Esc | back out one level |
 
 PRs are checked out with `gh` into `~/.cache/codesnob`, next to your own
-clone when one is open. Checkouts unused for a week are removed, and "Remove
-PR checkouts" in the palette clears them now.
+clone when one is open. Checkouts unused for a week are removed, and `codesnob prune` clears
+the ones no viewer has open right away.
 
 ## Building
 
