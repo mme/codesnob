@@ -11,6 +11,8 @@ pub enum Action {
     PreviousLocation,
     NextLocation,
     CloseLocation,
+    NextMark,
+    PrevMark,
     Commits,
     OlderCommit,
     NewerCommit,
@@ -43,6 +45,16 @@ pub struct Command {
 
 /// In palette order: what the palette is for first, movement after.
 pub const COMMANDS: &[Command] = &[
+    Command {
+        action: Action::NextMark,
+        name: "Next highlight",
+        keys: ">",
+    },
+    Command {
+        action: Action::PrevMark,
+        name: "Previous highlight",
+        keys: "<",
+    },
     Command {
         action: Action::Open,
         name: "Open…",
