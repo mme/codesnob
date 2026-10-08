@@ -14,6 +14,15 @@ pub struct Entry {
     pub base: Option<String>,
     /// Unix seconds when it was last opened.
     pub used: u64,
+    /// For a PR: its URL and title. `dir` is then its checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PrRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrRef {
+    pub url: String,
+    pub title: String,
 }
 
 /// Where the list lives: `$XDG_STATE_HOME/codesnob`, else
@@ -42,11 +51,15 @@ pub fn load(dir: &Path) -> Vec<Entry> {
         .unwrap_or_default()
 }
 
-/// Move `dir` to the front of the list and save it. Failures to save are
-/// ignored: the list is a convenience.
-pub fn record(state: &Path, dir: &Path, base: Option<&str>) {
+/// Move `dir` (or the PR) to the front of the list and save it. Failures to
+/// save are ignored: the list is a convenience.
+pub fn record(state: &Path, dir: &Path, base: Option<&str>, pr: Option<PrRef>) {
     let mut list = load(state);
-    list.retain(|e| !(e.dir == dir && e.base.as_deref() == base));
+    list.retain(|e| match (&e.pr, &pr) {
+        (Some(a), Some(b)) => a.url != b.url,
+        (None, None) => !(e.dir == dir && e.base.as_deref() == base),
+        _ => true,
+    });
     let used = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -57,6 +70,7 @@ pub fn record(state: &Path, dir: &Path, base: Option<&str>) {
             dir: dir.to_path_buf(),
             base: base.map(str::to_owned),
             used,
+            pr,
         },
     );
     list.truncate(MAX);
@@ -78,9 +92,9 @@ mod tests {
     fn newest_first_without_duplicates_and_capped() {
         let state = crate::testutil::fresh_dir("recent");
         for i in 0..25 {
-            record(&state, Path::new(&format!("/r/{i}")), None);
+            record(&state, Path::new(&format!("/r/{i}")), None, None);
         }
-        record(&state, Path::new("/r/3"), None);
+        record(&state, Path::new("/r/3"), None, None);
         let list = load(&state);
         assert_eq!(list.len(), MAX);
         assert_eq!(list[0].dir, Path::new("/r/3"));

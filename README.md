@@ -33,7 +33,22 @@ Give Claude Code the `show_diff` tool:
 claude mcp add codesnob --scope user -- codesnob mcp
 ```
 
-Press `?` in the viewer for keys.
+In the viewer, `:` or `?` lists every command with its key. The ones you
+need to start:
+
+| Key | Does |
+|---|---|
+| `o` | open a path, or a PR: `#123`, `owner/repo#123` or its URL |
+| `c` | the branch's commits; moving through the list previews each one |
+| `<` `>` | older and newer commit, directly |
+| `f` | the changed files; `z` narrows the view to one |
+| `d` | show or hide the commit message or PR description |
+| `-` | back to the previous location; quick repeats go further |
+| Esc | back out one level |
+
+PRs are checked out with `gh` into `~/.cache/codesnob`, next to your own
+clone when one is open. Checkouts unused for a week are removed, and "Remove
+PR checkouts" in the palette clears them now.
 
 ## Building
 

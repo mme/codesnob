@@ -80,6 +80,22 @@ pub struct Options {
     pub context: usize,
     /// Where the recent-locations list is kept; `None` keeps nothing.
     pub state_dir: Option<PathBuf>,
+    /// Where PR checkouts live; `None` turns PRs off.
+    pub cache_dir: Option<PathBuf>,
+    /// Where PR details come from.
+    pub pr_source: std::sync::Arc<dyn crate::pr::Source>,
+}
+
+/// A location that shows a pull request.
+struct PrState {
+    spec: crate::pr::Spec,
+    info: Option<crate::pr::Info>,
+    /// A fetch is running.
+    fetching: bool,
+    /// Checked out at least once, so `dir` is real.
+    ready: bool,
+    /// Keeps the checkout from being pruned while this viewer has it open.
+    _hold: Option<crate::pr::Hold>,
 }
 
 /// How long the location strip stays after the last `-`.
@@ -139,6 +155,16 @@ struct Origin {
     anchor: Option<Anchor>,
 }
 
+impl Location {
+    /// The short name: "#142" for a PR, else the directory's name.
+    fn name(&self) -> String {
+        match &self.pr {
+            Some(p) => format!("#{}", p.spec.number),
+            None => dir_name(&self.dir),
+        }
+    }
+}
+
 struct Location {
     id: u64,
     dir: PathBuf,
@@ -165,6 +191,7 @@ struct Location {
     desc_dirty: bool,
     /// The width the description block was wrapped at.
     desc_width: u16,
+    pr: Option<PrState>,
 }
 
 pub struct App {
@@ -187,6 +214,8 @@ pub struct App {
     body_h: usize,
     /// Commit messages are shown above a commit's diff unless turned off.
     show_commit_desc: bool,
+    /// PR descriptions are hidden until turned on.
+    show_pr_desc: bool,
     flip: Option<Flip>,
     /// How long the location strip stays after the last `-`.
     flip_window: Duration,
@@ -220,6 +249,7 @@ impl App {
             message: None,
             body_h: 1,
             show_commit_desc: true,
+            show_pr_desc: false,
             flip: None,
             flip_window: FLIP_WINDOW,
             open_choices: Vec::new(),
@@ -259,9 +289,10 @@ impl App {
             pending_anchor: None,
             desc_dirty: true,
             desc_width: 0,
+            pr: None,
         };
         if let Some(state) = &self.opts.state_dir {
-            crate::recent::record(state, &target.dir, target.base.as_deref());
+            crate::recent::record(state, &target.dir, target.base.as_deref(), None);
         }
         self.deactivate();
         self.locations.insert(0, loc);
@@ -281,6 +312,10 @@ impl App {
 
     /// Only the location on screen watches its files.
     fn deactivate(&mut self) {
+        // A list previewing on the location being left puts it back first.
+        if self.panel.is_some() {
+            self.close_panel(true);
+        }
         if let Some(loc) = self.locations.first_mut() {
             loc._watch = None;
             loc.mode = Mode::Off;
@@ -300,6 +335,10 @@ impl App {
         if loc.repo {
             loc._watch = Some(watch::spawn_watcher(loc.dir.clone(), tx, loc.id));
         }
+        if loc.pr.as_ref().is_some_and(|p| !p.ready) {
+            // Still being fetched: nothing to watch or load yet.
+            return;
+        }
         let target = Target {
             dir: loc.dir.clone(),
             base: loc.base.clone(),
@@ -307,6 +346,185 @@ impl App {
         };
         self.link.set_target(target);
         self.request();
+    }
+
+    /// Open a PR as a new location, or switch to it when it is open here.
+    fn open_pr(&mut self, spec: crate::pr::Spec) {
+        let Some(cache) = self.opts.cache_dir.clone() else {
+            self.message = Some("pull requests need a cache directory".to_string());
+            return;
+        };
+        if let Some(i) = self.locations.iter().position(|l| {
+            let Some(p) = &l.pr else { return false };
+            let repo = p.info.as_ref().and_then(|i| i.repo());
+            p.spec.number == spec.number
+                && spec.repo.is_some()
+                && repo.as_ref().map(|r| r.slug()) == spec.repo.as_ref().map(|r| r.slug())
+        }) {
+            self.switch_to(i);
+            return;
+        }
+        let cwd = self.cur().filter(|l| l.repo).map(|l| l.dir.clone());
+        let id = self.next_id;
+        self.next_id += 1;
+        let loc = Location {
+            id,
+            dir: PathBuf::new(),
+            base: None,
+            repo: false,
+            range: Range::Everything,
+            focus: Focus::All,
+            view: DiffView::default(),
+            info: None,
+            _watch: None,
+            mode: Mode::Off,
+            seq: 0,
+            pending_since: None,
+            error: None,
+            fingerprint: 0,
+            manual: false,
+            pending_anchor: None,
+            desc_dirty: true,
+            desc_width: 0,
+            pr: Some(PrState {
+                spec: spec.clone(),
+                info: None,
+                fetching: true,
+                ready: false,
+                _hold: None,
+            }),
+        };
+        self.deactivate();
+        self.locations.insert(0, loc);
+        self.activate();
+        self.fetch_pr(id, spec, cwd, cache);
+    }
+
+    fn fetch_pr(&mut self, id: u64, spec: crate::pr::Spec, cwd: Option<PathBuf>, cache: PathBuf) {
+        // Clones this viewer has open, to fetch the PR into rather than cloning.
+        let clones = self
+            .locations
+            .iter()
+            .filter(|l| l.repo)
+            .map(|l| l.dir.clone())
+            .collect();
+        crate::pr::spawn_fetch(
+            spec,
+            cwd,
+            clones,
+            cache,
+            self.opts.pr_source.clone(),
+            self.tx.clone(),
+            id,
+        );
+    }
+
+    /// `r` on a PR: fetch it again, then reload.
+    fn refetch_pr(&mut self) {
+        let Some(cache) = self.opts.cache_dir.clone() else {
+            return;
+        };
+        let Some(loc) = self.cur_mut() else { return };
+        let id = loc.id;
+        let dir = loc.dir.clone();
+        let Some(p) = loc.pr.as_mut() else { return };
+        if p.fetching {
+            return;
+        }
+        p.fetching = true;
+        let spec = p
+            .info
+            .as_ref()
+            .and_then(|i| crate::pr::parse(&i.url))
+            .unwrap_or_else(|| p.spec.clone());
+        let number = spec.number;
+        self.message = Some(format!("fetching #{number}…"));
+        let cwd = (!dir.as_os_str().is_empty()).then_some(dir);
+        self.fetch_pr(id, spec, cwd, cache);
+    }
+
+    fn apply_pr(&mut self, id: u64, progress: crate::pr::Progress) {
+        use crate::pr::Progress;
+        let Some(idx) = self.locations.iter().position(|l| l.id == id) else {
+            return;
+        };
+        match progress {
+            Progress::Info(info) => {
+                // Opened twice by different names: keep the one already here.
+                let dup = self.locations.iter().position(|l| {
+                    l.id != id
+                        && l.pr.as_ref().is_some_and(|p| {
+                            p.ready && p.info.as_ref().is_some_and(|i| i.url == info.url)
+                        })
+                });
+                if let Some(other) = dup {
+                    if idx == 0 {
+                        self.locations.remove(0);
+                        let other = if other > 0 { other - 1 } else { other };
+                        let loc = self.locations.remove(other);
+                        self.locations.insert(0, loc);
+                        self.activate();
+                    } else {
+                        self.locations.remove(idx);
+                    }
+                    return;
+                }
+                if let Some(p) = self.locations[idx].pr.as_mut() {
+                    p.info = Some(info);
+                }
+            }
+            Progress::Ready {
+                info,
+                dir,
+                base,
+                note,
+            } => {
+                if let Some(state) = &self.opts.state_dir {
+                    let pr = crate::recent::PrRef {
+                        url: info.url.clone(),
+                        title: info.title.clone(),
+                    };
+                    crate::recent::record(state, &dir, Some(&base), Some(pr));
+                }
+                let loc = &mut self.locations[idx];
+                let first = loc.pr.as_ref().is_some_and(|p| !p.ready);
+                if let Some(p) = loc.pr.as_mut() {
+                    p.info = Some(info);
+                    p.fetching = false;
+                    p.ready = true;
+                    if p._hold.is_none() {
+                        p._hold = crate::pr::hold(&dir);
+                    }
+                }
+                loc.dir = dir;
+                loc.base = Some(base);
+                loc.repo = true;
+                loc.error = None;
+                loc.desc_dirty = true;
+                if note.is_some() {
+                    self.message = note;
+                }
+                if idx == 0 {
+                    if first {
+                        self.activate();
+                    } else {
+                        self.request();
+                    }
+                }
+            }
+            Progress::Failed(e) => {
+                let loc = &mut self.locations[idx];
+                let ready = loc.pr.as_ref().is_some_and(|p| p.ready);
+                if let Some(p) = loc.pr.as_mut() {
+                    p.fetching = false;
+                }
+                if ready {
+                    self.message = Some(format!("fetch failed: {e}"));
+                } else {
+                    loc.error = Some(e);
+                }
+            }
+        }
     }
 
     fn close_location(&mut self) {
@@ -439,13 +657,22 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                let open = self
-                    .locations
-                    .iter()
-                    .any(|l| l.dir == e.dir && l.base == e.base);
+                let open = self.locations.iter().any(|l| l.dir == e.dir && l.repo);
+                let text = match &e.pr {
+                    Some(p) => match crate::pr::parse(&p.url) {
+                        Some(spec) => format!(
+                            "#{} {}  {}",
+                            spec.number,
+                            p.title,
+                            spec.repo.map(|r| r.slug()).unwrap_or_default()
+                        ),
+                        None => p.title.clone(),
+                    },
+                    None => tilde(&e.dir, home.as_deref()),
+                };
                 panel::Item {
                     tag: None,
-                    text: tilde(&e.dir, home.as_deref()),
+                    text,
                     hint: if open {
                         "open".to_string()
                     } else {
@@ -467,7 +694,10 @@ impl App {
             .iter()
             .map(|l| panel::Item {
                 tag: None,
-                text: format!("{}  {}", name_of(&l.dir), tilde(&l.dir, home.as_deref())),
+                text: match l.pr.as_ref().and_then(|p| p.info.as_ref()) {
+                    Some(i) => format!("{}  {}", l.name(), i.title),
+                    None => format!("{}  {}", l.name(), tilde(&l.dir, home.as_deref())),
+                },
                 hint: self.location_summary(l),
                 action: Action::SwitchLocation(l.id),
                 key: l.id.to_string(),
@@ -484,6 +714,13 @@ impl App {
 
     /// "feature · commit 2 of 3": a location's branch and range.
     fn location_summary(&self, l: &Location) -> String {
+        if let Some(p) = l.pr.as_ref().filter(|p| !p.ready) {
+            return if p.fetching {
+                "fetching".to_string()
+            } else {
+                "failed".to_string()
+            };
+        }
         if !l.repo {
             return "no repository".to_string();
         }
@@ -535,16 +772,20 @@ impl App {
         }
         loc.range = range;
         loc.error = None;
+        loc.pending_anchor = None;
         self.request();
     }
 
     /// Whether a load is in flight, which needs timed redraws.
     pub fn loading(&self) -> bool {
-        self.cur().is_some_and(|l| l.pending_since.is_some())
+        self.cur()
+            .is_some_and(|l| l.pending_since.is_some() || l.pr.as_ref().is_some_and(|p| p.fetching))
     }
 
     fn apply_loaded(&mut self, id: u64, seq: u64, result: Result<git::Snapshot, String>) {
         let context = self.opts.context;
+        // A location loaded in the background speaks only once it is shown.
+        let current = self.locations.first().is_some_and(|l| l.id == id);
         let Some(loc) = self.locations.iter_mut().find(|l| l.id == id) else {
             return;
         };
@@ -553,14 +794,16 @@ impl App {
         }
         loc.pending_since = None;
         let manual = std::mem::take(&mut loc.manual);
+        // Only ever for this load; never carried to a later range.
+        let pending = loc.pending_anchor.take();
         let snap = match result {
             Ok(snap) => snap,
             Err(e) => {
                 let shown = loc.info.as_ref().is_some_and(|i| i.range == loc.range);
-                if shown {
-                    self.message = Some(format!("refresh failed: {e}"));
-                } else {
+                if !shown {
                     loc.error = Some(e);
+                } else if current {
+                    self.message = Some(format!("refresh failed: {e}"));
                 }
                 return;
             }
@@ -574,15 +817,17 @@ impl App {
                 .as_ref()
                 .is_some_and(|i| i.commits.iter().any(|c| c.id == id))
         {
-            let short = id.to_hex_with_len(7).to_string();
-            self.message = Some(format!("{short} is no longer on this branch"));
             loc.range = Range::Everything;
-            self.request();
+            if current {
+                let short = id.to_hex_with_len(7).to_string();
+                self.message = Some(format!("{short} is no longer on this branch"));
+                self.request();
+            }
             return;
         }
         let fingerprint = snap.fingerprint();
         if fingerprint == loc.fingerprint {
-            if manual {
+            if manual && current {
                 self.message = Some("no changes since the last load".to_string());
             }
             return;
@@ -596,12 +841,12 @@ impl App {
             && !loc.view.narrow_to_path(Some(path))
         {
             // While a list previews, a file missing from one commit is not news.
-            if self.panel.is_none() {
+            if self.panel.is_none() || !current {
                 self.message = Some(format!("{path} has no changes here; showing all files"));
                 loc.focus = Focus::All;
             }
         }
-        match anchor.or(loc.pending_anchor.take()) {
+        match anchor.or(pending) {
             Some(a) => loc.view.restore(a),
             None if !same_range => {
                 loc.view.scroll = 0;
@@ -611,9 +856,11 @@ impl App {
         }
         loc.info = Some(info);
         loc.desc_dirty = true;
-        self.hl.clear();
-        if manual {
-            self.message = Some("reloaded".to_string());
+        if current {
+            self.hl.clear();
+            if manual {
+                self.message = Some("reloaded".to_string());
+            }
         }
     }
 
@@ -630,6 +877,7 @@ impl App {
             Msg::Loaded { loc, seq, result } => self.apply_loaded(loc, seq, *result),
             Msg::Show(target) => self.open(target),
             Msg::Link(up) => self.linked = up,
+            Msg::Pr { loc, progress } => self.apply_pr(loc, *progress),
             Msg::Watching { loc, mode } => {
                 if let Some(l) = self.locations.iter_mut().find(|l| l.id == loc)
                     && l._watch.is_some()
@@ -656,7 +904,7 @@ impl App {
                 };
                 match self.panel.as_mut() {
                     Some(p) => {
-                        let before = p.selected_action();
+                        let before = p.selected_key();
                         p.move_by(delta.signum());
                         self.preview(before);
                     }
@@ -678,7 +926,7 @@ impl App {
     fn key(&mut self, k: KeyEvent) {
         if self.panel.is_some() {
             let rows = self.panel_rows();
-            let before = self.panel.as_ref().and_then(|p| p.selected_action());
+            let before = self.panel.as_ref().and_then(|p| p.selected_key());
             let outcome = self.panel.as_mut().map(|p| p.key(k, rows));
             match outcome {
                 Some(Outcome::Close) => self.close_panel(true),
@@ -688,9 +936,13 @@ impl App {
                     if let Some(kind) = kind {
                         let list = self.recent.entry(kind).or_default();
                         list.retain(|k| *k != key);
-                        list.insert(0, key);
+                        list.insert(0, key.clone());
                     }
-                    self.perform(action);
+                    match action {
+                        // Files are chosen by path: the list may predate a reload.
+                        Action::GoToFile => self.go_to_path(&key),
+                        _ => self.perform(action),
+                    }
                 }
                 Some(Outcome::Submit { input, selected }) => self.submit_open(&input, selected),
                 Some(Outcome::Complete) => {
@@ -798,6 +1050,11 @@ impl App {
     /// Esc: leave the narrowest thing first, and never quit.
     fn back_out(&mut self) {
         let Some(loc) = self.cur() else { return };
+        if loc.pr.as_ref().is_some_and(|p| !p.ready) {
+            // Esc while a PR is still being fetched cancels opening it.
+            self.close_location();
+            return;
+        }
         if loc.focus != Focus::All {
             self.narrow(None);
         } else if loc.range != Range::Everything {
@@ -827,6 +1084,40 @@ impl App {
         }
     }
 
+    fn go_to_path(&mut self, path: &str) {
+        let fi = self
+            .cur()
+            .and_then(|l| l.view.files.iter().position(|f| f.path == path));
+        if let Some(fi) = fi {
+            self.go_to_file(fi);
+        }
+    }
+
+    /// Keep focus and the screen in agreement once a list has closed: a
+    /// narrowed file the shown range lacks means showing all files.
+    fn reconcile_focus(&mut self) {
+        let Some(loc) = self.cur_mut() else { return };
+        let Focus::File(path) = loc.focus.clone() else {
+            return;
+        };
+        // A load for the asked range is on its way and will decide.
+        if loc.info.as_ref().is_none_or(|i| i.range != loc.range) {
+            return;
+        }
+        if loc
+            .view
+            .narrowed()
+            .is_some_and(|fi| loc.view.files[fi].path == path)
+        {
+            return;
+        }
+        if !loc.view.narrow_to_path(Some(&path)) {
+            loc.focus = Focus::All;
+            loc.desc_dirty = true;
+            self.message = Some(format!("{path} has no changes here; showing all files"));
+        }
+    }
+
     /// Move to file `fi`: jump in the full view, switch file while narrowed.
     fn go_to_file(&mut self, fi: usize) {
         let Some(loc) = self.cur_mut() else { return };
@@ -841,17 +1132,23 @@ impl App {
     }
 
     /// Show what a previewing list has highlighted, if it changed.
-    fn preview(&mut self, before: Option<Action>) {
+    /// `before` is the key of the row highlighted before the last key press.
+    fn preview(&mut self, before: Option<String>) {
         let Some(panel) = &self.panel else { return };
         if !panel.kind.previews() {
             return;
         }
-        let now = panel.selected_action();
-        if now == before {
+        let now_key = panel.selected_key();
+        if now_key == before {
             return;
         }
+        let now = panel.selected_action();
         match now {
-            Some(Action::GoToFile(fi)) => self.go_to_file(fi),
+            Some(Action::GoToFile) => {
+                if let Some(path) = now_key {
+                    self.go_to_path(&path);
+                }
+            }
             Some(Action::RangeEverything) => self.set_range(Range::Everything),
             Some(Action::RangeUncommitted) => self.set_range(Range::Uncommitted),
             Some(Action::ShowCommit(id)) => self.set_range(Range::Commit(id)),
@@ -866,6 +1163,7 @@ impl App {
             return;
         };
         if !revert {
+            self.reconcile_focus();
             return;
         }
         let Some(loc) = self.cur_mut() else { return };
@@ -886,12 +1184,18 @@ impl App {
         if let Some(a) = origin.anchor {
             loc.view.restore(a);
         }
+        self.reconcile_focus();
     }
 
     /// Enter in the Open prompt: a typed path that exists wins, else the
     /// highlighted recent location.
     fn submit_open(&mut self, input: &str, selected: Option<Action>) {
         let input = input.trim();
+        if let Some(spec) = crate::pr::parse(input) {
+            self.close_panel(false);
+            self.open_pr(spec);
+            return;
+        }
         let typed = (!input.is_empty()).then(|| self.resolve_path(input));
         match (typed, selected) {
             (Some(Ok(dir)), _) => {
@@ -915,11 +1219,15 @@ impl App {
         let Some(loc) = self.cur() else { return };
         let Some(info) = &loc.info else { return };
         let mut items = Vec::new();
+        let pr_number = loc.pr.as_ref().map(|p| p.spec.number);
         if let Some(base) = &info.base.name {
             let n = info.commits.len();
             items.push(panel::Item {
                 tag: None,
-                text: format!("Everything since {base}"),
+                text: match pr_number {
+                    Some(n) => format!("Everything in #{n}"),
+                    None => format!("Everything since {base}"),
+                },
                 hint: format!(
                     "{n}{} commit{}",
                     if info.commits_truncated { "+" } else { "" },
@@ -1009,17 +1317,55 @@ impl App {
         self.set_range(steps[next]);
     }
 
+    fn pr_description(&self, pr: &crate::pr::Info, width: u16) -> Vec<Line<'static>> {
+        let width = width.saturating_sub(6) as usize;
+        let dim = Style::default().fg(self.palette.note_fg);
+        let who = pr
+            .author
+            .as_ref()
+            .map(|a| format!(" · @{}", a.login))
+            .unwrap_or_default();
+        let branches = if pr.head_ref_name.is_empty() {
+            format!("into {}", pr.base_ref_name)
+        } else {
+            format!("{} into {}", pr.head_ref_name, pr.base_ref_name)
+        };
+        let mut out = vec![Line::from(Span::styled(
+            format!("#{}{who} · {branches}", pr.number),
+            dim,
+        ))];
+        let title = format!("**{}**", pr.title.replace('*', "\\*"));
+        out.extend(markdown::render(&title, width, &self.palette));
+        if !pr.body.trim().is_empty() {
+            out.push(Line::default());
+            out.extend(markdown::render(&pr.body, width, &self.palette));
+        }
+        out
+    }
+
     /// The description block for the current view, wrapped to `width`.
     fn description(&self, width: u16) -> Vec<Line<'static>> {
         let Some(loc) = self.cur() else {
             return Vec::new();
         };
-        if loc.focus != Focus::All || !self.show_commit_desc {
+        if loc.focus != Focus::All {
             return Vec::new();
         }
         let Some(info) = &loc.info else {
             return Vec::new();
         };
+        if let Some(pr) = loc.pr.as_ref().and_then(|p| p.info.as_ref())
+            && info.range == Range::Everything
+        {
+            return if self.show_pr_desc {
+                self.pr_description(pr, width)
+            } else {
+                Vec::new()
+            };
+        }
+        if !self.show_commit_desc {
+            return Vec::new();
+        }
         let (Range::Commit(id), Some(c)) = (info.range, &info.commit) else {
             return Vec::new();
         };
@@ -1056,8 +1402,7 @@ impl App {
             .view
             .files
             .iter()
-            .enumerate()
-            .map(|(fi, f)| {
+            .map(|f| {
                 let (tag, color) = match f.status {
                     crate::diff::Status::Added => ("A", Color::Green),
                     crate::diff::Status::Deleted => ("D", Color::Red),
@@ -1072,7 +1417,7 @@ impl App {
                     } else {
                         format!("+{} −{}", f.added, f.removed)
                     },
-                    action: Action::GoToFile(fi),
+                    action: Action::GoToFile,
                     key: f.path.clone(),
                 }
             })
@@ -1115,8 +1460,11 @@ impl App {
                 .as_ref()
                 .is_some_and(|i| !i.commits.is_empty() || i.dirty),
             Action::ShowCommit(_) => loc.repo,
-            Action::ToggleDescription => matches!(loc.range, Range::Commit(_)),
-            Action::Files | Action::Narrow | Action::GoToFile(_) => has_rows,
+            Action::ToggleDescription => {
+                matches!(loc.range, Range::Commit(_))
+                    || loc.pr.is_some() && loc.range == Range::Everything
+            }
+            Action::Files | Action::Narrow | Action::GoToFile => has_rows,
             Action::NextHunk
             | Action::PrevHunk
             | Action::NextFile
@@ -1126,7 +1474,8 @@ impl App {
             Action::RangeEverything => loc.repo && loc.range != Range::Everything,
             Action::RangeUncommitted => loc.repo && has_base && loc.range != Range::Uncommitted,
             Action::ExplainBase => loc.info.is_some(),
-            Action::Reload => loc.repo,
+            Action::Reload => loc.repo || loc.pr.is_some(),
+            Action::PrunePrs => self.opts.cache_dir.is_some(),
             Action::Quit => true,
         }
     }
@@ -1166,7 +1515,9 @@ impl App {
             Action::Open => self.open_prompt(),
             Action::OpenRecent(i) => {
                 if let Some(e) = self.open_choices.get(i).cloned() {
-                    if e.dir.is_dir() {
+                    if let Some(spec) = e.pr.as_ref().and_then(|p| crate::pr::parse(&p.url)) {
+                        self.open_pr(spec);
+                    } else if e.dir.is_dir() {
                         self.open_dir(e.dir, e.base);
                     } else {
                         self.message = Some(format!("{} no longer exists", e.dir.display()));
@@ -1180,18 +1531,34 @@ impl App {
                 }
             }
             Action::PreviousLocation => self.flip(),
+            Action::PrunePrs => {
+                if let Some(cache) = &self.opts.cache_dir {
+                    // PRs open in any viewer hold a lock and are kept.
+                    let n = crate::pr::prune(cache, Duration::ZERO);
+                    let noun = if n == 1 { "checkout" } else { "checkouts" };
+                    self.message = Some(format!("removed {n} PR {noun}; open ones were kept"));
+                }
+            }
             Action::CloseLocation => self.close_location(),
             Action::Commits => self.open_commits(),
             Action::OlderCommit => self.step(true),
             Action::NewerCommit => self.step(false),
             Action::ShowCommit(id) => self.set_range(Range::Commit(id)),
             Action::ToggleDescription => {
-                self.show_commit_desc = !self.show_commit_desc;
+                let commit = self
+                    .cur()
+                    .is_some_and(|l| matches!(l.range, Range::Commit(_)));
+                if commit {
+                    self.show_commit_desc = !self.show_commit_desc;
+                } else {
+                    self.show_pr_desc = !self.show_pr_desc;
+                }
                 if let Some(loc) = self.cur_mut() {
                     loc.desc_dirty = true;
                 }
             }
-            Action::GoToFile(fi) => self.go_to_file(fi),
+            // Handled where the file list's path is known.
+            Action::GoToFile => {}
             Action::Narrow => {
                 let Some(loc) = self.cur() else { return };
                 if loc.focus != Focus::All {
@@ -1220,11 +1587,30 @@ impl App {
             }
             Action::RangeEverything => self.set_range(Range::Everything),
             Action::RangeUncommitted => self.set_range(Range::Uncommitted),
+            Action::ExplainBase
+                if self
+                    .cur()
+                    .and_then(|l| l.pr.as_ref())
+                    .and_then(|p| p.info.as_ref())
+                    .is_some() =>
+            {
+                let pr = self
+                    .cur()
+                    .and_then(|l| l.pr.as_ref())
+                    .and_then(|p| p.info.as_ref());
+                if let Some(pr) = pr {
+                    self.message = Some(format!(
+                        "Base: {}, the base branch GitHub reports for #{}; the diff starts where they diverged.",
+                        pr.base_ref_name, pr.number
+                    ));
+                }
+            }
             Action::ExplainBase => {
                 if let Some(info) = self.cur().and_then(|l| l.info.as_ref()) {
                     self.message = Some(format!("Base: {}.", info.base.reason));
                 }
             }
+            Action::Reload if self.cur().is_some_and(|l| l.pr.is_some()) => self.refetch_pr(),
             Action::Reload => {
                 if let Some(loc) = self.cur_mut()
                     && loc.repo
@@ -1266,6 +1652,36 @@ impl App {
         let Some(loc) = self.cur() else {
             return String::new();
         };
+        if let Some(p) = &loc.pr {
+            let n = p.spec.number;
+            let doing = if p.fetching {
+                "fetching"
+            } else {
+                "could not be opened"
+            };
+            let Some(info) = &p.info else {
+                return format!("#{n} · {doing}");
+            };
+            if !p.ready {
+                return format!("#{n} {} · {doing}", info.title);
+            }
+            match loc.range {
+                Range::Everything => {
+                    let mut s = format!("#{n} {} · into {}", info.title, info.base_ref_name);
+                    if info.is_draft {
+                        s.push_str(" · draft");
+                    }
+                    match info.state.as_str() {
+                        "MERGED" => s.push_str(" · merged"),
+                        "CLOSED" => s.push_str(" · closed"),
+                        _ => {}
+                    }
+                    return s;
+                }
+                Range::Uncommitted => return format!("#{n} · local edits"),
+                Range::Commit(_) => {}
+            }
+        }
         if !loc.repo {
             return format!("no repository · {}", loc.dir.display());
         }
@@ -1322,14 +1738,30 @@ impl App {
     /// The centered text shown instead of a diff, if any.
     fn notice(&self) -> Option<Vec<String>> {
         let loc = self.cur()?;
+        if let Some(e) = &loc.error {
+            return Some(vec![e.clone()]);
+        }
+        if let Some(p) = loc.pr.as_ref().filter(|p| !p.ready) {
+            let n = p.spec.number;
+            let from = p
+                .info
+                .as_ref()
+                .and_then(|i| i.repo())
+                .or_else(|| p.spec.repo.clone())
+                .map(|r| format!(" from {}", r.slug()))
+                .unwrap_or_default();
+            let mut lines = vec![format!("Fetching #{n}{from}")];
+            if let Some(i) = &p.info {
+                lines.push(i.title.clone());
+            }
+            lines.push("Esc cancels".to_string());
+            return Some(lines);
+        }
         if !loc.repo {
             return Some(vec![
                 "not inside a git repository".to_string(),
                 loc.dir.display().to_string(),
             ]);
-        }
-        if let Some(e) = &loc.error {
-            return Some(vec![e.clone()]);
         }
         let stale = loc.info.as_ref().is_none_or(|i| i.range != loc.range);
         if stale {
@@ -1410,6 +1842,7 @@ impl App {
         let cursor = self
             .panel
             .as_mut()
+            .filter(|_| panel_area.height >= 2)
             .map(|p| p.render(panel_area, buf, &self.palette, &info));
         if let Some((x, y)) = cursor {
             frame.set_cursor_position((x, y));
@@ -1419,6 +1852,9 @@ impl App {
     fn render_notice(&self, lines: &[String], body: Rect, buf: &mut Buffer) {
         let top = body.y + body.height.saturating_sub(lines.len() as u16) / 2;
         for (i, text) in lines.iter().enumerate() {
+            if top + i as u16 >= body.bottom() {
+                break;
+            }
             let line = Line::from(Span::styled(
                 text.clone(),
                 Style::default().fg(self.palette.note_fg),
@@ -1442,7 +1878,7 @@ impl App {
                 if n > 0 {
                     spans.push(Span::styled(" · ", style));
                 }
-                let name = format!(" {} ", name_of(&l.dir));
+                let name = format!(" {} ", l.name());
                 spans.push(if *id == target {
                     Span::styled(name, Style::default().add_modifier(Modifier::BOLD))
                 } else {
@@ -1496,8 +1932,8 @@ impl App {
     }
 }
 
-/// A location's short name: its directory's.
-fn name_of(dir: &std::path::Path) -> String {
+/// A directory's short name.
+fn dir_name(dir: &std::path::Path) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| dir.display().to_string())

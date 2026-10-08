@@ -25,11 +25,24 @@ impl Harness {
     }
 
     fn open_with_state(dir: &Path, state: PathBuf) -> Self {
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        let cache = fresh_dir(&format!("cache-{name}"));
+        Self::build(dir, state, cache, std::sync::Arc::new(NoPrs))
+    }
+
+    fn build(
+        dir: &Path,
+        state: PathBuf,
+        cache: PathBuf,
+        source: std::sync::Arc<dyn crate::pr::Source>,
+    ) -> Self {
         let (tx, rx) = channel();
         let hl = Highlighter::new("base16").unwrap();
         let opts = Options {
             context: 3,
             state_dir: Some(state),
+            cache_dir: Some(cache),
+            pr_source: source,
         };
         let mut app = App::new(opts, Palette::dark(), hl, tx, Link::new());
         // Loads between key presses must not outlast the strip on slow machines.
@@ -111,6 +124,15 @@ impl Harness {
             .unwrap_or("")
             .trim()
             .to_string()
+    }
+}
+
+/// No pull requests outside the PR tests.
+struct NoPrs;
+
+impl crate::pr::Source for NoPrs {
+    fn view(&self, spec: &crate::pr::Spec, _: Option<&Path>) -> Result<crate::pr::Info, String> {
+        Err(format!("no pull request #{}", spec.number))
     }
 }
 
@@ -695,4 +717,457 @@ fn the_location_list_switches_and_close_drops_one() {
     );
     cleanup(a);
     cleanup(b);
+}
+
+/// Stands in for `gh pr view`: knows PR #7 of acme/widget.
+struct FakeGitHub {
+    info: crate::pr::Info,
+}
+
+impl crate::pr::Source for FakeGitHub {
+    fn view(&self, spec: &crate::pr::Spec, _: Option<&Path>) -> Result<crate::pr::Info, String> {
+        if spec.number == self.info.number {
+            Ok(self.info.clone())
+        } else {
+            Err(format!("no pull request #{}", spec.number))
+        }
+    }
+}
+
+/// A local repository playing github.com/acme/widget, with PR #7 at
+/// refs/pull/7/head, and a clone of it whose remote says github.com while a
+/// URL rewrite sends fetches to the local one.
+fn fake_github(name: &str) -> (PathBuf, PathBuf, FakeGitHub) {
+    use crate::testutil::git;
+    let origin = fresh_dir(&format!("{name}-origin"));
+    git(&origin, &["init", "-q"]);
+    std::fs::write(origin.join("a.txt"), "a\n").unwrap();
+    git(&origin, &["add", "-A"]);
+    git(&origin, &["commit", "-q", "-m", "base"]);
+    git(&origin, &["checkout", "-q", "-b", "feature", "main"]);
+    std::fs::write(origin.join("a.txt"), "a with retries\n").unwrap();
+    git(&origin, &["commit", "-q", "-am", "Add retries"]);
+    std::fs::write(origin.join("f.txt"), "tidy\n").unwrap();
+    git(&origin, &["add", "-A"]);
+    git(&origin, &["commit", "-q", "-m", "Tidy"]);
+    git(&origin, &["checkout", "-q", "main"]);
+    std::fs::write(origin.join("b.txt"), "main moved on\n").unwrap();
+    git(&origin, &["add", "-A"]);
+    git(&origin, &["commit", "-q", "-m", "main moves on"]);
+    git(&origin, &["update-ref", "refs/pull/7/head", "feature"]);
+    let head = std::process::Command::new("git")
+        .current_dir(&origin)
+        .args(["rev-parse", "feature"])
+        .output()
+        .unwrap();
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+    let user = fresh_dir(&format!("{name}-user"));
+    git(&user, &["clone", "-q", origin.to_str().unwrap(), "."]);
+    let github = "https://github.com/acme/widget.git";
+    git(&user, &["remote", "set-url", "origin", github]);
+    git(
+        &user,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", origin.display()),
+            github,
+        ],
+    );
+    let info = crate::pr::Info {
+        number: 7,
+        title: "Add retries".to_string(),
+        body: "Retries **twice** now.\n\n- first\n- second".to_string(),
+        url: "https://github.com/acme/widget/pull/7".to_string(),
+        base_ref_name: "main".to_string(),
+        head_ref_name: "feature".to_string(),
+        head_ref_oid: head,
+        is_draft: true,
+        state: "OPEN".to_string(),
+        author: Some(crate::pr::Author {
+            login: "octo".to_string(),
+        }),
+        merge_commit: None,
+    };
+    (origin, user, FakeGitHub { info })
+}
+
+fn pr_harness(name: &str) -> (Harness, PathBuf, PathBuf, PathBuf) {
+    let (origin, user, fake) = fake_github(name);
+    let state = fresh_dir(&format!("{name}-state"));
+    let cache = fresh_dir(&format!("{name}-cache"));
+    let h = Harness::build(&user, state, cache.clone(), std::sync::Arc::new(fake));
+    (h, origin, user, cache)
+}
+
+#[test]
+fn a_pr_opens_as_a_checkout_diffed_against_its_base() {
+    let (mut h, origin, user, cache) = pr_harness("ui-pr");
+    h.keys("o#7<enter>");
+    let status = h.status();
+    assert!(
+        status.starts_with("#7 Add retries · into main · draft"),
+        "{status}"
+    );
+    assert!(
+        status.contains("2 files"),
+        "the PR's files, not main's later work: {status}"
+    );
+    let screen = h.screen();
+    assert!(
+        screen.contains("a.txt") && screen.contains("f.txt") && !screen.contains("b.txt"),
+        "{screen}"
+    );
+    assert_eq!(
+        h.app.cur().unwrap().dir,
+        std::fs::canonicalize(cache.join("pr/github.com/acme/widget/7")).unwrap(),
+        "checked out in the cache"
+    );
+
+    assert!(!screen.contains("Retries"), "the description starts hidden");
+    h.keys("d");
+    let screen = h.screen();
+    assert!(
+        screen.contains("#7 · @octo · feature into main"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Retries twice now.") && screen.contains("• first"),
+        "{screen}"
+    );
+
+    h.keys("c");
+    let screen = h.screen();
+    assert!(screen.contains("Everything in #7"), "{screen}");
+    assert!(
+        screen.contains("Add retries") && screen.contains("Tidy"),
+        "{screen}"
+    );
+    h.keys("<esc>-");
+    assert_eq!(h.app.cur().unwrap().dir, user, "- flips back to the clone");
+    cleanup(origin);
+    cleanup(user);
+    cleanup(cache);
+}
+
+#[test]
+fn a_pr_open_twice_is_switched_to_and_an_unknown_one_says_so() {
+    let (mut h, origin, user, cache) = pr_harness("ui-pr-twice");
+    h.keys("o#7<enter>");
+    h.keys("-");
+    h.keys("ohttps://github.com/acme/widget/pull/7/files<enter>");
+    assert_eq!(h.app.locations.len(), 2, "the open PR is reused");
+    assert!(h.status().starts_with("#7 Add retries"), "{}", h.status());
+
+    h.keys("o#8<enter>");
+    assert!(h.screen().contains("no pull request #8"), "{}", h.screen());
+    h.keys("<esc>");
+    assert_eq!(h.app.locations.len(), 2, "Esc drops the failed PR");
+    cleanup(origin);
+    cleanup(user);
+    cleanup(cache);
+}
+
+#[test]
+fn pr_checkouts_are_remembered_and_removed_on_request() {
+    let (mut h, origin, user, cache) = pr_harness("ui-pr-prune");
+    h.keys("o#7<enter>");
+    let checkout = h.app.cur().unwrap().dir.clone();
+
+    h.keys(":remove pr<enter>");
+    assert!(
+        h.status().contains("removed 0 PR checkouts"),
+        "{}",
+        h.status()
+    );
+    assert!(checkout.exists(), "an open PR is kept");
+
+    h.keys("-o");
+    assert!(
+        h.screen().contains("#7 Add retries  acme/widget"),
+        "recents list PRs: {}",
+        h.screen()
+    );
+    h.keys("<esc>-:close loc<enter>");
+    h.keys(":remove pr<enter>");
+    assert!(
+        h.status().contains("removed 1 PR checkout"),
+        "{}",
+        h.status()
+    );
+    assert!(!checkout.exists());
+    let refs = std::process::Command::new("git")
+        .current_dir(&user)
+        .args(["for-each-ref", "refs/codesnob"])
+        .output()
+        .unwrap();
+    assert!(refs.stdout.is_empty(), "its refs go too");
+    cleanup(origin);
+    cleanup(user);
+    cleanup(cache);
+}
+
+#[test]
+fn a_merged_pr_still_shows_its_own_changes() {
+    use crate::testutil::git;
+    let (origin, user, mut fake) = fake_github("ui-pr-merged");
+    // Merge the PR on "GitHub", then main moves on again.
+    git(
+        &origin,
+        &["merge", "-q", "--no-ff", "-m", "Merge #7", "feature"],
+    );
+    let merge = std::process::Command::new("git")
+        .current_dir(&origin)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    std::fs::write(origin.join("c.txt"), "later\n").unwrap();
+    git(&origin, &["add", "-A"]);
+    git(&origin, &["commit", "-q", "-m", "later work"]);
+    fake.info.state = "MERGED".to_string();
+    fake.info.is_draft = false;
+    fake.info.merge_commit = Some(crate::pr::Oid {
+        oid: String::from_utf8_lossy(&merge.stdout).trim().to_string(),
+    });
+    let state = fresh_dir("ui-pr-merged-state");
+    let cache = fresh_dir("ui-pr-merged-cache");
+    let mut h = Harness::build(&user, state, cache.clone(), std::sync::Arc::new(fake));
+    h.keys("o#7<enter>");
+    let status = h.status();
+    assert!(
+        status.starts_with("#7 Add retries · into main · merged"),
+        "{status}"
+    );
+    assert!(status.contains("2 files"), "the PR's own files: {status}");
+    cleanup(origin);
+    cleanup(user);
+    cleanup(cache);
+}
+
+// ---- regressions found in review ------------------------------------------
+
+fn wait_until(h: &mut Harness, what: &dyn Fn(&mut Harness) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !what(h) && Instant::now() < deadline {
+        if let Ok(m) = h.rx.recv_timeout(Duration::from_millis(50)) {
+            h.app.dispatch(m);
+        }
+    }
+}
+
+#[test]
+fn the_file_list_follows_paths_across_a_reload() {
+    let dir = branch_with_history("ui-files-reload");
+    let mut h = Harness::open(&dir);
+    h.keys("f");
+    std::fs::write(dir.join("0first.txt"), "new\n").unwrap();
+    wait_until(&mut h, &|h| h.status().contains("6 files"));
+    h.keys("gone<enter>");
+    let loc = h.app.cur().unwrap();
+    let fi = loc.view.current_file().unwrap();
+    assert_eq!(loc.view.files[fi].path, "gone.txt");
+    cleanup(dir);
+}
+
+#[test]
+fn a_reverted_preview_does_not_leak_its_position_into_the_next_range() {
+    let dir = branch_with_history("ui-anchor-leak");
+    let mut h = Harness::open(&dir);
+    h.keys("jjjjjjjjjjjj");
+    h.keys("c<down><esc>");
+    h.keys("<");
+    assert!(h.status().contains("uncommitted changes"), "{}", h.status());
+    assert_eq!(
+        h.app.cur().unwrap().view.scroll,
+        0,
+        "a new range starts at the top"
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn choosing_a_commit_without_the_narrowed_file_shows_all_and_says_so() {
+    let dir = branch_with_history("ui-focus-sync");
+    let mut h = Harness::open(&dir);
+    h.keys("Nz");
+    assert!(h.status().contains("b.txt only"), "{}", h.status());
+    h.keys("c<down><enter>");
+    let status = h.status();
+    assert!(!status.contains(" only"), "{status}");
+    assert!(h.app.cur().unwrap().focus == Focus::All);
+    cleanup(dir);
+}
+
+#[test]
+fn leaving_a_location_mid_preview_puts_its_range_back() {
+    let a = branch_with_history("ui-show-preview-a");
+    let b = small_repo("ui-show-preview-b");
+    let mut h = Harness::open(&a);
+    h.keys("c<down>");
+    h.app.dispatch(Msg::Show(Target {
+        dir: b.clone(),
+        base: None,
+        repo: true,
+    }));
+    h.settle();
+    h.keys("-");
+    assert_eq!(h.app.cur().unwrap().dir, a);
+    assert!(h.app.cur().unwrap().range == Range::Everything);
+    cleanup(a);
+    cleanup(b);
+}
+
+#[test]
+fn a_tiny_terminal_does_not_panic() {
+    let dir = branch_with_history("ui-tiny");
+    let mut h = Harness::open(&dir);
+    for (w, ht) in [(60, 4), (60, 3), (20, 2)] {
+        h.term = Terminal::new(TestBackend::new(w, ht)).unwrap();
+        h.keys(":zzzz");
+        h.screen();
+        h.keys("<esc>");
+    }
+    cleanup(dir);
+}
+
+#[test]
+fn the_pr_description_does_not_depend_on_the_commit_toggle() {
+    let (mut h, origin, user, cache) = pr_harness("ui-pr-desc-toggle");
+    h.keys("o#7<enter>");
+    h.keys("<");
+    h.keys("d<esc>");
+    assert!(!h.screen().contains("Retries twice"));
+    h.keys("d");
+    assert!(h.screen().contains("Retries twice now."), "{}", h.screen());
+    cleanup(origin);
+    cleanup(user);
+    cleanup(cache);
+}
+
+#[test]
+fn an_open_pr_survives_another_viewer_pruning() {
+    let (mut h, origin, user, cache) = pr_harness("ui-pr-held");
+    h.keys("o#7<enter>");
+    let checkout = h.app.cur().unwrap().dir.clone();
+    assert_eq!(crate::pr::prune(&cache, Duration::ZERO), 0);
+    assert!(checkout.exists(), "held open, so kept");
+    cleanup(origin);
+    cleanup(user);
+    cleanup(cache);
+}
+
+#[test]
+fn opening_a_pr_leaves_the_clones_other_worktrees_registered() {
+    use crate::testutil::git;
+    let (mut h, origin, user, cache) = pr_harness("ui-pr-keep-wt");
+    let side = fresh_dir("ui-pr-keep-wt-side");
+    std::fs::remove_dir(&side).unwrap();
+    git(
+        &user,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            side.to_str().unwrap(),
+        ],
+    );
+    std::fs::rename(&side, side.with_extension("moved")).unwrap();
+    h.keys("o#7<enter>");
+    let list = std::process::Command::new("git")
+        .current_dir(&user)
+        .args(["worktree", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("[side]"),
+        "a missing worktree of the user's stays registered"
+    );
+    cleanup(side.with_extension("moved"));
+    cleanup(origin);
+    cleanup(user);
+    cleanup(cache);
+}
+
+#[test]
+fn reopening_a_pr_from_another_clone_shows_its_new_head() {
+    use crate::testutil::git;
+    let (mut h, origin, user, cache) = pr_harness("ui-pr-reopen");
+    h.keys("o#7<enter>");
+    h.keys(":close loc<enter>");
+
+    // The PR gains a commit; open it again from a second clone.
+    git(&origin, &["checkout", "-q", "feature"]);
+    std::fs::write(origin.join("a.txt"), "a with retries, again\n").unwrap();
+    git(&origin, &["commit", "-q", "-am", "More retries"]);
+    git(&origin, &["checkout", "-q", "main"]);
+    git(&origin, &["update-ref", "refs/pull/7/head", "feature"]);
+    let second = fresh_dir("ui-pr-reopen-second");
+    git(&second, &["clone", "-q", origin.to_str().unwrap(), "."]);
+    let github = "https://github.com/acme/widget.git";
+    git(&second, &["remote", "set-url", "origin", github]);
+    git(
+        &second,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", origin.display()),
+            github,
+        ],
+    );
+    h.keys(&format!("o{}<enter>", second.display()));
+    h.keys("o#7<enter>");
+    let checkout = h.app.cur().unwrap().dir.clone();
+    let a = std::fs::read_to_string(checkout.join("a.txt")).unwrap();
+    assert_eq!(
+        a, "a with retries, again\n",
+        "the checkout moved to the new head"
+    );
+    cleanup(second);
+    cleanup(origin);
+    cleanup(user);
+    cleanup(cache);
+}
+
+#[test]
+fn a_merged_pr_whose_base_branch_is_gone_still_opens() {
+    use crate::testutil::git;
+    let (origin, user, mut fake) = fake_github("ui-pr-gone-base");
+    // #7 targeted "stack", which merged and was deleted; main took it in.
+    git(&origin, &["branch", "stack", "main"]);
+    git(&origin, &["checkout", "-q", "stack"]);
+    git(
+        &origin,
+        &["merge", "-q", "--no-ff", "-m", "Merge #7", "feature"],
+    );
+    let merge = std::process::Command::new("git")
+        .current_dir(&origin)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    git(&origin, &["checkout", "-q", "main"]);
+    git(
+        &origin,
+        &["merge", "-q", "--no-ff", "-m", "Land the stack", "stack"],
+    );
+    git(&origin, &["branch", "-q", "-D", "stack"]);
+    fake.info.base_ref_name = "stack".to_string();
+    fake.info.state = "MERGED".to_string();
+    fake.info.merge_commit = Some(crate::pr::Oid {
+        oid: String::from_utf8_lossy(&merge.stdout).trim().to_string(),
+    });
+    let state = fresh_dir("ui-pr-gone-base-state");
+    let cache = fresh_dir("ui-pr-gone-base-cache");
+    let mut h = Harness::build(&user, state, cache.clone(), std::sync::Arc::new(fake));
+    h.keys("o#7<enter>");
+    let status = h.status();
+    assert!(
+        status.starts_with("#7 Add retries · into stack"),
+        "{status}\n{}",
+        h.screen()
+    );
+    assert!(status.contains("2 files"), "{status}");
+    cleanup(origin);
+    cleanup(user);
+    cleanup(cache);
 }

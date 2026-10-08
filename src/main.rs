@@ -5,6 +5,7 @@ mod highlight;
 mod link;
 mod loader;
 mod mcp;
+mod pr;
 mod proto;
 mod recent;
 #[cfg(test)]
@@ -122,12 +123,18 @@ fn main() -> Result<()> {
     } else {
         ui::Palette::dark()
     };
+    // PR checkouts unused for a week go, quietly, in the background.
+    if let Some(cache) = pr::default_cache() {
+        std::thread::spawn(move || pr::prune(&cache, std::time::Duration::from_secs(7 * 86_400)));
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let link = link::Link::new();
     let mut app = ui::App::new(
         ui::Options {
             context: args.context,
             state_dir: recent::default_dir(),
+            cache_dir: pr::default_cache(),
+            pr_source: std::sync::Arc::new(pr::Gh),
         },
         palette,
         hl,

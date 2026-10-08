@@ -10,6 +10,7 @@ pub enum Action {
     SwitchLocation(u64),
     PreviousLocation,
     CloseLocation,
+    PrunePrs,
     Commits,
     OlderCommit,
     NewerCommit,
@@ -18,8 +19,9 @@ pub enum Action {
     Files,
     /// Narrow to the current file, or show all files again.
     Narrow,
-    /// Move to file `n`: jump in the full view, switch file while narrowed.
-    GoToFile(usize),
+    /// Move to the file chosen in the file list (by path): jump in the full
+    /// view, switch file while narrowed.
+    GoToFile,
     NextHunk,
     PrevHunk,
     NextFile,
@@ -110,6 +112,11 @@ pub const COMMANDS: &[Command] = &[
     Command {
         action: Action::CloseLocation,
         name: "Close location",
+        keys: "",
+    },
+    Command {
+        action: Action::PrunePrs,
+        name: "Remove PR checkouts",
         keys: "",
     },
     Command {
