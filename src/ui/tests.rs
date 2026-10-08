@@ -103,6 +103,8 @@ impl Harness {
                     "down" => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
                     "up" => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
                     "bs" => KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                    "a-up" => KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+                    "a-down" => KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
                     c if c.starts_with("c-") => KeyEvent::new(
                         KeyCode::Char(c.chars().nth(2).unwrap()),
                         KeyModifiers::CONTROL,
@@ -216,7 +218,7 @@ fn recently_used_commands_come_first() {
     let dir = branch_with_history("ui-recent");
     let mut h = Harness::open(&dir);
     h.keys(":how<enter>");
-    h.keys("?");
+    h.keys(":");
     let screen = h.screen();
     let first = screen
         .lines()
@@ -445,7 +447,7 @@ fn the_commit_list_previews_each_commit_and_esc_reverts() {
     h.keys("<down>");
     let status = h.status();
     assert!(
-        status.contains(" one · commit 1 of 2"),
+        status.contains("commit 1 of 2 · "),
         "moving previews: {status}"
     );
     assert!(h.screen().contains("src/deep/one.rs"));
@@ -459,7 +461,7 @@ fn the_commit_list_previews_each_commit_and_esc_reverts() {
 
     h.keys("c<down><down><enter>");
     assert!(
-        h.status().contains(" two · commit 2 of 2"),
+        h.status().contains("commit 2 of 2 · "),
         "Enter keeps: {}",
         h.status()
     );
@@ -477,9 +479,9 @@ fn angle_brackets_walk_the_branch_and_esc_comes_back() {
         h.status()
     );
     h.keys("<");
-    assert!(h.status().contains("two · commit 2 of 2"), "{}", h.status());
+    assert!(h.status().contains("commit 2 of 2 · "), "{}", h.status());
     h.keys("<");
-    assert!(h.status().contains("one · commit 1 of 2"), "{}", h.status());
+    assert!(h.status().contains("commit 1 of 2 · "), "{}", h.status());
     h.keys("<");
     assert!(
         h.status().contains("this is the oldest commit"),
@@ -508,8 +510,8 @@ fn a_commit_shows_its_message_above_the_diff_and_d_hides_it() {
     let screen = h.screen();
     let top: Vec<&str> = screen.lines().take(4).collect();
     assert!(
-        top[0].contains("│") && top[0].contains("· t ·"),
-        "header with author: {top:?}"
+        top[0].starts_with("  ") && top[0].contains("· t ·") && !top[0].contains('│'),
+        "header with author, no ruler: {top:?}"
     );
     assert!(top[1].contains("one"), "subject: {top:?}");
     assert!(top[3].contains("Adds the first function."), "body: {top:?}");
@@ -522,18 +524,18 @@ fn a_commit_shows_its_message_above_the_diff_and_d_hides_it() {
         "{screen}"
     );
     assert!(
-        h.status().contains("one · commit 1 of 2"),
+        h.status().contains("commit 1 of 2 · "),
         "the subject stays in the status bar"
     );
 
     h.keys(">");
     assert!(
-        !h.screen().contains("│"),
+        !h.screen().contains("· t ·"),
         "hidden stays hidden for the session"
     );
     h.keys("d");
     assert!(
-        h.screen().lines().next().unwrap().contains("│"),
+        h.screen().lines().next().unwrap().contains("· t ·"),
         "and comes back"
     );
     cleanup(dir);
@@ -544,7 +546,7 @@ fn an_amended_commit_falls_back_to_everything() {
     let dir = branch_with_history("ui-amend");
     let mut h = Harness::open(&dir);
     h.keys("<<");
-    assert!(h.status().contains("two · commit 2 of 2"), "{}", h.status());
+    assert!(h.status().contains("commit 2 of 2 · "), "{}", h.status());
     crate::testutil::git(&dir, &["commit", "-q", "--amend", "-m", "two, amended"]);
     let deadline = Instant::now() + Duration::from_secs(10);
     while !h.status().contains("no longer on this branch") && Instant::now() < deadline {
@@ -585,7 +587,7 @@ fn open_a_typed_path_and_flip_back_with_dash() {
     let b = small_repo("ui-loc-b");
     let mut h = Harness::open(&a);
     h.keys("<<");
-    assert!(h.status().contains("two · commit 2 of 2"), "{}", h.status());
+    assert!(h.status().contains("commit 2 of 2 · "), "{}", h.status());
 
     h.keys(&format!("o{}<enter>", b.display()));
     assert!(
@@ -602,7 +604,7 @@ fn open_a_typed_path_and_flip_back_with_dash() {
     );
     h.keys("j");
     assert!(
-        h.status().contains("two · commit 2 of 2"),
+        h.status().contains("commit 2 of 2 · "),
         "a location keeps its range: {}",
         h.status()
     );
@@ -908,7 +910,7 @@ fn pr_checkouts_are_remembered_and_removed_on_request() {
 
     h.keys("-o");
     assert!(
-        h.screen().contains("#7 Add retries  acme/widget"),
+        h.screen().contains("acme/widget#7 Add retries"),
         "recents list PRs: {}",
         h.screen()
     );
@@ -1203,6 +1205,86 @@ fn a_merged_pr_whose_base_branch_is_gone_still_opens() {
         h.screen()
     );
     assert!(status.contains("2 files"), "{status}");
+    cleanup(origin);
+    cleanup(user);
+    cleanup(cache);
+}
+
+// ---- walkthrough notes --------------------------------------------------------
+
+#[test]
+fn alt_arrows_walk_the_commits_with_the_position_first() {
+    let dir = branch_with_history("ui-alt-step");
+    let mut h = Harness::open(&dir);
+    h.keys("<a-up>");
+    assert!(h.status().contains("uncommitted changes"), "{}", h.status());
+    h.keys("<a-up>");
+    let status = h.status();
+    assert!(
+        status.starts_with(&format!("{COMMIT_ICON} commit 2 of 2 · ")) && status.contains(" two"),
+        "icon and position lead: {status}"
+    );
+    h.keys("<a-up>");
+    assert!(h.status().contains("commit 1 of 2 · "), "{}", h.status());
+    h.keys("<a-down><a-down>");
+    assert!(h.status().contains("uncommitted changes"), "{}", h.status());
+    h.keys("<esc>");
+    assert!(h.status().contains("since main"), "{}", h.status());
+    cleanup(dir);
+}
+
+#[test]
+fn stepping_on_a_branch_without_commits_says_so() {
+    let dir = small_repo("ui-no-commits");
+    crate::testutil::git(&dir, &["checkout", "-q", "-b", "feature", "main"]);
+    let mut h = Harness::open(&dir);
+    h.keys("<a-up>");
+    assert!(h.status().contains("uncommitted changes"), "{}", h.status());
+    h.keys("<a-up>");
+    assert!(
+        h.status().contains("no commits since the branch point"),
+        "{}",
+        h.status()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn question_mark_no_longer_opens_the_palette_and_keys_show_as_keycaps() {
+    let dir = branch_with_history("ui-keycaps");
+    let mut h = Harness::open(&dir);
+    h.keys("?");
+    assert!(!h.screen().contains("Commands ›"));
+    assert!(h.status().ends_with(": commands"), "{}", h.status());
+    h.keys(":older");
+    let screen = h.screen();
+    let row = screen.lines().find(|l| l.contains("Older commit")).unwrap();
+    assert!(row.trim_end().ends_with("Alt-↑"), "{row}");
+    // The keycap has its own background.
+    let y = screen
+        .lines()
+        .position(|l| l.contains("Older commit"))
+        .unwrap() as u16;
+    let buf = h.term.backend().buffer();
+    let x = (0..buf.area.width)
+        .rev()
+        .find(|&x| buf[(x, y)].symbol() == "A")
+        .unwrap();
+    assert_eq!(buf[(x, y)].bg, Palette::dark().key_bg);
+    cleanup(dir);
+}
+
+#[test]
+fn fetching_a_pr_again_reports_when_it_is_done() {
+    let (mut h, origin, user, cache) = pr_harness("ui-pr-refetch");
+    h.keys("o#7<enter>");
+    h.keys("r");
+    let status = h.status();
+    assert!(!status.contains("fetching"), "{status}");
+    assert!(
+        status.contains("no changes since the last load"),
+        "{status}"
+    );
     cleanup(origin);
     cleanup(user);
     cleanup(cache);

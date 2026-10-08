@@ -297,14 +297,29 @@ impl Panel {
             }
             spans.push(Span::styled(item.text.clone(), style));
             buf.set_line(area.x, y, &Line::from(spans), area.width);
-            let hw = item.hint.chars().count() as u16 + 2;
-            if !item.hint.is_empty() && area.width > hw + 10 {
-                buf.set_span(
-                    area.right() - hw,
-                    y,
-                    &Span::styled(item.hint.clone(), style.fg(p.note_fg)),
-                    hw,
-                );
+            if !item.hint.is_empty() {
+                // Commands show their shortcut as a keycap; other lists show
+                // plain details such as counts and ages.
+                let (text, hint_style) = if self.kind == Kind::Commands {
+                    (
+                        format!(" {} ", item.hint),
+                        Style::default()
+                            .bg(p.key_bg)
+                            .fg(p.key_fg)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    (item.hint.clone(), style.fg(p.note_fg))
+                };
+                let hw = text.chars().count() as u16;
+                if area.width > hw + 12 {
+                    buf.set_span(
+                        area.right() - hw - 1,
+                        y,
+                        &Span::styled(text, hint_style),
+                        hw,
+                    );
+                }
             }
         }
         cursor
