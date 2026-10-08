@@ -49,6 +49,8 @@ pub struct FileDiff {
     pub hunks: Vec<Hunk>,
     pub old_lines: Vec<String>,
     pub new_lines: Vec<String>,
+    /// A file shown as it is, not a change: every line is context.
+    pub plain: bool,
 }
 
 impl FileDiff {
@@ -91,6 +93,7 @@ pub fn build(change: FileChange, context: usize) -> FileDiff {
             hunks: Vec::new(),
             old_lines: Vec::new(),
             new_lines: Vec::new(),
+            plain: false,
         };
     }
 
@@ -222,6 +225,69 @@ pub fn build(change: FileChange, context: usize) -> FileDiff {
         hunks,
         old_lines,
         new_lines,
+        plain: false,
+    }
+}
+
+/// A file shown as it is. `windows` are 1-based inclusive line ranges to
+/// show as excerpts; empty shows the whole file.
+pub fn plain(path: String, content: &[u8], windows: &[(usize, usize)]) -> FileDiff {
+    let binary = is_binary(Some(content));
+    let text = if binary {
+        String::new()
+    } else {
+        expand_tabs(&String::from_utf8_lossy(content))
+    };
+    let lines: Vec<String> = split_lines(&text).into_iter().map(str::to_owned).collect();
+    let n = lines.len();
+    let mut spans: Vec<(usize, usize)> = if windows.is_empty() {
+        if n == 0 { Vec::new() } else { vec![(1, n)] }
+    } else {
+        windows
+            .iter()
+            .map(|&(a, b)| (a.clamp(1, n.max(1)), b.clamp(1, n.max(1))))
+            .filter(|_| n > 0)
+            .collect()
+    };
+    spans.sort();
+    // Overlapping or touching excerpts become one.
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in spans {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 + 1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    let hunks = merged
+        .into_iter()
+        .map(|(a, b)| Hunk {
+            old_start: a,
+            old_count: b + 1 - a,
+            new_start: a,
+            new_count: b + 1 - a,
+            func: find_func(&lines, a - 1),
+            lines: (a..=b)
+                .map(|no| DiffLine {
+                    kind: Kind::Context,
+                    old_no: Some(no),
+                    new_no: Some(no),
+                    text: lines[no - 1].clone(),
+                    emph: Vec::new(),
+                })
+                .collect(),
+        })
+        .collect();
+    FileDiff {
+        path,
+        old_path: None,
+        status: Status::Modified,
+        binary,
+        added: 0,
+        removed: 0,
+        hunks,
+        old_lines: Vec::new(),
+        new_lines: lines,
+        plain: true,
     }
 }
 

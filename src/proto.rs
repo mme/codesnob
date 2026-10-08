@@ -91,6 +91,27 @@ pub struct ViewSpec {
     /// Only these files, relative to the repository root.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// Show files as they are instead of a diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeSpec>,
+}
+
+/// Files to show as they are.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeSpec {
+    /// A revision to show them at; `None` is the working tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    pub files: Vec<CodeFile>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeFile {
+    /// Relative to the repository root.
+    pub path: String,
+    /// Open at this line, marked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
 }
 
 /// A connected viewer. Re-sent in full whenever anything changes; the

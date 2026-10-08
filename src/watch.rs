@@ -11,8 +11,6 @@ use std::time::Duration;
 
 use notify::{RecursiveMode, Watcher};
 
-use crate::git;
-
 pub enum Msg {
     Input(crossterm::event::Event),
     /// Files changed under location `loc`.
@@ -23,7 +21,7 @@ pub enum Msg {
     Loaded {
         loc: u64,
         seq: u64,
-        result: Box<Result<git::Snapshot, String>>,
+        result: Box<Result<crate::loader::Load, String>>,
     },
     /// The daemon asks this viewer to display a target.
     Show(crate::proto::Target),

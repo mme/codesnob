@@ -38,6 +38,9 @@ use panel::{Outcome, Panel};
 /// Alt-Up and Alt-Down walk the branch.
 const COMMIT_ICON: &str = "\u{f0718}";
 
+/// Lines shown above and below the target line of an excerpt.
+const EXCERPT: usize = 8;
+
 /// How long a load may take before the screen says it is loading.
 const LOADING_DELAY: Duration = Duration::from_millis(150);
 
@@ -161,15 +164,19 @@ enum Focus {
 /// What Esc returns to after an agent changed the view.
 enum AgentReturn {
     /// The view this location had before the agent's call.
-    View {
-        range: Range,
-        base: Option<String>,
-        label: Option<String>,
-        focus: Focus,
-        anchor: Option<Anchor>,
-    },
+    View(Box<SavedView>),
     /// The location that was on screen before the agent's call.
     Switch(u64),
+}
+
+/// A location's view, kept to return to.
+struct SavedView {
+    range: Range,
+    base: Option<String>,
+    label: Option<String>,
+    focus: Focus,
+    anchor: Option<Anchor>,
+    code: Option<crate::proto::CodeSpec>,
 }
 
 /// Where the view was when a previewing list opened, to return to on Esc.
@@ -200,6 +207,13 @@ struct Location {
     range_label: Option<String>,
     /// Set while an agent's view is on screen: where Esc goes back to.
     agent_return: Option<AgentReturn>,
+    /// Files to show as they are instead of the range's changes.
+    code: Option<crate::proto::CodeSpec>,
+    /// The code view currently on screen, if the screen shows one.
+    code_shown: Option<crate::proto::CodeSpec>,
+    /// The revision the code on screen was read at, as a short id.
+    code_rev: Option<String>,
+    code_fp: u64,
     focus: Focus,
     view: DiffView,
     info: Option<Info>,
@@ -311,6 +325,10 @@ impl App {
             range: Range::Everything,
             range_label: None,
             agent_return: None,
+            code: None,
+            code_shown: None,
+            code_rev: None,
+            code_fp: 0,
             focus: Focus::All,
             view: DiffView::default(),
             info: None,
@@ -415,6 +433,10 @@ impl App {
             range: Range::Everything,
             range_label: None,
             agent_return: None,
+            code: None,
+            code_shown: None,
+            code_rev: None,
+            code_fp: 0,
             focus: Focus::All,
             view: DiffView::default(),
             info: None,
@@ -857,6 +879,10 @@ impl App {
             dir: loc.dir.clone(),
             base: loc.base.clone(),
             range: loc.range,
+            code: loc.code.as_ref().map(|c| loader::Code {
+                rev: c.rev.clone(),
+                paths: c.files.iter().map(|f| f.path.clone()).collect(),
+            }),
         });
     }
 
@@ -877,7 +903,86 @@ impl App {
             .is_some_and(|l| l.pending_since.is_some() || l.pr.as_ref().is_some_and(|p| p.fetching))
     }
 
-    fn apply_loaded(&mut self, id: u64, seq: u64, result: Result<git::Snapshot, String>) {
+    fn apply_loaded(&mut self, id: u64, seq: u64, result: Result<loader::Load, String>) {
+        match result {
+            Ok(loader::Load::Code(code)) => self.apply_code(id, seq, code),
+            Ok(loader::Load::Diff(snap)) => self.apply_diff(id, seq, Ok(*snap)),
+            Err(e) => self.apply_diff(id, seq, Err(e)),
+        }
+    }
+
+    /// Files to show as they are have loaded.
+    fn apply_code(&mut self, id: u64, seq: u64, code: git::CodeSnapshot) {
+        let current = self.locations.first().is_some_and(|l| l.id == id);
+        let Some(loc) = self.locations.iter_mut().find(|l| l.id == id) else {
+            return;
+        };
+        if seq != loc.seq {
+            return;
+        }
+        loc.pending_since = None;
+        let manual = std::mem::take(&mut loc.manual);
+        let pending = loc.pending_anchor.take();
+        // The code view was left while this loaded.
+        let Some(spec) = loc.code.clone() else {
+            return;
+        };
+        loc.error = None;
+        let fingerprint = code.fingerprint();
+        let same_view = loc.code_shown.as_ref() == Some(&spec);
+        if same_view && fingerprint == loc.code_fp {
+            if manual && current {
+                self.message = Some("no changes since the last load".to_string());
+            }
+            return;
+        }
+        let anchor = if same_view { loc.view.anchor() } else { None };
+        // One file shows whole; several show as excerpts around their line.
+        let several = spec.files.len() > 1;
+        let files = code
+            .files
+            .into_iter()
+            .map(|(path, data)| {
+                let line = spec
+                    .files
+                    .iter()
+                    .find(|f| f.path == path)
+                    .and_then(|f| f.line);
+                let windows = match (several, line) {
+                    (true, Some(l)) => vec![(l.saturating_sub(EXCERPT).max(1), l + EXCERPT)],
+                    _ => Vec::new(),
+                };
+                crate::diff::plain(path, &data, &windows)
+            })
+            .collect();
+        loc.view.set_built(files);
+        loc.view.target = spec
+            .files
+            .iter()
+            .find_map(|f| f.line.map(|l| (f.path.clone(), l)));
+        narrow_view(&mut loc.view, &loc.focus);
+        match anchor.or(pending) {
+            Some(a) => loc.view.restore(a),
+            None => {
+                // Placed at the next draw, when the screen height is known.
+                loc.view.scroll = 0;
+                loc.view.hscroll = 0;
+                loc.view.place_target = loc.view.target.is_some();
+            }
+        }
+        loc.code_shown = Some(spec);
+        loc.code_rev = code.rev;
+        loc.code_fp = fingerprint;
+        loc.desc_dirty = true;
+        if current {
+            self.hl.clear();
+            if manual {
+                self.message = Some("reloaded".to_string());
+            }
+        }
+    }
+
+    fn apply_diff(&mut self, id: u64, seq: u64, result: Result<git::Snapshot, String>) {
         let context = self.opts.context;
         // A location loaded in the background speaks only once it is shown.
         let current = self.locations.first().is_some_and(|l| l.id == id);
@@ -894,7 +999,13 @@ impl App {
         let snap = match result {
             Ok(snap) => snap,
             Err(e) => {
-                let shown = loc.info.as_ref().is_some_and(|i| i.range == loc.range);
+                let shown = match &loc.code {
+                    Some(code) => loc.code_shown.as_ref() == Some(code),
+                    None => {
+                        loc.code_shown.is_none()
+                            && loc.info.as_ref().is_some_and(|i| i.range == loc.range)
+                    }
+                };
                 if !shown {
                     loc.error = Some(e);
                 } else if current {
@@ -920,14 +1031,19 @@ impl App {
             }
             return;
         }
+        // The code view was entered while this diff loaded.
+        if loc.code.is_some() {
+            return;
+        }
+        let leaving_code = loc.code_shown.take().is_some();
         let fingerprint = snap.fingerprint();
-        if fingerprint == loc.fingerprint {
+        if fingerprint == loc.fingerprint && !leaving_code {
             if manual && current {
                 self.message = Some("no changes since the last load".to_string());
             }
             return;
         }
-        let same_range = loc.info.as_ref().is_some_and(|i| i.range == snap.range);
+        let same_range = !leaving_code && loc.info.as_ref().is_some_and(|i| i.range == snap.range);
         let anchor = if same_range { loc.view.anchor() } else { None };
         let (info, files) = Info::split(snap);
         loc.fingerprint = fingerprint;
@@ -1159,6 +1275,7 @@ impl App {
 
     /// `u`: the uncommitted changes alone, and back to everything.
     fn toggle_uncommitted(&mut self) {
+        self.leave_code();
         let Some(loc) = self.cur() else { return };
         if loc.range == Range::Uncommitted {
             self.set_range(Range::Everything);
@@ -1182,6 +1299,10 @@ impl App {
             self.close_location();
             return;
         }
+        if loc.code.is_some() {
+            self.leave_code();
+            return;
+        }
         if loc.focus != Focus::All {
             self.narrow(None);
         } else if loc.range != Range::Everything {
@@ -1189,9 +1310,53 @@ impl App {
         }
     }
 
+    /// Back from files as they are to the location's diff.
+    fn leave_code(&mut self) {
+        if let Some(loc) = self.cur_mut()
+            && loc.code.take().is_some()
+        {
+            self.settle_view(None);
+        }
+    }
+
+    /// Show `file` as it is, in its repository's location.
+    fn open_file(&mut self, file: PathBuf) {
+        let Some(parent) = file.parent().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        if gix::discover(&parent).is_err() {
+            self.open_dir(parent, None);
+            return;
+        }
+        let root = checkout_root(&parent);
+        let Ok(rel) = file
+            .strip_prefix(&root)
+            .map(|r| r.to_string_lossy().into_owned())
+        else {
+            return;
+        };
+        self.open(Target {
+            dir: root,
+            base: None,
+            repo: true,
+        });
+        if let Some(loc) = self.cur_mut() {
+            loc.code = Some(crate::proto::CodeSpec {
+                rev: None,
+                files: vec![crate::proto::CodeFile {
+                    path: rel,
+                    line: None,
+                }],
+            });
+            loc.focus = Focus::All;
+        }
+        self.settle_view(None);
+    }
+
     /// Show a comparison typed in the Open prompt in the current location.
     fn apply_spec(&mut self, spec: git::Spec) {
         let Some(loc) = self.cur_mut() else { return };
+        loc.code = None;
         match spec {
             git::Spec::Range(range, label) => {
                 loc.range = range;
@@ -1213,7 +1378,9 @@ impl App {
     fn settle_view(&mut self, anchor: Option<Anchor>) {
         let Some(loc) = self.cur_mut() else { return };
         loc.desc_dirty = true;
-        let shown = loc.info.as_ref().is_some_and(|i| i.range == loc.range);
+        let shown = loc.code.is_none()
+            && loc.code_shown.is_none()
+            && loc.info.as_ref().is_some_and(|i| i.range == loc.range);
         if shown {
             narrow_view(&mut loc.view, &loc.focus);
             match anchor {
@@ -1258,13 +1425,14 @@ impl App {
             if let Some(loc) = self.cur_mut()
                 && loc.agent_return.is_none()
             {
-                loc.agent_return = Some(AgentReturn::View {
+                loc.agent_return = Some(AgentReturn::View(Box::new(SavedView {
                     range: loc.range,
                     base: loc.base.clone(),
                     label: loc.range_label.clone(),
                     focus: loc.focus.clone(),
                     anchor: loc.view.anchor(),
-                });
+                    code: loc.code.clone(),
+                })));
             }
         } else {
             self.open(Target { dir, ..target });
@@ -1274,6 +1442,16 @@ impl App {
             {
                 loc.agent_return = before.map(AgentReturn::Switch);
             }
+        }
+        if let Some(code) = view.code {
+            // Files as they are; the location's diff stays as it was.
+            if let Some(loc) = self.cur_mut() {
+                loc.code = Some(code);
+                loc.focus = Focus::All;
+                loc.error = None;
+            }
+            self.settle_view(None);
+            return;
         }
         let parsed = match &view.range {
             Some(r) => self
@@ -1285,6 +1463,7 @@ impl App {
         let Some(loc) = self.cur_mut() else { return };
         loc.focus = focus;
         loc.error = None;
+        loc.code = None;
         match parsed {
             Some(Ok(git::Spec::Range(range, label))) => {
                 loc.range = range;
@@ -1317,18 +1496,21 @@ impl App {
                     self.switch_to(i);
                 }
             }
-            AgentReturn::View {
-                range,
-                base,
-                label,
-                focus,
-                anchor,
-            } => {
+            AgentReturn::View(saved) => {
+                let SavedView {
+                    range,
+                    base,
+                    label,
+                    focus,
+                    anchor,
+                    code,
+                } = *saved;
                 let Some(loc) = self.cur_mut() else { return };
                 loc.range = range;
                 loc.base = base;
                 loc.range_label = label;
                 loc.focus = focus;
+                loc.code = code;
                 loc.error = None;
                 self.settle_view(anchor);
             }
@@ -1463,6 +1645,15 @@ impl App {
         if let Some(spec) = crate::pr::parse(input) {
             self.close_panel(false);
             self.open_pr(spec);
+            return;
+        }
+        // A file: show it as it is.
+        if !input.is_empty()
+            && let Ok(file) = std::fs::canonicalize(self.expand(input))
+            && file.is_file()
+        {
+            self.close_panel(false);
+            self.open_file(file);
             return;
         }
         let typed = (!input.is_empty()).then(|| self.resolve_path(input));
@@ -1632,7 +1823,7 @@ impl App {
         let Some(loc) = self.cur() else {
             return Vec::new();
         };
-        if loc.focus != Focus::All {
+        if loc.focus != Focus::All || loc.code.is_some() {
             return Vec::new();
         }
         let Some(info) = &loc.info else {
@@ -1790,6 +1981,19 @@ impl App {
     }
 
     fn perform(&mut self, action: Action) {
+        // Diff-only actions first go back from files as they are to the diff.
+        if matches!(
+            action,
+            Action::Commits
+                | Action::OlderCommit
+                | Action::NewerCommit
+                | Action::ShowCommit(_)
+                | Action::RangeEverything
+                | Action::RangeUncommitted
+                | Action::ToggleDescription
+        ) {
+            self.leave_code();
+        }
         let body_h = self.body_h;
         match action {
             Action::Quit => self.quit = true,
@@ -1918,6 +2122,16 @@ impl App {
         let Some(loc) = self.cur() else {
             return String::new();
         };
+        if let Some(code) = &loc.code {
+            let what = match code.files.as_slice() {
+                [one] => one.path.clone(),
+                many => format!("{} files", many.len()),
+            };
+            return match (&loc.code_rev, &code.rev) {
+                (Some(r), _) | (None, Some(r)) => format!("{what} @ {r}"),
+                (None, None) => format!("{what} · working tree"),
+            };
+        }
         if let Some(p) = &loc.pr {
             let n = p.spec.number;
             let doing = if p.fetching {
@@ -2040,7 +2254,12 @@ impl App {
                 loc.dir.display().to_string(),
             ]);
         }
-        let stale = loc.info.as_ref().is_none_or(|i| i.range != loc.range);
+        let stale = match &loc.code {
+            Some(code) => loc.code_shown.as_ref() != Some(code),
+            None => {
+                loc.code_shown.is_some() || loc.info.as_ref().is_none_or(|i| i.range != loc.range)
+            }
+        };
         if stale {
             let slow = loc
                 .pending_since
@@ -2103,6 +2322,16 @@ impl App {
             }
         }
         if let Some(loc) = self.locations.first_mut() {
+            // A target line sits about a third of the way down.
+            if std::mem::take(&mut loc.view.place_target)
+                && let Some(row) = loc
+                    .view
+                    .target
+                    .clone()
+                    .and_then(|(p, l)| loc.view.row_of_line(&p, l))
+            {
+                loc.view.scroll = row.saturating_sub(self.body_h / 3);
+            }
             loc.view.clamp();
         }
 
@@ -2179,6 +2408,16 @@ impl App {
             return;
         }
         if let Some(loc) = self.cur()
+            && loc.code_shown.is_some()
+            && loc.view.has_files()
+        {
+            // Files as they are: no changes to count.
+            let n = loc.view.files.len();
+            if n > 1 {
+                let pos = loc.view.current_file().map_or(0, |i| i + 1);
+                right = format!(" file {pos} of {n}  ·");
+            }
+        } else if let Some(loc) = self.cur()
             && loc.view.has_files()
         {
             let n = loc.view.files.len();
