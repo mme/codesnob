@@ -86,19 +86,20 @@ const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a termin
 fn tools() -> Value {
     json!([{
         "name": "show_code",
-        "description": "Show source code to the user in their codesnob viewer: one file, or excerpts from several, optionally opened at a line and with highlighted line ranges, each with a short note. Use it when the user asks to see, open or look at code, or where something is defined or handled, and whenever they ask you to show code while explaining. Prefer a few precise highlights with notes over large ranges.",
+        "description": "Show source code to the user in their codesnob viewer: whole files, or excerpts around a line and highlighted line ranges, each highlight with a short note. Use it when the user asks to see, open or look at code, or where something is defined or handled, and whenever they ask you to show code while explaining. Prefer a few precise highlights with notes over large ranges.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "files": {
                     "type": "array",
                     "minItems": 1,
-                    "description": "The files to show, in this order. One shows whole; several show as excerpts around their line and highlights.",
+                    "description": "The files to show, in this order. Unless excerpts says otherwise, one file shows whole and several show as excerpts around their line and highlights.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "path": { "type": "string", "description": "Relative to your working directory, or absolute." },
                             "line": { "type": "integer", "minimum": 1, "description": "Open at this line, marked." },
+                            "excerpts": { "type": "boolean", "description": "true shows only this file's line and highlights, each with a few lines around it, like a diff; false shows the whole file." },
                             "highlights": {
                                 "type": "array",
                                 "description": "Line ranges to highlight in this file. The viewer numbers all of a call's highlights by where they sit, not by the order you list them: by file in the order of files, then by line, so the first file's highlights come first. At most 20 per call, ① to ⑳. The user steps through them with < and >; the result lists each number with its file and lines, so refer to them by those numbers.",
@@ -223,13 +224,18 @@ fn prepare_code(
                 ));
             }
         }
-        let (path, line) = match item {
-            Value::String(p) => (p.as_str(), None),
+        let (path, line, excerpts) = match item {
+            Value::String(p) => (p.as_str(), None, None),
             Value::Object(o) => (
                 o.get("path")
                     .and_then(Value::as_str)
                     .ok_or("each file needs a path")?,
                 o.get("line").and_then(Value::as_u64),
+                match o.get("excerpts") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Bool(b)) => Some(*b),
+                    Some(_) => return Err("excerpts is true or false".to_string()),
+                },
             ),
             _ => return Err("each file is an object with a path".to_string()),
         };
@@ -239,6 +245,7 @@ fn prepare_code(
         files.push(crate::proto::CodeFile {
             path: relative_to(&root, cwd, path)?,
             line: line.map(|l| l as usize),
+            excerpts,
         });
     }
     check_count(marks.len())?;
@@ -670,6 +677,26 @@ mod tests {
             err.starts_with("at most 20 highlights per call (got 21)"),
             "{err}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn excerpts_are_carried_per_file() {
+        let dir = branch_with_history("mcp-excerpts");
+        let (_, view, _) = prepare_code(
+            &json!({ "files": [{ "path": "a.txt", "excerpts": true }, { "path": "b.txt" }] }),
+            &dir,
+        )
+        .unwrap();
+        let files = view.code.unwrap().files;
+        assert_eq!(files[0].excerpts, Some(true));
+        assert_eq!(files[1].excerpts, None);
+        let err = prepare_code(
+            &json!({ "files": [{ "path": "a.txt", "excerpts": "yes" }] }),
+            &dir,
+        )
+        .unwrap_err();
+        assert_eq!(err, "excerpts is true or false");
         let _ = std::fs::remove_dir_all(dir);
     }
 

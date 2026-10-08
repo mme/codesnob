@@ -1592,6 +1592,7 @@ fn code(rev: Option<&str>, files: &[(&str, Option<usize>)]) -> crate::proto::Vie
                 .map(|(p, l)| crate::proto::CodeFile {
                     path: p.to_string(),
                     line: *l,
+                    ..Default::default()
                 })
                 .collect(),
         }),
@@ -2010,5 +2011,50 @@ fn a_line_outside_the_highlights_opens_at_the_line() {
         Some(1)
     );
     assert!(h.status().contains("highlight 1 of 2"), "{}", h.status());
+    cleanup(dir);
+}
+
+#[test]
+fn one_file_can_show_just_its_highlights_like_a_diff() {
+    let dir = repo_with_long_file("ui-code-excerpts");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.code.as_mut().unwrap().files[0].excerpts = Some(true);
+    spec.highlights = vec![
+        hl("src/long.rs", 10, 11, Some("first")),
+        hl("src/long.rs", 45, 45, Some("second")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let view = &h.app.cur().unwrap().view;
+    let shown = |line| view.row_of_line("src/long.rs", line).is_some();
+    // Three lines of context, as in a diff.
+    for line in [7, 8, 10, 11, 14, 42, 45, 48] {
+        assert!(shown(line), "line {line} is shown");
+    }
+    for line in [6, 15, 30, 41, 49, 60] {
+        assert!(!shown(line), "line {line} is left out");
+    }
+    cleanup(dir);
+}
+
+#[test]
+fn one_of_several_files_can_show_whole() {
+    let dir = repo_with_long_file("ui-code-whole");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None), ("src/deep/one.rs", None)]);
+    spec.code.as_mut().unwrap().files[0].excerpts = Some(false);
+    spec.highlights = vec![
+        hl("src/long.rs", 5, 5, None),
+        hl("src/deep/one.rs", 1, 1, None),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let view = &h.app.cur().unwrap().view;
+    assert!(
+        (1..=60).all(|l| view.row_of_line("src/long.rs", l).is_some()),
+        "long.rs shows whole"
+    );
+    assert!(view.row_of_line("src/deep/one.rs", 1).is_some());
     cleanup(dir);
 }
