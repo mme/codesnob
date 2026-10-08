@@ -36,6 +36,8 @@ pub struct DiffView {
     file_starts: Vec<usize>,
     hunk_starts: Vec<usize>,
     gutter_w: usize,
+    /// Narrowed to this file index; `None` shows every file.
+    only: Option<usize>,
     pub scroll: usize,
     pub hscroll: usize,
 }
@@ -46,7 +48,50 @@ impl DiffView {
             .into_iter()
             .map(|c| diff::build(c, context))
             .collect();
+        self.only = None;
         self.build_rows();
+    }
+
+    /// Narrow to one file, or show all with `None`. Returns false, and shows
+    /// all, when the path is not part of this diff.
+    pub fn narrow_to_path(&mut self, path: Option<&str>) -> bool {
+        let fi = match path {
+            Some(p) => match self.files.iter().position(|f| f.path == p) {
+                Some(fi) => Some(fi),
+                None => {
+                    self.narrow_to(None);
+                    return false;
+                }
+            },
+            None => None,
+        };
+        self.narrow_to(fi);
+        true
+    }
+
+    pub fn narrow_to(&mut self, fi: Option<usize>) {
+        if self.only != fi {
+            self.only = fi;
+            self.build_rows();
+        }
+    }
+
+    pub fn narrowed(&self) -> Option<usize> {
+        self.only
+    }
+
+    /// Scroll so file `fi` starts at the top.
+    pub fn scroll_to_file(&mut self, fi: usize) {
+        if let Some(r) = self.file_row(fi) {
+            self.scroll = r;
+        }
+    }
+
+    fn file_row(&self, fi: usize) -> Option<usize> {
+        self.file_starts
+            .iter()
+            .copied()
+            .find(|&r| self.rows[r] == Row::File(fi))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -65,7 +110,10 @@ impl DiffView {
         self.hunk_starts.clear();
         let mut max_no = 1;
         for (fi, f) in self.files.iter().enumerate() {
-            if fi > 0 {
+            if self.only.is_some_and(|o| o != fi) {
+                continue;
+            }
+            if !self.rows.is_empty() {
                 self.rows.push(Row::Blank);
             }
             self.file_starts.push(self.rows.len());
@@ -121,11 +169,15 @@ impl DiffView {
             self.clamp();
             return;
         };
-        let start = self.file_starts[fi];
+        let Some(start) = self.file_row(fi) else {
+            self.clamp();
+            return;
+        };
         let end = self
             .file_starts
-            .get(fi + 1)
+            .iter()
             .copied()
+            .find(|&r| r > start)
             .unwrap_or(self.rows.len());
         let mut best: Option<(usize, usize)> = None; // (distance, row)
         if let Some((side, target)) = a.line {
@@ -167,14 +219,19 @@ impl DiffView {
         s.min(self.max_scroll())
     }
 
+    /// The index into `files` of the file at the top of the view.
     pub fn current_file(&self) -> Option<usize> {
         if self.file_starts.is_empty() {
             return None;
         }
-        Some(match self.file_starts.binary_search(&self.scroll) {
+        let i = match self.file_starts.binary_search(&self.scroll) {
             Ok(i) => i,
             Err(i) => i.saturating_sub(1),
-        })
+        };
+        match self.rows[self.file_starts[i]] {
+            Row::File(fi) => Some(fi),
+            _ => None,
+        }
     }
 
     pub fn scroll_by(&mut self, delta: isize) {

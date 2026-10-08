@@ -30,7 +30,7 @@ use crate::loader;
 use crate::proto::Target;
 use crate::watch::{self, Mode, Msg};
 use commands::{Action, COMMANDS};
-use diffview::DiffView;
+use diffview::{Anchor, DiffView};
 use panel::{Outcome, Panel};
 
 /// How long a load may take before the screen says it is loading.
@@ -110,6 +110,20 @@ impl Info {
     }
 }
 
+/// What part of the range is on screen.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Focus {
+    All,
+    /// One file, by path.
+    File(String),
+}
+
+/// Where the view was when a previewing list opened, to return to on Esc.
+struct Origin {
+    focus: Focus,
+    anchor: Option<Anchor>,
+}
+
 struct Location {
     id: u64,
     dir: PathBuf,
@@ -117,6 +131,7 @@ struct Location {
     repo: bool,
     /// The range asked for; `info.range` is the one on screen.
     range: Range,
+    focus: Focus,
     view: DiffView,
     info: Option<Info>,
     /// Held for its `Drop`, which stops the watcher.
@@ -143,6 +158,8 @@ pub struct App {
     locations: Vec<Location>,
     next_id: u64,
     panel: Option<Panel>,
+    /// Where to return when a previewing list is closed with Esc.
+    origin: Option<Origin>,
     /// Recently chosen panel entries per list, newest first.
     recent: HashMap<panel::Kind, Vec<String>>,
     message: Option<String>,
@@ -170,6 +187,7 @@ impl App {
             locations: Vec::new(),
             next_id: 1,
             panel: None,
+            origin: None,
             recent: HashMap::new(),
             message: None,
             body_h: 1,
@@ -199,6 +217,7 @@ impl App {
             base: target.base.clone(),
             repo: target.repo,
             range: Range::Everything,
+            focus: Focus::All,
             view: DiffView::default(),
             info: None,
             _watch: watch,
@@ -295,6 +314,12 @@ impl App {
         let (info, files) = Info::split(snap);
         loc.fingerprint = fingerprint;
         loc.view.set_files(files, context);
+        if let Focus::File(path) = &loc.focus
+            && !loc.view.narrow_to_path(Some(path))
+        {
+            self.message = Some(format!("{path} has no changes here; showing all files"));
+            loc.focus = Focus::All;
+        }
         match anchor {
             Some(a) => loc.view.restore(a),
             None if !same_range => {
@@ -336,7 +361,11 @@ impl App {
                     _ => return,
                 };
                 match self.panel.as_mut() {
-                    Some(p) => p.move_by(delta.signum()),
+                    Some(p) => {
+                        let before = p.selected_action();
+                        p.move_by(delta.signum());
+                        self.preview(before);
+                    }
                     None => {
                         if let Some(loc) = self.cur_mut() {
                             loc.view.scroll_by(delta);
@@ -355,12 +384,13 @@ impl App {
     fn key(&mut self, k: KeyEvent) {
         if self.panel.is_some() {
             let rows = self.panel_rows();
+            let before = self.panel.as_ref().and_then(|p| p.selected_action());
             let outcome = self.panel.as_mut().map(|p| p.key(k, rows));
             match outcome {
-                Some(Outcome::Close) => self.panel = None,
+                Some(Outcome::Close) => self.close_panel(true),
                 Some(Outcome::Choose(action, key)) => {
                     let kind = self.panel.as_ref().map(|p| p.kind);
-                    self.panel = None;
+                    self.close_panel(false);
                     if let Some(kind) = kind {
                         let list = self.recent.entry(kind).or_default();
                         list.retain(|k| *k != key);
@@ -369,7 +399,7 @@ impl App {
                     self.perform(action);
                 }
                 Some(Outcome::Quit) => self.quit = true,
-                Some(Outcome::Stay) | None => {}
+                Some(Outcome::Stay) | None => self.preview(before),
             }
             return;
         }
@@ -398,6 +428,8 @@ impl App {
             (KeyCode::Char(':'), false, _)
             | (KeyCode::Char('?'), false, _)
             | (KeyCode::Char('k'), true, false) => self.open_palette(),
+            (KeyCode::Char('f'), false, false) => self.perform(Action::Files),
+            (KeyCode::Char('z'), false, false) => self.perform(Action::Narrow),
 
             (KeyCode::Down, _, _)
             | (KeyCode::Char('j'), false, false)
@@ -453,9 +485,125 @@ impl App {
 
     /// Esc: leave the narrowest thing first, and never quit.
     fn back_out(&mut self) {
-        if self.cur().is_some_and(|l| l.range != Range::Everything) {
+        let Some(loc) = self.cur() else { return };
+        if loc.focus != Focus::All {
+            self.narrow(None);
+        } else if loc.range != Range::Everything {
             self.set_range(Range::Everything);
         }
+    }
+
+    /// Narrow to `path`, or show all files with `None`, keeping the line in view.
+    fn narrow(&mut self, path: Option<String>) {
+        let Some(loc) = self.cur_mut() else { return };
+        let anchor = loc.view.anchor();
+        // Stay on the same line when it is still on screen afterwards: always
+        // when showing all again, and when narrowing to the file already in view.
+        let current = loc.view.current_file().map(|fi| &loc.view.files[fi].path);
+        let keep = path.is_none() || current == path.as_ref();
+        if !loc.view.narrow_to_path(path.as_deref()) {
+            return;
+        }
+        loc.focus = match path {
+            Some(p) => Focus::File(p),
+            None => Focus::All,
+        };
+        match anchor {
+            Some(a) if keep => loc.view.restore(a),
+            _ => loc.view.scroll = 0,
+        }
+    }
+
+    /// Move to file `fi`: jump in the full view, switch file while narrowed.
+    fn go_to_file(&mut self, fi: usize) {
+        let Some(loc) = self.cur_mut() else { return };
+        let Some(path) = loc.view.files.get(fi).map(|f| f.path.clone()) else {
+            return;
+        };
+        if loc.focus == Focus::All {
+            loc.view.scroll_to_file(fi);
+        } else {
+            self.narrow(Some(path));
+        }
+    }
+
+    /// Show what a previewing list has highlighted, if it changed.
+    fn preview(&mut self, before: Option<Action>) {
+        let Some(panel) = &self.panel else { return };
+        if !panel.kind.previews() {
+            return;
+        }
+        let now = panel.selected_action();
+        if now == before {
+            return;
+        }
+        if let Some(Action::GoToFile(fi)) = now {
+            self.go_to_file(fi);
+        }
+    }
+
+    /// Close the panel; with `revert`, undo whatever it previewed.
+    fn close_panel(&mut self, revert: bool) {
+        self.panel = None;
+        let Some(origin) = self.origin.take() else {
+            return;
+        };
+        if !revert {
+            return;
+        }
+        let Some(loc) = self.cur_mut() else { return };
+        let path = match &origin.focus {
+            Focus::File(p) => Some(p.as_str()),
+            Focus::All => None,
+        };
+        loc.view.narrow_to_path(path);
+        loc.focus = origin.focus;
+        if let Some(a) = origin.anchor {
+            loc.view.restore(a);
+        }
+    }
+
+    fn open_files(&mut self) {
+        let Some(loc) = self.cur() else { return };
+        let items = loc
+            .view
+            .files
+            .iter()
+            .enumerate()
+            .map(|(fi, f)| {
+                let (tag, color) = match f.status {
+                    crate::diff::Status::Added => ("A", Color::Green),
+                    crate::diff::Status::Deleted => ("D", Color::Red),
+                    crate::diff::Status::Modified => ("M", Color::Yellow),
+                    crate::diff::Status::Renamed => ("R", Color::Magenta),
+                };
+                panel::Item {
+                    tag: Some((tag.to_string(), color)),
+                    text: f.display_path(),
+                    hint: if f.binary {
+                        "binary".to_string()
+                    } else {
+                        format!("+{} −{}", f.added, f.removed)
+                    },
+                    action: Action::GoToFile(fi),
+                    key: f.path.clone(),
+                }
+            })
+            .collect();
+        let current = loc
+            .view
+            .current_file()
+            .map(|fi| loc.view.files[fi].path.clone());
+        self.origin = Some(Origin {
+            focus: loc.focus.clone(),
+            anchor: loc.view.anchor(),
+        });
+        self.panel = Some(Panel::new(
+            panel::Kind::Files,
+            items,
+            Vec::new(),
+            current.as_deref(),
+        ));
     }
 
     fn applicable(&self, action: Action) -> bool {
@@ -468,6 +616,7 @@ impl App {
             .as_ref()
             .is_some_and(|i| i.base.name.is_some() && !i.unborn);
         match action {
+            Action::Files | Action::Narrow | Action::GoToFile(_) => has_rows,
             Action::NextHunk
             | Action::PrevHunk
             | Action::NextFile
@@ -486,11 +635,19 @@ impl App {
         let items = COMMANDS
             .iter()
             .filter(|c| self.applicable(c.action))
-            .map(|c| panel::Item {
-                text: c.name.to_string(),
-                hint: c.keys.to_string(),
-                action: c.action,
-                key: c.name.to_string(),
+            .map(|c| {
+                let narrowed = self.cur().is_some_and(|l| l.focus != Focus::All);
+                let name = match c.action {
+                    Action::Narrow if narrowed => "Show all files",
+                    _ => c.name,
+                };
+                panel::Item {
+                    tag: None,
+                    text: name.to_string(),
+                    hint: c.keys.to_string(),
+                    action: c.action,
+                    key: c.name.to_string(),
+                }
             })
             .collect();
         let recent = self
@@ -498,13 +655,41 @@ impl App {
             .get(&panel::Kind::Commands)
             .cloned()
             .unwrap_or_default();
-        self.panel = Some(Panel::new(panel::Kind::Commands, items, recent));
+        self.panel = Some(Panel::new(panel::Kind::Commands, items, recent, None));
     }
 
     fn perform(&mut self, action: Action) {
         let body_h = self.body_h;
         match action {
             Action::Quit => self.quit = true,
+            Action::Files => self.open_files(),
+            Action::GoToFile(fi) => self.go_to_file(fi),
+            Action::Narrow => {
+                let Some(loc) = self.cur() else { return };
+                if loc.focus != Focus::All {
+                    self.narrow(None);
+                } else if let Some(fi) = loc.view.current_file() {
+                    let path = loc.view.files[fi].path.clone();
+                    self.narrow(Some(path));
+                }
+            }
+            Action::NextFile | Action::PrevFile
+                if self.cur().is_some_and(|l| l.focus != Focus::All) =>
+            {
+                // While narrowed, next and previous file move the narrowing.
+                let Some(loc) = self.cur() else { return };
+                let Some(fi) = loc.view.current_file() else {
+                    return;
+                };
+                let next = if action == Action::NextFile {
+                    fi + 1
+                } else {
+                    fi.wrapping_sub(1)
+                };
+                if next < loc.view.files.len() {
+                    self.go_to_file(next);
+                }
+            }
             Action::RangeEverything => self.set_range(Range::Everything),
             Action::RangeUncommitted => self.set_range(Range::Uncommitted),
             Action::ExplainBase => {
@@ -541,6 +726,15 @@ impl App {
 
     /// What the screen shows, in words: the left side of the status bar.
     fn scope(&self) -> String {
+        let scope = self.range_scope();
+        match self.cur().map(|l| &l.focus) {
+            // Narrowed first: on a narrow terminal the scope is what gets cut.
+            Some(Focus::File(path)) => format!("{path} only · Esc for all · {scope}"),
+            _ => scope,
+        }
+    }
+
+    fn range_scope(&self) -> String {
         let Some(loc) = self.cur() else {
             return String::new();
         };
@@ -713,11 +907,20 @@ impl App {
         if let Some(loc) = self.cur()
             && !loc.view.is_empty()
         {
-            let (added, removed) = loc.view.totals();
             let n = loc.view.files.len();
-            let pos = loc.view.current_file().map(|i| i + 1).unwrap_or(0);
-            let noun = if n == 1 { "file" } else { "files" };
-            right = format!(" {n} {noun}  +{added} −{removed}  ·  {pos}/{n}  ·");
+            let cur = loc.view.current_file();
+            let pos = cur.map(|i| i + 1).unwrap_or(0);
+            right = match (loc.view.narrowed(), cur) {
+                (Some(_), Some(fi)) => {
+                    let f = &loc.view.files[fi];
+                    format!(" file {pos} of {n}  +{} −{}  ·", f.added, f.removed)
+                }
+                _ => {
+                    let (added, removed) = loc.view.totals();
+                    let noun = if n == 1 { "file" } else { "files" };
+                    format!(" {n} {noun}  +{added} −{removed}  ·  {pos}/{n}  ·")
+                }
+            };
         }
         right.push_str(" ? commands ");
         let rw = right.chars().count() as u16;
