@@ -1006,6 +1006,14 @@ impl App {
             (KeyCode::Char('<'), false, false) => self.perform(Action::OlderCommit),
             (KeyCode::Char('>'), false, false) => self.perform(Action::NewerCommit),
             (KeyCode::Char('d'), false, false) => self.perform(Action::ToggleDescription),
+            (KeyCode::Char('u'), false, false) => self.toggle_uncommitted(),
+            (KeyCode::Char('L'), false, false) => {
+                if self.applicable(Action::Locations) {
+                    self.perform(Action::Locations);
+                } else {
+                    self.message = Some("no other location open; o opens one".to_string());
+                }
+            }
             (KeyCode::Char('z'), false, false) => self.perform(Action::Narrow),
 
             // Up the commit list is older, down is newer, uncommitted last.
@@ -1060,6 +1068,19 @@ impl App {
                 self.perform(Action::Reload)
             }
             _ => {}
+        }
+    }
+
+    /// `u`: the uncommitted changes alone, and back to everything.
+    fn toggle_uncommitted(&mut self) {
+        let Some(loc) = self.cur() else { return };
+        if loc.range == Range::Uncommitted {
+            self.set_range(Range::Everything);
+        } else if self.applicable(Action::RangeUncommitted) {
+            self.set_range(Range::Uncommitted);
+        } else if loc.repo {
+            // Without a base branch, everything shown is uncommitted already.
+            self.message = Some("everything here is uncommitted already".to_string());
         }
     }
 
@@ -1494,9 +1515,7 @@ impl App {
             | Action::Bottom => has_rows,
             Action::RangeEverything => loc.repo && loc.range != Range::Everything,
             Action::RangeUncommitted => loc.repo && has_base && loc.range != Range::Uncommitted,
-            Action::ExplainBase => loc.info.is_some(),
             Action::Reload => loc.repo || loc.pr.is_some(),
-            Action::PrunePrs => self.opts.cache_dir.is_some(),
             Action::Quit => true,
         }
     }
@@ -1552,14 +1571,6 @@ impl App {
                 }
             }
             Action::PreviousLocation => self.flip(),
-            Action::PrunePrs => {
-                if let Some(cache) = &self.opts.cache_dir {
-                    // PRs open in any viewer hold a lock and are kept.
-                    let n = crate::pr::prune(cache, Duration::ZERO);
-                    let noun = if n == 1 { "checkout" } else { "checkouts" };
-                    self.message = Some(format!("removed {n} PR {noun}; open ones were kept"));
-                }
-            }
             Action::CloseLocation => self.close_location(),
             Action::Commits => self.open_commits(),
             Action::OlderCommit => self.step(true),
@@ -1608,29 +1619,6 @@ impl App {
             }
             Action::RangeEverything => self.set_range(Range::Everything),
             Action::RangeUncommitted => self.set_range(Range::Uncommitted),
-            Action::ExplainBase
-                if self
-                    .cur()
-                    .and_then(|l| l.pr.as_ref())
-                    .and_then(|p| p.info.as_ref())
-                    .is_some() =>
-            {
-                let pr = self
-                    .cur()
-                    .and_then(|l| l.pr.as_ref())
-                    .and_then(|p| p.info.as_ref());
-                if let Some(pr) = pr {
-                    self.message = Some(format!(
-                        "Base: {}, the base branch GitHub reports for #{}; the diff starts where they diverged.",
-                        pr.base_ref_name, pr.number
-                    ));
-                }
-            }
-            Action::ExplainBase => {
-                if let Some(info) = self.cur().and_then(|l| l.info.as_ref()) {
-                    self.message = Some(format!("Base: {}.", info.base.reason));
-                }
-            }
             Action::Reload if self.cur().is_some_and(|l| l.pr.is_some()) => self.refetch_pr(),
             Action::Reload => {
                 if let Some(loc) = self.cur_mut()

@@ -77,6 +77,8 @@ enum Cmd {
     Daemon,
     /// Serve the Model Context Protocol over stdio for AI agents.
     Mcp,
+    /// Remove PR checkouts that no viewer has open.
+    Prune,
 }
 
 fn canonical(path: &std::path::Path) -> Result<PathBuf> {
@@ -93,6 +95,16 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Status { json }) => return link::status(json).map_err(|e| anyhow::anyhow!(e)),
         Some(Cmd::Mcp) => return mcp::serve(),
+        Some(Cmd::Prune) => {
+            let Some(cache) = pr::default_cache() else {
+                anyhow::bail!("no cache directory: HOME is not set");
+            };
+            // PRs open in a viewer hold a lock and are kept.
+            let n = pr::prune(&cache, std::time::Duration::ZERO);
+            let noun = if n == 1 { "checkout" } else { "checkouts" };
+            println!("removed {n} PR {noun}");
+            return Ok(());
+        }
         None => {}
     }
     if args.list_themes {

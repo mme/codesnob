@@ -10,7 +10,6 @@ pub enum Action {
     SwitchLocation(u64),
     PreviousLocation,
     CloseLocation,
-    PrunePrs,
     Commits,
     OlderCommit,
     NewerCommit,
@@ -30,7 +29,6 @@ pub enum Action {
     Bottom,
     RangeEverything,
     RangeUncommitted,
-    ExplainBase,
     Reload,
     Quit,
 }
@@ -52,7 +50,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         action: Action::Locations,
         name: "Locations…",
-        keys: "",
+        keys: "L",
     },
     Command {
         action: Action::PreviousLocation,
@@ -82,7 +80,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         action: Action::RangeUncommitted,
         name: "Uncommitted changes only",
-        keys: "",
+        keys: "u",
     },
     Command {
         action: Action::OlderCommit,
@@ -100,11 +98,6 @@ pub const COMMANDS: &[Command] = &[
         keys: "d",
     },
     Command {
-        action: Action::ExplainBase,
-        name: "How the base was chosen",
-        keys: "",
-    },
-    Command {
         action: Action::Reload,
         name: "Reload",
         keys: "r",
@@ -112,11 +105,6 @@ pub const COMMANDS: &[Command] = &[
     Command {
         action: Action::CloseLocation,
         name: "Close location",
-        keys: "",
-    },
-    Command {
-        action: Action::PrunePrs,
-        name: "Remove PR checkouts",
         keys: "",
     },
     Command {
@@ -142,12 +130,12 @@ pub const COMMANDS: &[Command] = &[
     Command {
         action: Action::Top,
         name: "Top",
-        keys: "g",
+        keys: "Home",
     },
     Command {
         action: Action::Bottom,
         name: "Bottom",
-        keys: "G",
+        keys: "End",
     },
     Command {
         action: Action::Quit,
