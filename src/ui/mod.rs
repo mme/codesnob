@@ -1080,26 +1080,24 @@ impl App {
                 .find(|(p, _)| p == path)
                 .map(|(_, d)| crate::diff::text_lines(d))
         });
-        // One file shows whole; several show as excerpts around their line
-        // and their highlights.
+        // A file shows whole or as excerpts around its line and highlights,
+        // as asked; unasked, one file shows whole and several as excerpts.
+        // Highlights get a diff's context around them.
         let several = spec.files.len() > 1;
+        let context = self.opts.context;
         let marks = &loc.marks;
         let files = code
             .files
             .into_iter()
             .map(|(path, data)| {
+                let asked = spec.files.iter().find(|f| f.path == path);
                 let mut windows = Vec::new();
-                if several {
-                    let line = spec
-                        .files
-                        .iter()
-                        .find(|f| f.path == path)
-                        .and_then(|f| f.line);
-                    if let Some(l) = line {
+                if asked.and_then(|f| f.excerpts).unwrap_or(several) {
+                    if let Some(l) = asked.and_then(|f| f.line) {
                         windows.push((l.saturating_sub(EXCERPT).max(1), l + EXCERPT));
                     }
                     for m in marks.iter().filter(|m| m.path == path) {
-                        windows.push((m.start.saturating_sub(3).max(1), m.end + 3));
+                        windows.push((m.start.saturating_sub(context).max(1), m.end + context));
                     }
                 }
                 crate::diff::plain(path, &data, &windows)
@@ -1530,7 +1528,7 @@ impl App {
                 rev: None,
                 files: vec![crate::proto::CodeFile {
                     path: rel,
-                    line: None,
+                    ..Default::default()
                 }],
             });
             loc.focus = Focus::All;

@@ -141,6 +141,11 @@ pub struct CodeFile {
     /// Open at this line, marked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
+    /// Show only the line and highlights with a few lines around them
+    /// (true), or the whole file (false). Unset: whole when it is the only
+    /// file, excerpts when there are several.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpts: Option<bool>,
 }
 
 /// A connected viewer. Re-sent in full whenever anything changes; the
