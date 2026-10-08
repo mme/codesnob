@@ -296,27 +296,22 @@ impl Panel {
                 spans.push(Span::styled(format!("{tag} "), style.fg(*color)));
             }
             spans.push(Span::styled(item.text.clone(), style));
+            // Commands show their shortcut right after the name: "Open… [o]".
+            if self.kind == Kind::Commands && !item.hint.is_empty() {
+                spans.push(Span::styled(
+                    format!(" [{}]", item.hint),
+                    style.fg(p.key_fg).add_modifier(Modifier::BOLD),
+                ));
+            }
             buf.set_line(area.x, y, &Line::from(spans), area.width);
-            if !item.hint.is_empty() {
-                // Commands show their shortcut as a keycap; other lists show
-                // plain details such as counts and ages.
-                let (text, hint_style) = if self.kind == Kind::Commands {
-                    (
-                        format!(" {} ", item.hint),
-                        Style::default()
-                            .bg(p.key_bg)
-                            .fg(p.key_fg)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    (item.hint.clone(), style.fg(p.note_fg))
-                };
-                let hw = text.chars().count() as u16;
+            // Other lists show details such as counts and ages on the right.
+            if self.kind != Kind::Commands && !item.hint.is_empty() {
+                let hw = item.hint.chars().count() as u16;
                 if area.width > hw + 12 {
                     buf.set_span(
                         area.right() - hw - 1,
                         y,
-                        &Span::styled(text, hint_style),
+                        &Span::styled(item.hint.clone(), style.fg(p.note_fg)),
                         hw,
                     );
                 }

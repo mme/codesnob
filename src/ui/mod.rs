@@ -42,8 +42,7 @@ const COMMIT_ICON: &str = "\u{f0718}";
 const LOADING_DELAY: Duration = Duration::from_millis(150);
 
 pub struct Palette {
-    /// Keycaps: the shortcuts shown in the palette.
-    pub key_bg: Color,
+    /// Shortcuts in the palette.
     pub key_fg: Color,
     pub add_bg: Color,
     pub add_emph: Color,
@@ -58,7 +57,6 @@ pub struct Palette {
 impl Palette {
     pub fn dark() -> Self {
         Self {
-            key_bg: Color::Rgb(0x3c, 0x41, 0x55),
             key_fg: Color::Cyan,
             add_bg: Color::Rgb(0x12, 0x33, 0x1c),
             add_emph: Color::Rgb(0x1f, 0x6b, 0x2f),
@@ -73,7 +71,6 @@ impl Palette {
 
     pub fn light() -> Self {
         Self {
-            key_bg: Color::Rgb(0xd0, 0xd4, 0xe2),
             key_fg: Color::Blue,
             add_bg: Color::Rgb(0xe2, 0xf5, 0xe6),
             add_emph: Color::Rgb(0xa8, 0xe8, 0xb5),
