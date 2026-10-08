@@ -38,8 +38,8 @@ pub struct DiffView {
     file_starts: Vec<usize>,
     hunk_starts: Vec<usize>,
     gutter_w: usize,
-    /// Narrowed to this file index; `None` shows every file.
-    only: Option<usize>,
+    /// The files shown, by index; empty shows every file.
+    only: Vec<usize>,
     /// The description block: a commit message or PR body, already wrapped.
     desc: Vec<Line<'static>>,
     pub scroll: usize,
@@ -52,7 +52,7 @@ impl DiffView {
             .into_iter()
             .map(|c| diff::build(c, context))
             .collect();
-        self.only = None;
+        self.only.clear();
         self.build_rows();
     }
 
@@ -74,14 +74,33 @@ impl DiffView {
     }
 
     pub fn narrow_to(&mut self, fi: Option<usize>) {
-        if self.only != fi {
-            self.only = fi;
+        let only: Vec<usize> = fi.into_iter().collect();
+        if self.only != only {
+            self.only = only;
             self.build_rows();
         }
     }
 
+    /// Show only the files at `paths`, in diff order. Returns how many of
+    /// them are part of this diff; with none, every file shows.
+    pub fn narrow_to_paths(&mut self, paths: &[String]) -> usize {
+        let only: Vec<usize> = (0..self.files.len())
+            .filter(|&fi| paths.iter().any(|p| *p == self.files[fi].path))
+            .collect();
+        let found = only.len();
+        if self.only != only {
+            self.only = only;
+            self.build_rows();
+        }
+        found
+    }
+
+    /// The one file shown, when narrowed to a single file.
     pub fn narrowed(&self) -> Option<usize> {
-        self.only
+        match self.only.as_slice() {
+            [fi] => Some(*fi),
+            _ => None,
+        }
     }
 
     /// Replace the description block, keeping the diff line in view.
@@ -122,10 +141,21 @@ impl DiffView {
         !self.files.is_empty()
     }
 
+    /// Lines added and removed across the files shown.
     pub fn totals(&self) -> (usize, usize) {
-        self.files
+        self.shown()
             .iter()
+            .map(|&fi| &self.files[fi])
             .fold((0, 0), |(a, r), f| (a + f.added, r + f.removed))
+    }
+
+    /// The indices of the files shown, in diff order.
+    pub fn shown(&self) -> Vec<usize> {
+        if self.only.is_empty() {
+            (0..self.files.len()).collect()
+        } else {
+            self.only.clone()
+        }
     }
 
     fn build_rows(&mut self) {
@@ -137,7 +167,7 @@ impl DiffView {
             self.rows.push(Row::Desc(i));
         }
         for (fi, f) in self.files.iter().enumerate() {
-            if self.only.is_some_and(|o| o != fi) {
+            if !self.only.is_empty() && !self.only.contains(&fi) {
                 continue;
             }
             if !self.rows.is_empty() {

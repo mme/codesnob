@@ -26,6 +26,106 @@ pub enum Range {
     Uncommitted,
     /// One commit against its first parent.
     Commit(ObjectId),
+    /// Any two states, as a comparison like `main...feature` or `staged`.
+    Compare(Side, Side),
+}
+
+/// One side of a comparison.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Side {
+    Rev(ObjectId),
+    /// The staging area.
+    Index,
+    Worktree,
+}
+
+/// What a typed comparison means.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Spec {
+    /// A range to show, with words for it.
+    Range(Range, String),
+    /// A branch or tag on its own: everything since the branch point with it.
+    Base(String),
+}
+
+/// Read a comparison the way git would, in the repository at `dir`:
+/// `worktree`, `staged`, `unstaged`, `a..b` (a against b), `a...b` (b since
+/// it diverged from a), a branch or tag (everything since the branch point
+/// with it), or any other revision (that commit against its parent).
+pub fn parse_spec(dir: &Path, spec: &str) -> Result<Spec> {
+    let repo = gix::discover(dir)
+        .with_context(|| format!("{} is not inside a git repository", dir.display()))?;
+    let s = spec.trim();
+    let head = || commit_of(&repo, "HEAD");
+    let side = |rev: &str| {
+        if rev.is_empty() {
+            head()
+        } else {
+            commit_of(&repo, rev)
+        }
+    };
+    Ok(match s {
+        "" => anyhow::bail!("nothing to compare"),
+        "worktree" => Spec::Range(Range::Uncommitted, "uncommitted changes".to_string()),
+        "staged" => Spec::Range(
+            Range::Compare(Side::Rev(head()?), Side::Index),
+            "staged changes".to_string(),
+        ),
+        "unstaged" => Spec::Range(
+            Range::Compare(Side::Index, Side::Worktree),
+            "unstaged changes".to_string(),
+        ),
+        _ => {
+            if let Some((a, b)) = s.split_once("...") {
+                let (a, b) = (side(a)?, side(b)?);
+                let base = repo
+                    .merge_base(a, b)
+                    .with_context(|| format!("{s}: the two sides share no history"))?
+                    .detach();
+                Spec::Range(Range::Compare(Side::Rev(base), Side::Rev(b)), s.to_string())
+            } else if let Some((a, b)) = s.split_once("..") {
+                Spec::Range(
+                    Range::Compare(Side::Rev(side(a)?), Side::Rev(side(b)?)),
+                    s.to_string(),
+                )
+            } else if s != "HEAD" && repo.try_find_reference(s).ok().flatten().is_some() {
+                Spec::Base(s.to_string())
+            } else {
+                Spec::Range(Range::Commit(commit_of(&repo, s)?), s.to_string())
+            }
+        }
+    })
+}
+
+fn commit_of(repo: &gix::Repository, rev: &str) -> Result<ObjectId> {
+    Ok(repo
+        .rev_parse_single(rev)
+        .with_context(|| format!("cannot resolve {rev:?}"))?
+        .object()?
+        .peel_to_commit()
+        .with_context(|| format!("{rev:?} is not a commit"))?
+        .id)
+}
+
+/// Branch, remote branch and tag names, for completing comparisons.
+pub fn ref_names(dir: &Path) -> Vec<String> {
+    let Ok(repo) = gix::discover(dir) else {
+        return Vec::new();
+    };
+    let Ok(refs) = repo.references() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = refs
+        .all()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|r| r.name().shorten().to_string())
+        .filter(|n| !n.starts_with("refs/") && n != "HEAD" && !n.ends_with("/HEAD"))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +176,8 @@ impl Snapshot {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.head_label.hash(&mut h);
         self.base.commit.hash(&mut h);
+        // A different base on the same commit still changes the words shown.
+        self.base.name.hash(&mut h);
         self.range.hash(&mut h);
         self.dirty.hash(&mut h);
         for c in &self.commits {
@@ -121,7 +223,7 @@ pub fn snapshot(dir: &Path, base_override: Option<&str>, range: &Range) -> Resul
         Some(id) => repo.find_commit(id)?.tree()?,
         None => repo.empty_tree(),
     };
-    let uncommitted = uncommitted_paths(&repo)?;
+    let uncommitted = status_paths(&repo, None, Want::ALL)?;
     let dirty = !uncommitted.is_empty();
 
     let mut commit = None;
@@ -130,9 +232,19 @@ pub fn snapshot(dir: &Path, base_override: Option<&str>, range: &Range) -> Resul
             let base_tree = tree_of(&repo, base.commit)?;
             let mut paths = uncommitted;
             tree_paths(&repo, &base_tree, &head_tree, &mut paths)?;
-            collect(&repo, &paths, &base_tree, &New::Worktree(&workdir))?
+            collect(
+                &repo,
+                &paths,
+                &Reader::Tree(&base_tree),
+                &Reader::Worktree(&workdir),
+            )?
         }
-        Range::Uncommitted => collect(&repo, &uncommitted, &head_tree, &New::Worktree(&workdir))?,
+        Range::Uncommitted => collect(
+            &repo,
+            &uncommitted,
+            &Reader::Tree(&head_tree),
+            &Reader::Worktree(&workdir),
+        )?,
         Range::Commit(id) => {
             let c = repo
                 .find_commit(*id)
@@ -143,7 +255,55 @@ pub fn snapshot(dir: &Path, base_override: Option<&str>, range: &Range) -> Resul
             commit = Some(commit_info(&c));
             let mut paths = BTreeSet::new();
             tree_paths(&repo, &old_tree, &new_tree, &mut paths)?;
-            collect(&repo, &paths, &old_tree, &New::Tree(&new_tree))?
+            collect(
+                &repo,
+                &paths,
+                &Reader::Tree(&old_tree),
+                &Reader::Tree(&new_tree),
+            )?
+        }
+        Range::Compare(from, to) => {
+            let index = repo.index_or_empty()?;
+            let state: &gix::index::State = &index;
+            let tree = |side: &Side| -> Result<Option<gix::Tree<'_>>> {
+                Ok(match side {
+                    Side::Rev(id) => Some(tree_of(&repo, Some(*id))?),
+                    _ => None,
+                })
+            };
+            let (old_tree, new_tree) = (tree(from)?, tree(to)?);
+            let paths = match (from, to, &old_tree, &new_tree) {
+                (Side::Rev(_), Side::Rev(_), Some(a), Some(b)) => {
+                    let mut paths = BTreeSet::new();
+                    tree_paths(&repo, a, b, &mut paths)?;
+                    paths
+                }
+                (Side::Rev(_), Side::Index, Some(a), _) => {
+                    status_paths(&repo, Some(a.id), Want::STAGED)?
+                }
+                (Side::Index, Side::Worktree, ..) => status_paths(&repo, None, Want::UNSTAGED)?,
+                (Side::Rev(_), Side::Worktree, Some(a), _) => {
+                    status_paths(&repo, Some(a.id), Want::ALL)?
+                }
+                _ => anyhow::bail!("cannot compare {from:?} with {to:?}"),
+            };
+            let reader = |side: &Side, tree: &Option<gix::Tree<'_>>| -> Result<Reader<'_>> {
+                Ok(match (side, tree) {
+                    (Side::Rev(_), Some(_)) => unreachable!("trees are read below"),
+                    (Side::Index, _) => Reader::Index(state),
+                    (Side::Worktree, _) => Reader::Worktree(&workdir),
+                    (Side::Rev(_), None) => anyhow::bail!("missing tree"),
+                })
+            };
+            let old = match &old_tree {
+                Some(t) => Reader::Tree(t),
+                None => reader(from, &old_tree)?,
+            };
+            let new = match &new_tree {
+                Some(t) => Reader::Tree(t),
+                None => reader(to, &new_tree)?,
+            };
+            collect(&repo, &paths, &old, &new)?
         }
     };
 
@@ -392,20 +552,60 @@ fn reflog_origin(repo: &gix::Repository) -> Option<String> {
 }
 
 /// Paths where the working tree differs from HEAD: staged, unstaged and untracked.
-fn uncommitted_paths(repo: &gix::Repository) -> Result<BTreeSet<BString>> {
+/// Which parts of `git status` to collect paths from.
+struct Want {
+    /// The tree against the index: staged changes.
+    tree_index: bool,
+    /// The index against the working tree: unstaged changes.
+    index_worktree: bool,
+    untracked: bool,
+}
+
+impl Want {
+    const ALL: Want = Want {
+        tree_index: true,
+        index_worktree: true,
+        untracked: true,
+    };
+    const STAGED: Want = Want {
+        tree_index: true,
+        index_worktree: false,
+        untracked: false,
+    };
+    const UNSTAGED: Want = Want {
+        tree_index: false,
+        index_worktree: true,
+        untracked: false,
+    };
+}
+
+/// Paths `git status` reports, comparing the index with `tree` (HEAD when
+/// `None`) and the working tree with the index.
+fn status_paths(
+    repo: &gix::Repository,
+    tree: Option<ObjectId>,
+    want: Want,
+) -> Result<BTreeSet<BString>> {
     use gix::diff::index::Change as TreeChange;
     use gix::status::Item;
     use gix::status::index_worktree::Item as WtItem;
 
     let mut paths = BTreeSet::new();
-    let platform = repo
+    let mut platform = repo
         .status(gix::progress::Discard)?
-        .untracked_files(gix::status::UntrackedFiles::Files)
+        .untracked_files(if want.untracked {
+            gix::status::UntrackedFiles::Files
+        } else {
+            gix::status::UntrackedFiles::None
+        })
         .index_worktree_rewrites(None)
         .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
+    if let Some(tree) = tree {
+        platform = platform.head_tree(tree);
+    }
     for item in platform.into_iter(Vec::<BString>::new())? {
         match item? {
-            Item::TreeIndex(change) => match change {
+            Item::TreeIndex(change) if want.tree_index => match change {
                 TreeChange::Addition { location, .. }
                 | TreeChange::Deletion { location, .. }
                 | TreeChange::Modification { location, .. } => {
@@ -420,24 +620,26 @@ fn uncommitted_paths(repo: &gix::Repository) -> Result<BTreeSet<BString>> {
                     paths.insert(location.into_owned());
                 }
             },
-            Item::IndexWorktree(item) => match &item {
-                WtItem::DirectoryContents { entry, .. } => {
-                    if entry.status == gix::dir::entry::Status::Untracked {
-                        paths.insert(entry.rela_path.clone());
-                    }
+            Item::IndexWorktree(item) if want.index_worktree || want.untracked => match &item {
+                WtItem::DirectoryContents { entry, .. }
+                    if want.untracked && entry.status == gix::dir::entry::Status::Untracked =>
+                {
+                    paths.insert(entry.rela_path.clone());
                 }
-                WtItem::Modification { rela_path, .. } => {
+                WtItem::Modification { rela_path, .. } if want.index_worktree => {
                     paths.insert(rela_path.clone());
                 }
                 WtItem::Rewrite {
                     source,
                     dirwalk_entry,
                     ..
-                } => {
+                } if want.index_worktree => {
                     paths.insert(source.rela_path().to_owned());
                     paths.insert(dirwalk_entry.rela_path.clone());
                 }
+                _ => {}
             },
+            _ => {}
         }
     }
     Ok(paths)
@@ -496,10 +698,35 @@ fn tree_paths(
     Ok(())
 }
 
-/// The new side of a range.
-enum New<'a> {
-    Worktree(&'a Path),
+/// Where one side of a comparison reads file contents from.
+enum Reader<'a> {
     Tree(&'a gix::Tree<'a>),
+    Index(&'a gix::index::State),
+    Worktree(&'a Path),
+}
+
+impl Reader<'_> {
+    /// The file at `path` on this side, with its blob id when known.
+    fn read(
+        &self,
+        repo: &gix::Repository,
+        path: &BString,
+    ) -> Result<Option<(Option<ObjectId>, Vec<u8>)>> {
+        Ok(match self {
+            Reader::Tree(tree) => blob_at(repo, tree, path)?.map(|(id, d)| (Some(id), d)),
+            Reader::Index(state) => match state.entry_by_path(path.as_bstr()) {
+                Some(e) if e.mode != gix::index::entry::Mode::COMMIT => {
+                    let id = e.id;
+                    Some((Some(id), repo.find_blob(id)?.take_data()))
+                }
+                _ => None,
+            },
+            Reader::Worktree(workdir) => {
+                read_worktree(&workdir.join(gix::path::from_bstr(path.as_bstr())))
+                    .map(|d| (None, d))
+            }
+        })
+    }
 }
 
 /// A blob or symlink at `path` in `tree`, with its id.
@@ -526,9 +753,10 @@ fn blob_at(
 fn collect(
     repo: &gix::Repository,
     paths: &BTreeSet<BString>,
-    old_tree: &gix::Tree<'_>,
-    new: &New<'_>,
+    old_side: &Reader<'_>,
+    new_side: &Reader<'_>,
 ) -> Result<Vec<FileChange>> {
+    let hash_kind = repo.object_hash();
     struct Side {
         path: String,
         old: Option<(ObjectId, Vec<u8>)>,
@@ -536,13 +764,15 @@ fn collect(
     }
     let mut entries: Vec<Side> = Vec::new();
     for path in paths {
-        let old = blob_at(repo, old_tree, path)?;
-        let new = match new {
-            New::Worktree(workdir) => {
-                read_worktree(&workdir.join(gix::path::from_bstr(path.as_bstr())))
-            }
-            New::Tree(tree) => blob_at(repo, tree, path)?.map(|(_, data)| data),
-        };
+        // The old side's id pairs renames; a working-tree file has none yet.
+        let old = old_side.read(repo, path)?.map(|(id, d)| {
+            let id = id.unwrap_or_else(|| {
+                gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &d)
+                    .unwrap_or_else(|_| ObjectId::null(hash_kind))
+            });
+            (id, d)
+        });
+        let new = new_side.read(repo, path)?.map(|(_, d)| d);
         let same = match (&old, &new) {
             (None, None) => true,
             (Some((_, a)), Some(b)) => a == b,
@@ -559,7 +789,6 @@ fn collect(
     }
 
     // Pair exact renames: a deleted blob whose content reappears under a new path.
-    let hash_kind = repo.object_hash();
     let mut deleted_by_id: HashMap<ObjectId, Vec<usize>> = HashMap::new();
     for (i, e) in entries.iter().enumerate() {
         if let (Some((id, _)), None) = (&e.old, &e.new) {
@@ -699,6 +928,48 @@ mod tests {
         assert_eq!(paths(&two), ["a.txt", "gone.txt"]);
         assert_eq!(two.commit.as_ref().unwrap().subject, "two");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn comparisons_read_like_git() {
+        let dir = branch_with_history("spec");
+        git(&dir, &["add", "b.txt"]);
+        let range = |spec: &str| match parse_spec(&dir, spec).unwrap() {
+            Spec::Range(r, _) => r,
+            Spec::Base(b) => panic!("{spec} became base {b}"),
+        };
+        let files = |r: Range| paths(&snapshot(&dir, None, &r).unwrap());
+
+        assert_eq!(files(range("staged")), ["b.txt"]);
+        assert_eq!(
+            files(range("unstaged")),
+            Vec::<String>::new(),
+            "b.txt is fully staged"
+        );
+        std::fs::write(dir.join("a.txt"), "a changed again\n").unwrap();
+        assert_eq!(files(range("unstaged")), ["a.txt"]);
+        assert_eq!(range("worktree"), Range::Uncommitted);
+        assert_eq!(
+            files(range("main..feature")),
+            ["a.txt", "gone.txt", "src/deep/one.rs"]
+        );
+        assert_eq!(
+            files(range("feature...main")),
+            Vec::<String>::new(),
+            "main has nothing new"
+        );
+        assert!(
+            matches!(range("HEAD~1"), Range::Commit(_)),
+            "a revision is one commit"
+        );
+        assert!(matches!(range("HEAD"), Range::Commit(_)));
+        assert_eq!(
+            parse_spec(&dir, "main").unwrap(),
+            Spec::Base("main".to_string())
+        );
+        assert!(parse_spec(&dir, "no-such-thing").is_err());
+        assert!(ref_names(&dir).contains(&"main".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

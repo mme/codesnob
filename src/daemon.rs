@@ -300,6 +300,7 @@ fn handle(
             dir,
             base,
             workspace,
+            view,
         } => {
             let repo = gix::discover(&dir).is_ok();
             let target = Target { dir, base, repo };
@@ -327,6 +328,7 @@ fn handle(
             st.broadcast(Event::Show {
                 viewer: result.viewer.clone(),
                 target,
+                view,
             });
             json!(result)
         }

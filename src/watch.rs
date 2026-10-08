@@ -27,6 +27,8 @@ pub enum Msg {
     },
     /// The daemon asks this viewer to display a target.
     Show(crate::proto::Target),
+    /// An agent asks this viewer to show something particular in a target.
+    View(crate::proto::Target, Box<crate::proto::ViewSpec>),
     /// Daemon link went up or down.
     Link(bool),
     /// How location `loc`'s watcher ended up detecting changes.

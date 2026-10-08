@@ -23,6 +23,8 @@ upgrades in place. `CODESNOB_VERSION=v0.1.0` pins a version.
 ```
 codesnob [PATH]        open the viewer (default: current directory)
 codesnob show PATH     show PATH in the viewer on your workspace
+  --range R             what to compare: main...feature, HEAD~3..HEAD, a commit,
+                        worktree, staged, unstaged, or a PR
 codesnob status        list connected viewers and their workspaces
 codesnob mcp           MCP server over stdio, for agents
 codesnob prune         remove PR checkouts no viewer has open
@@ -39,7 +41,7 @@ need to start:
 
 | Key | Does |
 |---|---|
-| `o` | open a path, or a PR: `#123`, `owner/repo#123` or its URL |
+| `o` | open a path, a PR (`#123`, `owner/repo#123`, a URL), or a comparison (`main...feature`, `HEAD~3`, `staged`) |
 | `c` | the branch's commits; moving through the list previews each one |
 | Alt-↑ Alt-↓ | older and newer commit, directly |
 | `u` | only the uncommitted changes, and back |

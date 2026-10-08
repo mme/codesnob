@@ -143,10 +143,18 @@ fn session(tx: &Sender<Msg>, link: &Link) -> Result<(), String> {
         if n == 0 {
             return Err("daemon closed".to_string());
         }
-        if let Ok(ServerFrame::Event(Event::Show { viewer, target })) = ServerFrame::parse(&line)
+        if let Ok(ServerFrame::Event(Event::Show {
+            viewer,
+            target,
+            view,
+        })) = ServerFrame::parse(&line)
             && viewer == my_id
         {
-            tx.send(Msg::Show(target)).map_err(|_| "ui gone")?;
+            let msg = match view {
+                Some(view) => Msg::View(target, Box::new(view)),
+                None => Msg::Show(target),
+            };
+            tx.send(msg).map_err(|_| "ui gone")?;
         }
     }
 }
@@ -155,19 +163,22 @@ fn session(tx: &Sender<Msg>, link: &Link) -> Result<(), String> {
 pub fn request_show(
     client: &mut proto::Client,
     dir: PathBuf,
-    base: Option<String>,
+    view: Option<proto::ViewSpec>,
 ) -> Result<proto::ShowResult, String> {
     let workspace = wm::own_workspace();
     let v = client.call(Method::Show {
         dir,
-        base,
+        base: None,
         workspace,
+        view,
     })?;
     serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
 pub fn describe(r: &proto::ShowResult) -> String {
-    let ws = r.workspace.as_deref().unwrap_or("unknown workspace");
+    let Some(ws) = r.workspace.as_deref() else {
+        return format!("shown in viewer {}", r.viewer);
+    };
     match r.picked_by.as_str() {
         "same" => format!("shown in viewer {} on your workspace {ws}", r.viewer),
         "nearest" => format!(
@@ -191,10 +202,14 @@ pub fn connect() -> Result<proto::Client, String> {
     one_shot()
 }
 
-/// `codesnob show PATH`: display in the best viewer and report.
-pub fn show(dir: PathBuf, base: Option<String>) -> Result<(), String> {
+/// `codesnob show PATH [--range R]`: display in the best viewer and report.
+pub fn show(dir: PathBuf, range: Option<String>) -> Result<(), String> {
     let mut client = one_shot()?;
-    let r = request_show(&mut client, dir.clone(), base)?;
+    let view = range.map(|r| proto::ViewSpec {
+        range: Some(r),
+        ..Default::default()
+    });
+    let r = request_show(&mut client, dir.clone(), view)?;
     if !r.repo {
         eprintln!(
             "codesnob: {} is not inside a git repository",
