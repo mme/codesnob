@@ -1523,11 +1523,16 @@ impl App {
             base: None,
             repo: true,
         });
+        self.show_file(None, rel);
+    }
+
+    /// Show one file of the current location, as it is or as of `rev`.
+    fn show_file(&mut self, rev: Option<String>, path: String) {
         if let Some(loc) = self.cur_mut() {
             loc.code = Some(crate::proto::CodeSpec {
-                rev: None,
+                rev,
                 files: vec![crate::proto::CodeFile {
-                    path: rel,
+                    path,
                     ..Default::default()
                 }],
             });
@@ -1869,6 +1874,26 @@ impl App {
         {
             self.close_panel(false);
             self.open_file(file);
+            return;
+        }
+        // A file as of a revision, in git's syntax: main:src/diff.rs.
+        if let Some((rev, path)) = input.split_once(':')
+            && !rev.is_empty()
+            && !path.is_empty()
+            && let Some(dir) = self.cur().filter(|l| l.repo).map(|l| l.dir.clone())
+        {
+            let path = path.trim_start_matches("./").to_string();
+            match git::read_code(&dir, Some(rev), std::slice::from_ref(&path)) {
+                Ok(_) => {
+                    self.close_panel(false);
+                    self.show_file(Some(rev.to_string()), path);
+                }
+                Err(e) => {
+                    if let Some(p) = self.panel.as_mut() {
+                        p.note = Some(format!("{e:#}"));
+                    }
+                }
+            }
             return;
         }
         let typed = (!input.is_empty()).then(|| self.resolve_path(input));
