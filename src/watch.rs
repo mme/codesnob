@@ -348,6 +348,9 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         drop(handle);
         std::thread::sleep(Duration::from_millis(300));
+        // FSEvents can still report the fixture's own setup writes shortly
+        // after the watcher starts; those were sent before the drop.
+        while rx.try_recv().is_ok() {}
         std::fs::write(dir.join("tracked.txt"), "after\n").unwrap();
         assert!(
             !changed(&rx, Duration::from_millis(1500)),
