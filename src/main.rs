@@ -74,6 +74,28 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// List the marks on a location in the viewer: the agent's highlights
+    /// and the user's comments, which count as read afterwards.
+    Review {
+        /// The location, as the viewer names it (L3); default: the one on screen.
+        #[arg(long)]
+        location: Option<String>,
+        /// Print the raw JSON reply.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove marks from a location in the viewer.
+    Clear {
+        /// The location, as the viewer names it (L3); default: the one on screen.
+        #[arg(long)]
+        location: Option<String>,
+        /// Which marks: the agent's highlights (mine), the user's comments
+        /// (user), or every mark (all). Default: mine.
+        #[arg(long, value_parser = ["mine", "user", "all"])]
+        which: Option<String>,
+        /// Letters of the marks to remove instead, e.g. C D.
+        letters: Vec<String>,
+    },
     /// Run the daemon in the foreground (it normally starts on demand).
     Daemon,
     /// Serve the Model Context Protocol over stdio for AI agents.
@@ -95,6 +117,17 @@ fn main() -> Result<()> {
             return link::show(dir, range).map_err(|e| anyhow::anyhow!(e));
         }
         Some(Cmd::Status { json }) => return link::status(json).map_err(|e| anyhow::anyhow!(e)),
+        Some(Cmd::Review { location, json }) => {
+            return link::review(location, json).map_err(|e| anyhow::anyhow!(e));
+        }
+        Some(Cmd::Clear {
+            location,
+            which,
+            letters,
+        }) => {
+            let which = which.unwrap_or_else(|| "mine".to_string());
+            return link::clear(location, which, letters).map_err(|e| anyhow::anyhow!(e));
+        }
         Some(Cmd::Mcp) => return mcp::serve(),
         Some(Cmd::Prune) => {
             let Some(cache) = pr::default_cache() else {

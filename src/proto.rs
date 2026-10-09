@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_SOCKET_PATH: usize = 100;
 
@@ -94,9 +94,225 @@ pub struct ViewSpec {
     /// Show files as they are instead of a diff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<CodeSpec>,
-    /// Line ranges to highlight, numbered in this order.
+    /// Line ranges to highlight, lettered in this order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub highlights: Vec<HighlightSpec>,
+    /// Add the files and highlights to what the location shows, keeping
+    /// every mark, instead of replacing the view.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub append: bool,
+}
+
+/// What an agent asks a viewer, through the daemon, besides showing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ViewerQuery {
+    /// Every mark on a location, with the user's comments; the comments
+    /// count as read afterwards.
+    Review {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<String>,
+    },
+    /// Remove marks: `letters` names them, else `which` of "mine" (the
+    /// agent's highlights), "user" or "all".
+    ClearMarks {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<String>,
+        which: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        letters: Vec<String>,
+    },
+}
+
+/// A mark as reported to an agent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkInfo {
+    pub label: String,
+    /// "agent" or "user".
+    pub author: String,
+    pub path: String,
+    pub start: usize,
+    pub end: usize,
+    /// The lines are the old side's: deleted lines.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub old_side: bool,
+    /// Deleted lines were among those marked, with others.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub with_deletions: bool,
+    /// Its lines are nowhere to be found since the last load.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
+    /// A comment the agent has not read yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub new: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// The marked code, as it was when the mark was made.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<String>,
+}
+
+/// The most code lines a mark is reported with.
+pub const MAX_MARK_LINES: usize = 12;
+
+impl MarkInfo {
+    pub fn lines_word(&self) -> String {
+        let side = if self.old_side { "old " } else { "" };
+        if self.start == self.end {
+            format!("{side}{}", self.start)
+        } else {
+            format!("{side}{}-{}", self.start, self.end)
+        }
+    }
+
+    /// One line, plus the code for the user's comments.
+    pub fn render(&self) -> String {
+        let kind = if self.author == "user" {
+            "comment"
+        } else {
+            "highlight"
+        };
+        let mut flags = Vec::new();
+        if self.new {
+            flags.push("new");
+        }
+        if self.stale {
+            flags.push("stale");
+        }
+        if self.with_deletions {
+            flags.push("includes deleted lines");
+        }
+        let flags = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", flags.join(", "))
+        };
+        let mut out = format!(
+            "[{}] {kind} {} {}{flags}",
+            self.label,
+            self.path,
+            self.lines_word()
+        );
+        match &self.text {
+            Some(t) if !t.is_empty() => {
+                out.push_str(": ");
+                out.push_str(t);
+            }
+            _ => {}
+        }
+        if self.author == "user" {
+            let w = self.end.to_string().len();
+            for (i, line) in self.lines.iter().take(MAX_MARK_LINES).enumerate() {
+                out.push_str(&format!("\n    {:>w$} | {line}", self.start + i));
+            }
+            if self.lines.len() > MAX_MARK_LINES {
+                out.push_str(&format!(
+                    "\n    … {} more lines",
+                    self.lines.len() - MAX_MARK_LINES
+                ));
+            }
+        }
+        out
+    }
+}
+
+/// What a viewer answers `get_review` with.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewResult {
+    /// "L3": the location's id in that viewer.
+    pub location: String,
+    pub dir: PathBuf,
+    /// What the location shows, in words.
+    pub showing: String,
+    pub marks: Vec<MarkInfo>,
+    /// Comments the agent had not read before this.
+    pub unread: usize,
+}
+
+impl ReviewResult {
+    pub fn render(&self) -> String {
+        let mut out = format!(
+            "{} {} · {}",
+            self.location,
+            self.dir.display(),
+            self.showing
+        );
+        if self.marks.is_empty() {
+            out.push_str("\nno marks");
+            return out;
+        }
+        let comments = self.marks.iter().filter(|m| m.author == "user").count();
+        out.push_str(&format!(
+            "\n{} mark{}, {comments} comment{} by the user{}",
+            self.marks.len(),
+            if self.marks.len() == 1 { "" } else { "s" },
+            if comments == 1 { "" } else { "s" },
+            match self.unread {
+                0 => String::new(),
+                n => format!(", {n} new"),
+            }
+        ));
+        for m in &self.marks {
+            out.push('\n');
+            out.push_str(&m.render());
+        }
+        out
+    }
+}
+
+/// What a viewer answers a show request with, once it has applied it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShowAck {
+    pub location: String,
+    pub dir: PathBuf,
+    /// The highlights the call placed, with their letters.
+    pub marks: Vec<MarkInfo>,
+    /// The user's comments the agent has not read.
+    pub unread: usize,
+    /// Whether the view changed now, or waits for the user.
+    pub applied: bool,
+}
+
+/// What a viewer answers `clear_marks` with.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClearResult {
+    pub location: String,
+    pub cleared: Vec<String>,
+    pub remaining: usize,
+    pub unread: usize,
+}
+
+impl ClearResult {
+    pub fn render(&self) -> String {
+        let what = if self.cleared.is_empty() {
+            "nothing to clear".to_string()
+        } else {
+            format!(
+                "cleared {}",
+                self.cleared
+                    .iter()
+                    .map(|l| format!("[{l}]"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        format!(
+            "{what} on {}; {} mark{} remain{}",
+            self.location,
+            self.remaining,
+            if self.remaining == 1 { "" } else { "s" },
+            if self.remaining == 1 { "s" } else { "" }
+        )
+    }
+}
+
+/// The agent's nudge about comments it has not read, for every reply.
+pub fn unread_note(location: &str, unread: usize) -> String {
+    match unread {
+        0 => String::new(),
+        1 => format!("; the user has 1 unread comment on {location}, call get_review"),
+        n => format!("; the user has {n} unread comments on {location}, call get_review"),
+    }
 }
 
 /// The most highlights one call can place.
@@ -198,6 +414,18 @@ pub enum Method {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         view: Option<ViewSpec>,
     },
+    /// Ask the viewer picked as for `Show` something, and relay its answer.
+    Query {
+        #[serde(default)]
+        workspace: Option<String>,
+        query: ViewerQuery,
+    },
+    /// A viewer's answer to a `Show` or `Query` event, by the event's id.
+    #[serde(rename = "viewer.reply")]
+    ViewerReply {
+        id: String,
+        result: Value,
+    },
     Status,
     Subscribe,
     #[serde(rename = "viewer.register")]
@@ -243,6 +471,9 @@ pub struct ShowResult {
     pub workspace: Option<String>,
     /// How the viewer was chosen: "same", "nearest" or "first".
     pub picked_by: String,
+    /// What the viewer made of it; `None` when it did not answer in time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack: Option<ShowAck>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -254,12 +485,21 @@ pub struct StatusResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", content = "params", rename_all = "snake_case")]
 pub enum Event {
-    /// Addressed to one viewer; others ignore it.
+    /// Addressed to one viewer; others ignore it. The viewer answers with
+    /// `viewer.reply` under `id` when there is one.
     Show {
         viewer: String,
         target: Target,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         view: Option<ViewSpec>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// A question for one viewer, answered with `viewer.reply` under `id`.
+    Query {
+        viewer: String,
+        id: String,
+        query: ViewerQuery,
     },
     ViewerConnected(ViewerEntry),
     ViewerUpdated(ViewerEntry),
@@ -391,7 +631,109 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::letter;
+    use super::*;
+
+    #[test]
+    fn a_review_renders_one_line_per_mark_with_the_commented_code() {
+        let r = ReviewResult {
+            location: "L3".to_string(),
+            dir: PathBuf::from("/work/repo"),
+            showing: "src/x.rs · working tree".to_string(),
+            marks: vec![
+                MarkInfo {
+                    label: "A".to_string(),
+                    author: "agent".to_string(),
+                    path: "src/x.rs".to_string(),
+                    start: 40,
+                    end: 46,
+                    text: Some("the loop".to_string()),
+                    ..Default::default()
+                },
+                MarkInfo {
+                    label: "C".to_string(),
+                    author: "user".to_string(),
+                    path: "src/x.rs".to_string(),
+                    start: 42,
+                    end: 43,
+                    new: true,
+                    with_deletions: true,
+                    text: Some("rename this".to_string()),
+                    lines: vec!["let a = 1;".to_string(), "let b = 2;".to_string()],
+                    ..Default::default()
+                },
+                MarkInfo {
+                    label: "D".to_string(),
+                    author: "user".to_string(),
+                    path: "src/y.rs".to_string(),
+                    start: 7,
+                    end: 7,
+                    old_side: true,
+                    stale: true,
+                    text: Some(String::new()),
+                    ..Default::default()
+                },
+            ],
+            unread: 1,
+        };
+        let text = r.render();
+        assert_eq!(
+            text,
+            "L3 /work/repo · src/x.rs · working tree\n\
+             3 marks, 2 comments by the user, 1 new\n\
+             [A] highlight src/x.rs 40-46: the loop\n\
+             [C] comment src/x.rs 42-43 (new, includes deleted lines): rename this\n    \
+             42 | let a = 1;\n    \
+             43 | let b = 2;\n\
+             [D] comment src/y.rs old 7 (stale)"
+        );
+    }
+
+    #[test]
+    fn long_comments_show_twelve_lines_and_say_how_many_more() {
+        let m = MarkInfo {
+            label: "B".to_string(),
+            author: "user".to_string(),
+            path: "a.txt".to_string(),
+            start: 1,
+            end: 20,
+            lines: (1..=20).map(|i| format!("l{i}")).collect(),
+            ..Default::default()
+        };
+        let text = m.render();
+        assert!(
+            text.contains("12 | l12") && !text.contains("13 | l13"),
+            "{text}"
+        );
+        assert!(text.ends_with("… 8 more lines"), "{text}");
+    }
+
+    #[test]
+    fn empty_reviews_and_clears_say_so() {
+        let r = ReviewResult {
+            location: "L1".to_string(),
+            dir: PathBuf::from("/r"),
+            showing: "all".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(r.render(), "L1 /r · all\nno marks");
+        let c = ClearResult {
+            location: "L1".to_string(),
+            cleared: vec!["C".to_string(), "D".to_string()],
+            remaining: 1,
+            unread: 0,
+        };
+        assert_eq!(c.render(), "cleared [C] [D] on L1; 1 mark remains");
+        let c = ClearResult {
+            location: "L1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(c.render(), "nothing to clear on L1; 0 marks remain");
+        assert_eq!(
+            unread_note("L1", 2),
+            "; the user has 2 unread comments on L1, call get_review"
+        );
+        assert_eq!(unread_note("L1", 0), "");
+    }
 
     #[test]
     fn letters_go_on_like_spreadsheet_columns() {

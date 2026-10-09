@@ -23,10 +23,20 @@ pub enum Msg {
         seq: u64,
         result: Box<Result<crate::loader::Load, String>>,
     },
-    /// The daemon asks this viewer to display a target.
-    Show(crate::proto::Target),
+    /// The daemon asks this viewer to display a target; `reply` is the id
+    /// to answer under, when the daemon waits for one.
+    Show(crate::proto::Target, Option<String>),
     /// An agent asks this viewer to show something particular in a target.
-    View(crate::proto::Target, Box<crate::proto::ViewSpec>),
+    View(
+        crate::proto::Target,
+        Box<crate::proto::ViewSpec>,
+        Option<String>,
+    ),
+    /// An agent asks this viewer something, to answer under `id`.
+    Query {
+        id: String,
+        query: crate::proto::ViewerQuery,
+    },
     /// Daemon link went up or down.
     Link(bool),
     /// How location `loc`'s watcher ended up detecting changes.

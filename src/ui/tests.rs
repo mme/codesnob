@@ -72,7 +72,7 @@ impl Harness {
         let mut h = Self {
             app,
             rx,
-            term: Terminal::new(TestBackend::new(100, 30)).unwrap(),
+            term: Terminal::new(TestBackend::new(120, 30)).unwrap(),
             scratch: Vec::new(),
         };
         h.settle();
@@ -1033,11 +1033,14 @@ fn leaving_a_location_mid_preview_puts_its_range_back() {
     let b = small_repo("ui-show-preview-b");
     let mut h = Harness::open(&a);
     h.keys("c<down>");
-    h.app.dispatch(Msg::Show(Target {
-        dir: b.clone(),
-        base: None,
-        repo: true,
-    }));
+    h.app.dispatch(Msg::Show(
+        Target {
+            dir: b.clone(),
+            base: None,
+            repo: true,
+        },
+        None,
+    ));
     h.settle();
     h.keys("-");
     assert_eq!(h.app.cur().unwrap().dir, a);
@@ -2005,6 +2008,183 @@ fn a_comment_follows_its_lines_through_an_edit() {
     std::fs::write(dir.join("src/long.rs"), body).unwrap();
     wait_until(&mut h, &|h| h.app.cur().unwrap().marks[0].start == 11);
     assert!(h.screen().contains("[A] you: here"), "{}", h.screen());
+    cleanup(dir);
+}
+
+#[test]
+fn an_agents_call_is_answered_with_letters_location_and_unread_count() {
+    let dir = repo_with_long_file("ui-ack");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![
+        hl("src/long.rs", 30, 30, Some("later")),
+        hl("src/long.rs", 10, 11, None),
+    ];
+    let ack = h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    assert_eq!(ack.location, "L1");
+    assert_eq!(ack.dir, dir);
+    let letters: Vec<(String, usize)> = ack
+        .marks
+        .iter()
+        .map(|m| (m.label.clone(), m.start))
+        .collect();
+    assert_eq!(
+        letters,
+        [("A".to_string(), 10), ("B".to_string(), 30)],
+        "lettered by position, as the viewer shows them"
+    );
+    assert!(ack.applied && ack.unread == 0);
+    assert!(h.status().contains("L1  ·"), "{}", h.status());
+
+    h.keys("jjjjj<enter>hm<enter>k");
+    assert!(h.status().contains("1 yours (1 unread)"), "{}", h.status());
+    let ack = h
+        .app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    assert_eq!(ack.unread, 1, "the reply nudges the agent");
+    assert!(ack.marks.is_empty());
+    cleanup(dir);
+}
+
+#[test]
+fn get_review_lists_every_mark_and_counts_comments_as_read() {
+    let dir = repo_with_long_file("ui-review");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![hl("src/long.rs", 20, 22, Some("the loop"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    h.keys("jjj<enter>needs a name<enter>");
+    let r = h.app.review(None).unwrap();
+    assert_eq!((r.location.as_str(), r.unread), ("L1", 1));
+    assert_eq!(r.dir, dir);
+    assert_eq!(r.showing, "src/long.rs · working tree");
+    assert_eq!(r.marks.len(), 2);
+    let a = &r.marks[0];
+    assert_eq!(
+        (a.label.as_str(), a.author.as_str(), a.start, a.end),
+        ("A", "agent", 20, 22)
+    );
+    assert_eq!(a.text.as_deref(), Some("the loop"));
+    assert!(a.lines.is_empty(), "no code for the agent's own highlights");
+    let b = &r.marks[1];
+    assert_eq!(
+        (b.label.as_str(), b.author.as_str(), b.start, b.end),
+        ("B", "user", 23, 23)
+    );
+    assert!(b.new, "not read before");
+    assert_eq!(b.lines, ["// line 23"]);
+    assert_eq!(b.text.as_deref(), Some("needs a name"));
+    let text = r.render();
+    assert!(
+        text.contains("[B] comment src/long.rs 23 (new): needs a name\n    23 | // line 23"),
+        "{text}"
+    );
+
+    // Read once, a comment stays until edited.
+    let r = h.app.review(Some("L1")).unwrap();
+    assert!(!r.marks[1].new && r.unread == 0, "{r:?}");
+    assert!(!h.status().contains("unread"), "{}", h.status());
+    h.keys("<");
+    h.keys("jjje<c-u>better name<enter>");
+    let r = h.app.review(None).unwrap();
+    assert!(
+        r.marks[1].new && r.unread == 1,
+        "an edit makes it new again: {r:?}"
+    );
+
+    let err = h.app.review(Some("L9")).unwrap_err();
+    assert_eq!(err, "no location L9 in this viewer");
+    let err = h.app.review(Some("nine")).unwrap_err();
+    assert!(err.contains("look like L3"), "{err}");
+    cleanup(dir);
+}
+
+#[test]
+fn clear_marks_takes_letters_or_an_author() {
+    let dir = repo_with_long_file("ui-clear");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![
+        hl("src/long.rs", 10, 10, Some("a")),
+        hl("src/long.rs", 20, 20, Some("b")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    h.keys("jj<enter>one<enter>");
+    h.keys("jjjjj<enter>two<enter>");
+    let r = h.app.clear_marks(None, "mine", &["c".to_string()]).unwrap();
+    assert_eq!(r.cleared, ["C"]);
+    assert_eq!((r.remaining, r.unread), (3, 1));
+    assert!(h.status().contains("agent cleared [C]"), "{}", h.status());
+    assert!(!h.screen().contains("[C] you"), "{}", h.screen());
+    let err = h
+        .app
+        .clear_marks(None, "mine", &["Z".to_string()])
+        .unwrap_err();
+    assert_eq!(err, "no mark [Z] on L1");
+    let r = h.app.clear_marks(None, "mine", &[]).unwrap();
+    assert_eq!(r.cleared, ["A", "B"]);
+    assert!(h.screen().contains("[D] you: two") && !h.screen().contains("[A] a"));
+    let r = h.app.clear_marks(Some("L1"), "user", &[]).unwrap();
+    assert_eq!(
+        (r.cleared.as_slice(), r.remaining),
+        (["D".to_string()].as_slice(), 0)
+    );
+    let r = h.app.clear_marks(None, "all", &[]).unwrap();
+    assert!(r.cleared.is_empty());
+    cleanup(dir);
+}
+
+#[test]
+fn append_adds_files_and_keeps_every_mark() {
+    let dir = repo_with_long_file("ui-append");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![hl("src/long.rs", 10, 10, Some("first"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    h.keys("jjj<enter>mine<enter>");
+    let mut spec = code(None, &[("a.txt", None)]);
+    spec.highlights = vec![hl("a.txt", 1, 1, Some("second"))];
+    spec.append = true;
+    let ack = h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    assert_eq!(ack.marks[0].label, "C");
+    assert!(
+        screen.contains("[A] first")
+            && screen.contains("[B] you: mine")
+            && screen.contains("[C] second"),
+        "every mark stays and the new file joins:\n{screen}"
+    );
+    assert!(
+        h.status().starts_with("2 files · working tree"),
+        "{}",
+        h.status()
+    );
+
+    // Without append the next call replaces the view and the agent's marks.
+    let mut spec = code(None, &[("a.txt", None)]);
+    spec.highlights = vec![hl("a.txt", 1, 1, Some("third"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen.contains("[D] third") && !screen.contains("[C]"),
+        "{screen}"
+    );
+    assert_eq!(
+        h.app.cur().unwrap().marks.len(),
+        2,
+        "the user's comment stays, off screen"
+    );
     cleanup(dir);
 }
 

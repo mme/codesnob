@@ -239,9 +239,34 @@ struct LocMark {
     old_side: bool,
     /// Deleted lines were among those commented on, with others.
     with_deletions: bool,
+    /// An agent has read it since it was made or last edited. Highlights
+    /// are the agent's own, so they start read.
+    seen: bool,
 }
 
 impl LocMark {
+    /// As reported to an agent.
+    fn info(&self) -> crate::proto::MarkInfo {
+        let user = self.author == diffview::Author::User;
+        crate::proto::MarkInfo {
+            label: self.label.clone(),
+            author: if user { "user" } else { "agent" }.to_string(),
+            path: self.path.clone(),
+            start: self.start,
+            end: self.end,
+            old_side: self.old_side,
+            with_deletions: self.with_deletions,
+            stale: self.stale,
+            new: user && !self.seen,
+            text: self.note.clone(),
+            lines: if user {
+                self.text.clone().unwrap_or_default()
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
     fn drawn(&self) -> diffview::Mark {
         diffview::Mark {
             path: self.path.clone(),
@@ -365,8 +390,22 @@ impl Location {
             stale: false,
             old_side: false,
             with_deletions: false,
+            seen: author == diffview::Author::Agent,
         });
         self.marks.last_mut().expect("just pushed")
+    }
+
+    /// "L3": how agents name this location.
+    fn label(&self) -> String {
+        format!("L{}", self.id)
+    }
+
+    /// Comments no agent has read.
+    fn unread(&self) -> usize {
+        self.marks
+            .iter()
+            .filter(|m| m.author == diffview::Author::User && !m.seen)
+            .count()
     }
 
     /// The user's comments here.
@@ -1397,8 +1436,26 @@ impl App {
                 }
             }
             Msg::Loaded { loc, seq, result } => self.apply_loaded(loc, seq, *result),
-            Msg::Show(target) => self.open(target),
-            Msg::View(target, view) => self.show_view(target, *view),
+            Msg::Show(target, reply) => {
+                self.open(target);
+                if let Some(id) = reply {
+                    let ack = self.ack(Vec::new());
+                    self.link.reply(id, serde_json::json!(ack));
+                }
+            }
+            Msg::View(target, view, reply) => {
+                let ack = self.show_view(target, *view);
+                if let Some(id) = reply {
+                    self.link.reply(id, serde_json::json!(ack));
+                }
+            }
+            Msg::Query { id, query } => {
+                let result = match self.answer(query) {
+                    Ok(v) => v,
+                    Err(e) => serde_json::json!({ "error": e }),
+                };
+                self.link.reply(id, result);
+            }
             Msg::Link(up) => self.linked = up,
             Msg::Pr { loc, progress } => self.apply_pr(loc, *progress),
             Msg::Watching { loc, mode } => {
@@ -1779,13 +1836,38 @@ impl App {
 
     /// An agent's view: update the location for that checkout in place, or
     /// open one, remembering what was on screen so Esc can go back to it.
-    pub fn show_view(&mut self, target: Target, view: crate::proto::ViewSpec) {
+    pub fn show_view(
+        &mut self,
+        target: Target,
+        mut view: crate::proto::ViewSpec,
+    ) -> crate::proto::ShowAck {
+        // Whatever the last key said is old news once the agent shows something.
+        self.message = None;
         let mut fresh: Vec<crate::proto::HighlightSpec> = view
             .highlights
             .iter()
             .take(crate::proto::MAX_HIGHLIGHTS)
             .cloned()
             .collect();
+        // Appending adds to the files the location shows as they are;
+        // anything else is a fresh view.
+        let append = view.append
+            && self
+                .cur()
+                .is_some_and(|l| l.code.is_some() && l.dir == checkout_root(&target.dir));
+        if append && let Some(loc) = self.cur() {
+            let shown = loc.code.as_ref().expect("checked").files.clone();
+            if let Some(code) = view.code.as_mut() {
+                let mut files = shown;
+                for f in code.files.drain(..) {
+                    match files.iter_mut().find(|s| s.path == f.path) {
+                        Some(s) => *s = f,
+                        None => files.push(f),
+                    }
+                }
+                code.files = files;
+            }
+        }
         // Lettered by where they sit: by file as the call lists them, then
         // by line.
         let order = |path: &str| {
@@ -1801,11 +1883,15 @@ impl App {
                 .as_ref()
                 .is_some_and(|c| c.files.iter().any(|f| f.line.is_some()));
         self.show_view_inner(target, view);
+        let mut added = Vec::new();
         if let Some(loc) = self.cur_mut() {
             // A new call replaces the agent's own marks; the user's stay.
-            loc.marks.retain(|m| m.author == diffview::Author::User);
+            if !append {
+                loc.marks.retain(|m| m.author == diffview::Author::User);
+            }
             for h in fresh {
-                loc.add_mark(diffview::Author::Agent, h.path, h.start, h.end, h.note);
+                let m = loc.add_mark(diffview::Author::Agent, h.path, h.start, h.end, h.note);
+                added.push(m.info());
             }
             loc.view.set_marks(Vec::new());
             loc.place_pending = placed;
@@ -1814,6 +1900,145 @@ impl App {
             loc.code_fp = 0;
         }
         self.request();
+        self.ack(added)
+    }
+
+    /// What to tell an agent about the location on screen after its call.
+    fn ack(&self, marks: Vec<crate::proto::MarkInfo>) -> crate::proto::ShowAck {
+        let Some(loc) = self.cur() else {
+            return crate::proto::ShowAck {
+                applied: true,
+                ..Default::default()
+            };
+        };
+        crate::proto::ShowAck {
+            location: loc.label(),
+            dir: loc.dir.clone(),
+            marks,
+            unread: loc.unread(),
+            applied: true,
+        }
+    }
+
+    /// The location an agent names, "L3", or the one on screen.
+    fn location_by(&mut self, name: Option<&str>) -> Result<&mut Location, String> {
+        let Some(name) = name else {
+            return self.cur_mut().ok_or("no location is open".to_string());
+        };
+        let id: u64 = name
+            .trim()
+            .trim_start_matches(['L', 'l'])
+            .parse()
+            .map_err(|_| format!("{name} is not a location id; they look like L3"))?;
+        self.locations
+            .iter_mut()
+            .find(|l| l.id == id)
+            .ok_or(format!("no location {name} in this viewer"))
+    }
+
+    /// Answer an agent's query.
+    fn answer(&mut self, query: crate::proto::ViewerQuery) -> Result<serde_json::Value, String> {
+        match query {
+            crate::proto::ViewerQuery::Review { location } => {
+                let r = self.review(location.as_deref())?;
+                Ok(serde_json::json!(r))
+            }
+            crate::proto::ViewerQuery::ClearMarks {
+                location,
+                which,
+                letters,
+            } => {
+                let r = self.clear_marks(location.as_deref(), &which, &letters)?;
+                Ok(serde_json::json!(r))
+            }
+        }
+    }
+
+    /// Every mark on a location for an agent; its comments count as read.
+    fn review(&mut self, location: Option<&str>) -> Result<crate::proto::ReviewResult, String> {
+        let current = self.cur().map(|l| l.id);
+        let showing_current = self.scope_words();
+        let loc = self.location_by(location)?;
+        let showing = if Some(loc.id) == current {
+            showing_current
+        } else {
+            "not on screen".to_string()
+        };
+        let unread = loc.unread();
+        let mut marks: Vec<&mut LocMark> = loc.marks.iter_mut().collect();
+        marks.sort_by_key(|m| (m.path.clone(), m.old_side, m.start, m.end, m.seq));
+        let infos: Vec<crate::proto::MarkInfo> = marks
+            .into_iter()
+            .map(|m| {
+                let info = m.info();
+                m.seen = true;
+                info
+            })
+            .collect();
+        Ok(crate::proto::ReviewResult {
+            location: loc.label(),
+            dir: loc.dir.clone(),
+            showing,
+            marks: infos,
+            unread,
+        })
+    }
+
+    fn clear_marks(
+        &mut self,
+        location: Option<&str>,
+        which: &str,
+        letters: &[String],
+    ) -> Result<crate::proto::ClearResult, String> {
+        let current = self.cur().map(|l| l.id);
+        let loc = self.location_by(location)?;
+        let goes = |m: &LocMark| {
+            if !letters.is_empty() {
+                return letters.iter().any(|l| l.eq_ignore_ascii_case(&m.label));
+            }
+            match which {
+                "user" => m.author == diffview::Author::User,
+                "all" => true,
+                _ => m.author == diffview::Author::Agent,
+            }
+        };
+        let cleared: Vec<String> = loc
+            .marks
+            .iter()
+            .filter(|m| goes(m))
+            .map(|m| m.label.clone())
+            .collect();
+        if let Some(missing) = letters
+            .iter()
+            .find(|l| !loc.marks.iter().any(|m| m.label.eq_ignore_ascii_case(l)))
+        {
+            return Err(format!(
+                "no mark [{}] on {}",
+                missing.to_uppercase(),
+                loc.label()
+            ));
+        }
+        loc.marks.retain(|m| !goes(m));
+        loc.view
+            .set_marks(loc.marks.iter().map(LocMark::drawn).collect());
+        let result = crate::proto::ClearResult {
+            location: loc.label(),
+            cleared,
+            remaining: loc.marks.len(),
+            unread: loc.unread(),
+        };
+        if Some(loc.id) == current && !result.cleared.is_empty() {
+            self.message = Some(format!(
+                "agent cleared {}",
+                result
+                    .cleared
+                    .iter()
+                    .map(|l| format!("[{l}]"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
+        Ok(result)
     }
 
     fn show_view_inner(&mut self, target: Target, view: crate::proto::ViewSpec) {
@@ -2492,6 +2717,7 @@ impl App {
         let label = match editing.and_then(|seq| loc.marks.iter_mut().find(|m| m.seq == seq)) {
             Some(m) => {
                 m.note = note;
+                m.seen = false;
                 m.label.clone()
             }
             None => {
@@ -2730,6 +2956,19 @@ impl App {
             format!("{scope} · Esc returns")
         } else {
             scope
+        }
+    }
+
+    /// What the screen shows, for an agent: the scope without key hints.
+    fn scope_words(&self) -> String {
+        let scope = self.range_scope();
+        let Some(loc) = self.cur() else {
+            return scope;
+        };
+        match &loc.focus {
+            Focus::File(path) => format!("{path} only · {scope}"),
+            Focus::Files(paths) => format!("{} files only · {scope}", paths.len()),
+            Focus::All => scope,
         }
     }
 
@@ -3094,8 +3333,15 @@ impl App {
             Some((None, n)) => right.insert_str(0, &format!(" {n} marks  ·")),
             None => {}
         }
-        if let Some(n) = self.cur().map(Location::comments).filter(|&n| n > 0) {
-            right.insert_str(0, &format!(" {n} yours  ·"));
+        if let Some(loc) = self.cur().filter(|l| l.comments() > 0) {
+            let unread = match loc.unread() {
+                0 => String::new(),
+                n => format!(" ({n} unread)"),
+            };
+            right.insert_str(0, &format!(" {} yours{unread}  ·", loc.comments()));
+        }
+        if let Some(loc) = self.cur().filter(|l| l.repo) {
+            right.insert_str(0, &format!(" {}  ·", loc.label()));
         }
         // Several marks under the cursor: all their letters, newest last.
         if let Some(labels) = self.cur().map(|l| l.view.labels_at_cursor())

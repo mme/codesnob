@@ -34,12 +34,18 @@ codesnob show PATH     show PATH in the viewer on your workspace
   --range R             what to compare: main...feature, HEAD~3..HEAD, a commit,
                         worktree, staged, unstaged, or a PR
 codesnob status        list connected viewers and their workspaces
+codesnob review        the marks on the location shown: highlights and your comments
+  --location L3         another location, by the id the status bar shows
+codesnob clear [C D…]  remove marks: the letters given, or --which mine|user|all
 codesnob mcp           MCP server over stdio, for agents
 codesnob prune         remove PR checkouts no viewer has open
 ```
 
 Give your coding agent the `show_code` and `show_diff` tools, so "show me the
-code" or "what changed" lands in your viewer. `codesnob mcp` is a standard
+code" or "what changed" lands in your viewer, and `get_review` and
+`clear_marks`, so the comments you write in the viewer reach it. Every reply
+names the location (`L3`) and the letters of the marks it placed, and says when
+you have comments it has not read. `codesnob mcp` is a standard
 MCP server over stdio, so any agent that speaks MCP can use it:
 
 ```
