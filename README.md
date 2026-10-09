@@ -237,6 +237,13 @@ have not been used for a week are removed on the next start;
 `codesnob` in a directory that is not inside a git repository opens with a
 message saying so. Press `o` to open a repository or a file from there.
 
+### Empty screens
+
+When there is nothing to show (no changes, a pull request still being
+fetched, no repository), the viewer says so in one line in the middle of the
+screen. In terminals that can show images (Sixel, kitty or iTerm2, such as
+foot, kitty, WezTerm or Ghostty), the codesnob sticker sits above that line.
+
 ## Keys
 
 Every command is also in the command list, `:` or `Ctrl-K`. The viewer

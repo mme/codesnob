@@ -6,6 +6,7 @@
 
 mod commands;
 mod diffview;
+mod logo;
 mod markdown;
 mod panel;
 #[cfg(test)]
@@ -20,7 +21,7 @@ use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -44,7 +45,19 @@ const EXCERPT: usize = 8;
 /// How long a load may take before the screen says it is loading.
 const LOADING_DELAY: Duration = Duration::from_millis(150);
 
+/// The widest the sticker on the empty screen is drawn, in columns.
+const STICKER_MAX_WIDTH: u16 = 72;
+
+/// The words shown instead of a diff, always one line.
+struct Notice {
+    text: String,
+    /// Whether the sticker goes above them, where the terminal shows images.
+    sticker: bool,
+}
+
 pub struct Palette {
+    /// Tuned for a light terminal background.
+    pub light: bool,
     /// Shortcuts in the palette.
     pub key_fg: Color,
     /// An agent's highlights: their tint and their letters and notes.
@@ -89,6 +102,7 @@ impl Palette {
 
     pub fn dark() -> Self {
         Self {
+            light: false,
             key_fg: Color::Cyan,
             mark_bg: Color::Rgb(0x2d, 0x2a, 0x50),
             mark_fg: Color::Rgb(0xc4, 0xa7, 0xff),
@@ -110,6 +124,7 @@ impl Palette {
 
     pub fn light() -> Self {
         Self {
+            light: true,
             key_fg: Color::Blue,
             mark_bg: Color::Rgb(0xec, 0xe6, 0xff),
             mark_fg: Color::Rgb(0x6a, 0x3d, 0xd1),
@@ -717,6 +732,8 @@ struct Location {
 pub struct App {
     opts: Options,
     palette: Palette,
+    /// The sticker on the empty screen, where the terminal shows images.
+    logo: Option<logo::Logo>,
     hl: Highlighter,
     tx: Sender<Msg>,
     loader: Sender<loader::Request>,
@@ -767,6 +784,7 @@ impl App {
         Self {
             opts,
             palette,
+            logo: None,
             hl,
             tx,
             loader,
@@ -3627,11 +3645,18 @@ impl App {
         self.cur().map(Location::range_words).unwrap_or_default()
     }
 
-    /// The centered text shown instead of a diff, if any.
-    fn notice(&self) -> Option<Vec<String>> {
+    /// The line shown instead of a diff, if any.
+    fn notice(&self) -> Option<Notice> {
         let loc = self.cur()?;
+        let says = |text: String| {
+            Some(Notice {
+                text,
+                sticker: true,
+            })
+        };
         if let Some(e) = &loc.error {
-            return Some(vec![e.clone()]);
+            let lines: Vec<&str> = e.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+            return says(lines.join(" · "));
         }
         if let Some(p) = loc.pr.as_ref().filter(|p| !p.ready) {
             let n = p.spec.number;
@@ -3642,18 +3667,19 @@ impl App {
                 .or_else(|| p.spec.repo.clone())
                 .map(|r| format!(" from {}", r.slug()))
                 .unwrap_or_default();
-            let mut lines = vec![format!("Fetching #{n}{from}")];
-            if let Some(i) = &p.info {
-                lines.push(i.title.clone());
-            }
-            lines.push("Esc cancels".to_string());
-            return Some(lines);
+            let title = p
+                .info
+                .as_ref()
+                .map(|i| format!(" {}", i.title))
+                .unwrap_or_default();
+            return says(format!("Fetching #{n}{title}{from} · Esc cancels"));
         }
         if !loc.repo {
-            return Some(vec![
-                "not inside a git repository".to_string(),
-                loc.dir.display().to_string(),
-            ]);
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            return says(format!(
+                "not inside a git repository · {}",
+                tilde(&loc.dir, home.as_deref())
+            ));
         }
         let stale = match &loc.code {
             Some(code) => loc.code_shown.as_ref() != Some(code),
@@ -3665,19 +3691,23 @@ impl App {
             let slow = loc
                 .pending_since
                 .is_some_and(|t| t.elapsed() >= LOADING_DELAY);
-            return slow.then(|| vec!["Loading…".to_string()]);
+            // Without the sticker, which would flash on every slow step.
+            return slow.then(|| Notice {
+                text: "Loading…".to_string(),
+                sticker: false,
+            });
         }
         if !loc.view.is_empty() {
             return None;
         }
         let info = loc.info.as_ref()?;
-        Some(vec![match (&loc.range, &info.base.name) {
+        says(match (&loc.range, &info.base.name) {
             (Range::Everything, Some(base)) => format!("no changes since {base}"),
             (Range::Everything, None) => "no changes".to_string(),
             (Range::Uncommitted, _) => "no uncommitted changes".to_string(),
             (Range::Commit(_), _) => "this commit changes no files".to_string(),
             (Range::Compare(..), _) => "no differences".to_string(),
-        }])
+        })
     }
 
     fn mode_label(&self) -> String {
@@ -3757,7 +3787,7 @@ impl App {
         let info = self.mode_label();
         let buf = frame.buffer_mut();
         match self.notice() {
-            Some(lines) => self.render_notice(&lines, body, buf),
+            Some(notice) => self.render_empty(&notice, body, buf),
             None => {
                 if let Some(loc) = self.locations.first() {
                     loc.view.render(body, buf, &self.palette, &mut self.hl);
@@ -3789,19 +3819,36 @@ impl App {
         }
     }
 
-    fn render_notice(&self, lines: &[String], body: Rect, buf: &mut Buffer) {
-        let top = body.y + body.height.saturating_sub(lines.len() as u16) / 2;
-        for (i, text) in lines.iter().enumerate() {
-            if top + i as u16 >= body.bottom() {
-                break;
-            }
-            let line = Line::from(Span::styled(
-                text.clone(),
-                Style::default().fg(self.palette.note_fg),
-            ));
-            let w = (line.width() as u16).min(body.width);
-            buf.set_line(body.x + (body.width - w) / 2, top + i as u16, &line, w);
+    /// The screen with no diff on it: the sticker, where the terminal shows
+    /// images and there is room, and one line of words under it, together
+    /// in the middle.
+    fn render_empty(&mut self, notice: &Notice, body: Rect, buf: &mut Buffer) {
+        // The sticker's room: at most three fifths of the width, and the
+        // height less a margin, the gap and the line.
+        let room = Size::new(
+            (body.width * 3 / 5).min(STICKER_MAX_WIDTH),
+            body.height.saturating_sub(4),
+        );
+        let sticker = match self.logo.as_mut() {
+            Some(logo) if notice.sticker => logo.size_in(room),
+            _ => None,
+        };
+        let height = sticker.map_or(1, |s| s.height + 2);
+        let top = body.y + body.height.saturating_sub(height) / 2;
+        if let (Some(size), Some(logo)) = (sticker, self.logo.as_mut()) {
+            let x = body.x + (body.width - size.width) / 2;
+            logo.render(Rect::new(x, top, size.width, size.height), buf);
         }
+        let row = top + height - 1;
+        if row >= body.bottom() {
+            return;
+        }
+        let line = Line::from(Span::styled(
+            notice.text.clone(),
+            Style::default().fg(self.palette.note_fg),
+        ));
+        let w = (line.width() as u16).min(body.width);
+        buf.set_line(body.x + (body.width - w) / 2, row, &line, w);
     }
 
     fn render_status(&self, area: Rect, buf: &mut Buffer) {
@@ -4017,7 +4064,10 @@ fn ago(time: i64) -> String {
     format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }
 
-pub fn run(mut app: App, rx: Receiver<Msg>) -> Result<()> {
+/// Run the viewer until it quits. Input is read from here on, once the
+/// terminal has said whether it shows images, so its answers are not taken
+/// for keys.
+pub fn run(mut app: App, rx: Receiver<Msg>, input: Sender<Msg>) -> Result<()> {
     let mut terminal = ratatui::init();
     crossterm::execute!(
         std::io::stdout(),
@@ -4025,6 +4075,8 @@ pub fn run(mut app: App, rx: Receiver<Msg>) -> Result<()> {
         crossterm::event::EnableBracketedPaste
     )
     .ok();
+    app.logo = logo::Logo::detect(app.palette.light);
+    crate::watch::spawn_input(input);
     let result = (|| -> Result<()> {
         loop {
             terminal.draw(|f| app.draw(f))?;

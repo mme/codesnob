@@ -262,8 +262,7 @@ fn main() -> Result<()> {
         repo,
     });
     link::spawn(tx.clone(), link);
-    watch::spawn_input(tx);
-    ui::run(app, rx)
+    ui::run(app, rx, tx)
 }
 
 fn print_stat(snap: git::Snapshot, context: usize) -> std::io::Result<()> {
