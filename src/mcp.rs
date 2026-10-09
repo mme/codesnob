@@ -81,12 +81,12 @@ fn initialize(params: &Value) -> Value {
 }
 
 /// Always in the agent's context, so this is what makes it reach for codesnob.
-const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a terminal beside you. When the user wants to see code, show it there instead of pasting it into the chat: `show_code` for files and lines, with highlights and short notes; `show_diff` for what changed between any two states (the branch point, commits, branches, staged work, a pull request). Typical requests: \"show me the code\", \"where is this handled\", \"open that file\", \"what changed\", \"show me the diff\", \"compare main and this branch\", \"show me PR 123\". A call updates that repository's view in the viewer; the user gets back to where they were with Esc. Read files with your own tools; codesnob is for showing.";
+const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a terminal beside you. When the user wants to see code, show it there instead of pasting it into the chat: `show_code` for files and lines, with highlights; `show_diff` for what changed between any two states (the branch point, commits, branches, staged work, a pull request). Typical requests: \"show me the code\", \"where is this handled\", \"open that file\", \"what changed\", \"show me the diff\", \"compare main and this branch\", \"show me PR 123\". A call updates that repository's view in the viewer; the user gets back to where they were with Esc. Read files with your own tools; codesnob is for showing. Add notes to highlights only when the user asks you to explain or comment on the code; otherwise show the code without them.";
 
 fn tools() -> Value {
     json!([{
         "name": "show_code",
-        "description": "Show source code to the user in their codesnob viewer: whole files, or excerpts around a line and highlighted line ranges, each highlight with a short note. Use it when the user asks to see, open or look at code, or where something is defined or handled, and whenever they ask you to show code while explaining. Prefer a few precise highlights with notes over large ranges.",
+        "description": "Show source code to the user in their codesnob viewer: whole files, or excerpts around a line and highlighted line ranges. Use it when the user asks to see, open or look at code, or where something is defined or handled, and whenever they ask you to show code while explaining. Prefer a few precise highlights over large ranges. Add notes only when the user asks you to explain or comment on the code.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -107,7 +107,7 @@ fn tools() -> Value {
                                     "type": "object",
                                     "properties": {
                                         "lines": { "type": "string", "description": "1-based and inclusive: \"40-60\", or \"42\" for one line." },
-                                        "note": { "type": "string", "description": "A short note shown above the lines." }
+                                        "note": { "type": "string", "description": "A short note shown above the lines. Only when the user asked you to explain or comment on the code." }
                                     },
                                     "required": ["lines"]
                                 }
@@ -126,7 +126,7 @@ fn tools() -> Value {
         }
     }, {
         "name": "show_diff",
-        "description": "Show the user a diff in their codesnob viewer. range takes git syntax (\"main...feature\", \"HEAD~3..HEAD\", a single commit, \"stash@{0}\"), \"worktree\", \"staged\" or \"unstaged\", or a pull request (\"#123\", \"owner/repo#123\", a URL). Without a range it shows everything since the branch point, uncommitted work included. Use it when the user asks what changed, to see or review a diff, to compare branches or commits, or to look at a pull request. Optionally narrow to files and highlight lines with notes.",
+        "description": "Show the user a diff in their codesnob viewer. range takes git syntax (\"main...feature\", \"HEAD~3..HEAD\", a single commit, \"stash@{0}\"), \"worktree\", \"staged\" or \"unstaged\", or a pull request (\"#123\", \"owner/repo#123\", a URL). Without a range it shows everything since the branch point, uncommitted work included. Use it when the user asks what changed, to see or review a diff, to compare branches or commits, or to look at a pull request. Optionally narrow to files and highlight lines; add notes only when the user asks you to explain or comment on the code.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -140,7 +140,7 @@ fn tools() -> Value {
                         "properties": {
                             "path": { "type": "string", "description": "Relative to your working directory." },
                             "lines": { "type": "string", "description": "1-based and inclusive: \"40-60\", or \"42\"." },
-                            "note": { "type": "string", "description": "A short note shown above the lines." }
+                            "note": { "type": "string", "description": "A short note shown above the lines. Only when the user asked you to explain or comment on the code." }
                         },
                         "required": ["path", "lines"]
                     }
