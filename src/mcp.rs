@@ -81,7 +81,7 @@ fn initialize(params: &Value) -> Value {
 }
 
 /// Always in the agent's context, so this is what makes it reach for codesnob.
-const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a terminal beside you. When the user wants to see code, show it there instead of pasting it into the chat: `show_code` for files and lines, with highlights; `show_diff` for what changed between any two states (the branch point, commits, branches, staged work, a pull request). Typical requests: \"show me the code\", \"where is this handled\", \"open that file\", \"what changed\", \"show me the diff\", \"compare main and this branch\", \"show me PR 123\". A call updates that repository's view in the viewer; the user gets back to where they were with Esc. Read files with your own tools; codesnob is for showing. Add notes to highlights only when the user asks you to explain or comment on the code; otherwise show the code without them. Marks are lettered [A], [B]… in the viewer, shared between you and the user: your highlights and the user's comments alike. The user writes comments on lines in the viewer; call `get_review` whenever they say they reviewed, commented or marked something, or a reply tells you they have unread comments, and answer to the letters. Every location has an id like L3, given in replies; pass it back to address that location. `clear_marks` removes marks you have dealt with.";
+const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a terminal beside you. When the user wants to see code, show it there instead of pasting it into the chat: `show_code` for files and lines, with highlights; `show_diff` for what changed between any two states (the branch point, commits, branches, staged work, a pull request). Typical requests: \"show me the code\", \"where is this handled\", \"open that file\", \"what changed\", \"show me the diff\", \"compare main and this branch\", \"show me PR 123\". A call updates that repository's view in the viewer; the user gets back to where they were with Esc. Read files with your own tools; codesnob is for showing. Add notes to highlights only when the user asks you to explain or comment on the code; otherwise show the code without them. Marks are lettered [A], [B]… in the viewer, shared between you and the user: your highlights and the user's comments alike. The user writes comments on lines in the viewer; call `get_review` whenever they say they reviewed, commented or marked something, or a reply tells you they have unread comments, and answer to the letters. Every location has an id like L3, given in replies; pass it back to address that location. The user's comments are theirs: answer one under it with `reply_to_comment` (numbered C1, C2… after its letter), and when you change the code under one, keep it on the right lines with `move_comment`. `clear_marks` removes your own highlights and replies; the user's comments only when the user explicitly asks you to delete them.";
 
 fn tools() -> Value {
     json!([{
@@ -151,7 +151,7 @@ fn tools() -> Value {
         }
     }, {
         "name": "get_review",
-        "description": "Read every mark on a location in the user's codesnob viewer: your highlights and the user's comments, each with its letter, file and lines, and the commented code. Call it whenever the user says they reviewed, commented on or marked something, or a reply says they have unread comments. Comments count as read once returned; those made or edited since your last call are flagged new. Comments on deleted lines give old-side line numbers; a stale mark's lines no longer exist.",
+        "description": "Read every mark on a location in the user's codesnob viewer: your highlights and the user's comments, each with its letter, file and lines, the commented code, and the replies under it (C1, C2…). Call it whenever the user says they reviewed, commented on or marked something, or a reply says they have unread comments. Comments and replies count as read once returned; those made or edited since your last call are flagged new. Comments on deleted lines give old-side line numbers; a stale mark's lines no longer exist.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -159,14 +159,41 @@ fn tools() -> Value {
             }
         }
     }, {
+        "name": "reply_to_comment",
+        "description": "Answer one of the user's comments in their codesnob viewer, under it. Replies are numbered after the comment's letter: the first under [C] is [C1]. Use it to say what you did about a comment, or to ask about it; the comment stays the user's to resolve, so reply instead of clearing it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "location": { "type": "string", "description": "The location id from an earlier reply, like L3. Defaults to the location on screen." },
+                "letter": { "type": "string", "description": "The user's comment to answer: \"C\". A reply's label, \"C2\", answers its comment." },
+                "text": { "type": "string", "description": "The reply, one or two sentences." }
+            },
+            "required": ["letter", "text"]
+        }
+    }, {
+        "name": "move_comment",
+        "description": "Move one of the user's comments in their codesnob viewer to other lines, when you changed the code it was on and it no longer sits on the code it is about. It keeps its letter, its text and its replies. Lines are the new side's, as for highlights.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "location": { "type": "string", "description": "The location id from an earlier reply, like L3. Defaults to the location on screen." },
+                "letter": { "type": "string", "description": "The user's comment to move: \"C\"." },
+                "lines": { "type": "string", "description": "Where it goes, 1-based and inclusive: \"40-60\", or \"42\"." },
+                "path": { "type": "string", "description": "The file it goes to, relative to your working directory. Defaults to the file it is on." },
+                "repo": { "type": "string", "description": "A directory in the repository, to resolve path in. Defaults to your working directory." }
+            },
+            "required": ["letter", "lines"]
+        }
+    }, {
         "name": "clear_marks",
-        "description": "Remove marks from a location in the user's codesnob viewer: the ones named by letter, else all of yours (mine), the user's (user) or every mark (all). Clear the comments you have addressed so the user sees what is still open; leave the rest.",
+        "description": "Remove marks from a location in the user's codesnob viewer: the ones named by letter (a reply by its label, \"C1\"), else all of yours (mine: your highlights and replies), the user's comments (user) or every mark (all). The user's comments and replies are theirs: remove them only when the user explicitly asked you to delete them, and say so with user_explicitly_asked_to_delete_comments. To say you dealt with a comment, reply to it instead.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "location": { "type": "string", "description": "The location id from an earlier reply, like L3. Defaults to the location on screen." },
                 "which": { "type": "string", "enum": ["mine", "user", "all"], "description": "Which marks to remove when no letters are given. Default: mine." },
-                "letters": { "type": "array", "items": { "type": "string" }, "description": "The marks to remove, by letter: [\"C\", \"D\"]." }
+                "letters": { "type": "array", "items": { "type": "string" }, "description": "The marks to remove, by letter, or replies by label: [\"C\", \"D2\"]." },
+                "user_explicitly_asked_to_delete_comments": { "type": "boolean", "description": "true only when the user explicitly asked you to delete their comments; without it, a call that would remove any of the user's comments or replies is refused. Default: false." }
             }
         }
     }])
@@ -180,6 +207,8 @@ fn call(params: &Value) -> Value {
         "show_code" => tool_result(show_code(&args)),
         "get_review" => tool_result(get_review(&args)),
         "clear_marks" => tool_result(clear_marks(&args)),
+        "reply_to_comment" => tool_result(reply_to_comment(&args)),
+        "move_comment" => tool_result(move_comment(&args)),
         _ => tool_result(Err(format!("unknown tool: {name}"))),
     }
 }
@@ -293,8 +322,7 @@ fn clear_args(args: &Value) -> Result<(String, Vec<String>), String> {
             .iter()
             .map(|v| {
                 v.as_str()
-                    .map(|s| s.trim().trim_matches(['[', ']']).to_uppercase())
-                    .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_uppercase()))
+                    .and_then(label)
                     .ok_or(format!("{v} is not a mark's letter"))
             })
             .collect::<Result<_, _>>()?,
@@ -305,6 +333,10 @@ fn clear_args(args: &Value) -> Result<(String, Vec<String>), String> {
 
 fn clear_marks(args: &Value) -> Result<String, String> {
     let (which, letters) = clear_args(args)?;
+    let user_asked = args
+        .get("user_explicitly_asked_to_delete_comments")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let mut client = link::connect()?;
     let v = link::request_query(
         &mut client,
@@ -312,10 +344,92 @@ fn clear_marks(args: &Value) -> Result<String, String> {
             location: location_arg(args),
             which,
             letters,
+            user_asked,
         },
     )
     .map_err(no_viewer)?;
     let r: crate::proto::ClearResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "{}{}",
+        r.render(),
+        crate::proto::unread_note(&r.location, r.unread)
+    ))
+}
+
+/// A mark's letter, "C", or a reply's label, "C2", as the agent wrote it:
+/// upper-cased and without brackets.
+fn label(s: &str) -> Option<String> {
+    let s = s.trim().trim_matches(['[', ']']).trim().to_uppercase();
+    let digits = s.trim_start_matches(|c: char| c.is_ascii_uppercase());
+    let letters = s.len() - digits.len();
+    let ok = letters > 0 && digits.chars().all(|c| c.is_ascii_digit()) && !digits.starts_with('0');
+    ok.then_some(s)
+}
+
+/// The comment a call names, by its `letter` argument.
+fn letter_arg(args: &Value) -> Result<String, String> {
+    let v = args
+        .get("letter")
+        .ok_or("letter is required: the comment's, like \"C\"")?;
+    v.as_str()
+        .and_then(label)
+        .ok_or(format!("{v} is not a mark's letter"))
+}
+
+fn reply_to_comment(args: &Value) -> Result<String, String> {
+    let letter = letter_arg(args)?;
+    let text = args
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or("text is required: the reply")?
+        .to_string();
+    let mut client = link::connect()?;
+    let v = link::request_query(
+        &mut client,
+        crate::proto::ViewerQuery::Reply {
+            location: location_arg(args),
+            letter,
+            text,
+        },
+    )
+    .map_err(no_viewer)?;
+    let r: crate::proto::ReplyResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "{}{}",
+        r.render(),
+        crate::proto::unread_note(&r.location, r.unread)
+    ))
+}
+
+/// Check a move_comment call: the letter, the lines, and the file made
+/// relative to the checkout root, as the viewer names files.
+pub fn move_args(args: &Value, cwd: &Path) -> Result<crate::proto::ViewerQuery, String> {
+    let letter = letter_arg(args)?;
+    if args.get("lines").is_none() {
+        return Err("lines is required: where the comment goes, like \"40-42\"".to_string());
+    }
+    let (start, end) = parse_lines(args.get("lines"))?;
+    let path = match args.get("path").and_then(Value::as_str).map(str::trim) {
+        Some(p) if !p.is_empty() => Some(relative_to(&repo_root(args, cwd)?, cwd, p)?),
+        _ => None,
+    };
+    Ok(crate::proto::ViewerQuery::MoveComment {
+        location: location_arg(args),
+        letter,
+        path,
+        start,
+        end,
+    })
+}
+
+fn move_comment(args: &Value) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let query = move_args(args, &cwd)?;
+    let mut client = link::connect()?;
+    let v = link::request_query(&mut client, query).map_err(no_viewer)?;
+    let r: crate::proto::MoveResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
     Ok(format!(
         "{}{}",
         r.render(),
@@ -897,15 +1011,60 @@ mod tests {
         let (which, letters) = clear_args(&json!({})).unwrap();
         assert_eq!((which.as_str(), letters.as_slice()), ("mine", &[][..]));
         let (which, letters) =
-            clear_args(&json!({ "which": "all", "letters": [" c", "[D]", "aa"] })).unwrap();
+            clear_args(&json!({ "which": "all", "letters": [" c", "[D]", "aa", "c12"] })).unwrap();
         assert_eq!(which, "all");
-        assert_eq!(letters, ["C", "D", "AA"]);
+        assert_eq!(letters, ["C", "D", "AA", "C12"]);
         let err = clear_args(&json!({ "which": "theirs" })).unwrap_err();
         assert_eq!(err, "which must be mine, user or all, not theirs");
         let err = clear_args(&json!({ "letters": ["3"] })).unwrap_err();
         assert_eq!(err, "\"3\" is not a mark's letter");
         let err = clear_args(&json!({ "letters": "C" })).unwrap_err();
         assert_eq!(err, "letters must be a list");
+        for bad in ["1C", "C0", "C1D", "", "[]"] {
+            assert_eq!(label(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_move_is_checked_and_its_path_made_relative_to_the_checkout() {
+        let dir = branch_with_history("mcp-move");
+        let sub = dir.join("deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        let q = move_args(
+            &json!({ "letter": "[b]", "lines": "4-6", "path": "one.rs", "location": "L2" }),
+            &sub,
+        )
+        .unwrap();
+        assert_eq!(
+            q,
+            crate::proto::ViewerQuery::MoveComment {
+                location: Some("L2".to_string()),
+                letter: "B".to_string(),
+                path: Some("deep/one.rs".to_string()),
+                start: 4,
+                end: 6,
+            }
+        );
+        let q = move_args(&json!({ "letter": "B", "lines": 9 }), &dir).unwrap();
+        assert!(
+            matches!(
+                q,
+                crate::proto::ViewerQuery::MoveComment {
+                    path: None,
+                    start: 9,
+                    end: 9,
+                    ..
+                }
+            ),
+            "{q:?}"
+        );
+        let err = move_args(&json!({ "lines": "4" }), &dir).unwrap_err();
+        assert!(err.starts_with("letter is required"), "{err}");
+        let err = move_args(&json!({ "letter": "B" }), &dir).unwrap_err();
+        assert!(err.starts_with("lines is required"), "{err}");
+        let err = move_args(&json!({ "letter": "B", "lines": "6-4" }), &dir).unwrap_err();
+        assert!(err.contains("run forward"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -919,12 +1078,29 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["show_code", "show_diff", "get_review", "clear_marks"]
+            [
+                "show_code",
+                "show_diff",
+                "get_review",
+                "reply_to_comment",
+                "move_comment",
+                "clear_marks"
+            ]
         );
         assert!(tools[0]["inputSchema"]["properties"]["append"].is_object());
         assert_eq!(
-            tools[3]["inputSchema"]["properties"]["which"]["enum"],
-            json!(["mine", "user", "all"])
+            tools[3]["inputSchema"]["required"],
+            json!(["letter", "text"])
+        );
+        assert_eq!(
+            tools[4]["inputSchema"]["required"],
+            json!(["letter", "lines"])
+        );
+        let clear = &tools[5]["inputSchema"]["properties"];
+        assert_eq!(clear["which"]["enum"], json!(["mine", "user", "all"]));
+        assert_eq!(
+            clear["user_explicitly_asked_to_delete_comments"]["type"],
+            "boolean"
         );
     }
 

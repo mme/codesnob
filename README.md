@@ -79,10 +79,12 @@ line; for several lines, press `v` on the first, move to the last and press
 Enter. Your comments are marks too, drawn in amber and lettered after the
 agent's.
 
-Then tell the agent "I left comments". It reads them, answers by letter, and
-can clear the ones it has dealt with. Until it has read them, it can't pull
-you to another location: the request waits behind a banner at the top, and
-`y` goes there anyway.
+Then tell the agent "I left comments". It reads them and answers under each
+one: its first answer to `[C]` is `[C1]`, the next `[C2]`. Press Enter on
+its answer to reply in the same thread. Your comments stay until you delete
+them; the agent removes them only when you ask it to. Until it has read
+them, it can't pull you to another location: the request waits behind a
+banner at the top, and `y` goes there anyway.
 
 **5. Look around yourself.** `j` and `k` (or the arrow keys) move the cursor
 line, `n` and `p` jump between hunks, `N` and `P` between files. `f` lists
@@ -127,14 +129,16 @@ Most other agents take a JSON configuration in this form:
 }
 ```
 
-The server gives the agent four tools:
+The server gives the agent six tools:
 
 | Tool | Does |
 |---|---|
 | `show_code` | show whole files or excerpts, as they are or as of a revision, with highlighted lines and optional notes |
 | `show_diff` | show any comparison from [the range table](#what-is-compared), optionally limited to some files, with highlighted lines |
-| `get_review` | read every mark on a location: the agent's highlights and your comments, with the code they are on and which comments are new |
-| `clear_marks` | remove marks by letter, or all of the agent's, all of yours, or all of them |
+| `get_review` | read every mark on a location: the agent's highlights, your comments and the replies under them, with the code they are on and what is new |
+| `reply_to_comment` | answer one of your comments under it, as `[C1]`, `[C2]`, … |
+| `move_comment` | put one of your comments on other lines after the agent changed the code under it; it keeps its letter, text and replies |
+| `clear_marks` | remove the agent's own highlights and replies. Your comments only when the call says you explicitly asked for that (`user_explicitly_asked_to_delete_comments`); otherwise it is refused |
 
 Every reply tells the agent the location id and the letters of the marks it
 placed, and whether you have comments it has not read yet. The tool
@@ -196,6 +200,12 @@ Marks are highlighted line ranges, lettered `[A]`, `[B]`, … in the order
 they were made. A mark keeps its letter, so you and the agent can both say
 "B" and mean the same lines. The agent's highlights can carry a short note;
 your comments are drawn in amber.
+
+Your comments are yours. The agent answers one with a reply under it,
+numbered after its letter (`[C1]`, `[C2]`), and you can reply to that in
+turn, in the same thread. When it changes the code a comment is on, it can
+move the comment to the right lines, but it cannot change what you wrote,
+and it deletes your comments only when you ask it to.
 
 Marks follow their code as you edit. If the lines a mark pointed at are
 deleted, the mark stays and is flagged stale.
@@ -271,10 +281,10 @@ moves the cursor to it, and the mouse wheel scrolls.
 
 | Key | Does |
 |---|---|
-| Enter | comment on the cursor's line; on your comment, edit it; on an agent's highlight, answer it |
+| Enter | comment on the cursor's line; on your comment or reply, edit it; on an agent's highlight, answer it; on an agent's reply, reply to it in the same thread |
 | `v`, `Ctrl-Space` | start marking lines; move to extend, then Enter to write the comment, Esc to cancel |
-| `e` | edit the comment under the cursor |
-| `x` | delete the comment under the cursor |
+| `e` | edit the comment or reply under the cursor |
+| `x` | delete the comment (with its replies) or your reply under the cursor |
 | `X` | delete all your comments in this location, after asking |
 | `<` `>` | previous, next mark (or hunk, when there are no marks) |
 | `y` | switch to what the agent is waiting to show |
@@ -310,7 +320,9 @@ The subcommands talk to viewers that are already running:
 |---|---|
 | `codesnob show PATH [--range R]` | show the repository at `PATH` in the viewer, optionally a specific range |
 | `codesnob review [--location L3] [--json]` | print the marks on a location (default: the one on screen); the comments count as read afterwards |
-| `codesnob clear [LETTERS…] [--which mine\|user\|all] [--location L3]` | remove marks by letter, or by owner: `mine` is the agent's highlights (the default), `user` is your comments |
+| `codesnob reply LETTER TEXT [--location L3]` | answer one of the user's comments under it |
+| `codesnob move LETTER LINES [--path P] [--location L3]` | put one of the user's comments on other lines, e.g. `codesnob move C 40-42` |
+| `codesnob clear [LETTERS…] [--which mine\|user\|all] [--location L3]` | remove marks by letter, or by owner: `mine` is the agent's highlights and replies (the default), `user` is the user's comments. Removing the user's comments needs `--user-explicitly-asked-to-delete-comments` |
 | `codesnob status [--json]` | list the connected viewers, with their workspace and directory |
 | `codesnob mcp` | run the MCP server on stdin and stdout |
 | `codesnob prune` | remove PR checkouts that no viewer has open |

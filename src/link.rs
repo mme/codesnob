@@ -253,7 +253,12 @@ pub fn review(location: Option<String>, json: bool) -> Result<(), String> {
 }
 
 /// `codesnob clear`: remove marks on a location.
-pub fn clear(location: Option<String>, which: String, letters: Vec<String>) -> Result<(), String> {
+pub fn clear(
+    location: Option<String>,
+    which: String,
+    letters: Vec<String>,
+    user_asked: bool,
+) -> Result<(), String> {
     let mut client = one_shot()?;
     let v = request_query(
         &mut client,
@@ -261,9 +266,35 @@ pub fn clear(location: Option<String>, which: String, letters: Vec<String>) -> R
             location,
             which,
             letters,
+            user_asked,
         },
     )?;
     let r: proto::ClearResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
+    println!("{}", r.render());
+    Ok(())
+}
+
+/// `codesnob reply`: answer one of the user's comments, under it.
+pub fn reply(location: Option<String>, letter: String, text: String) -> Result<(), String> {
+    let mut client = one_shot()?;
+    let v = request_query(
+        &mut client,
+        proto::ViewerQuery::Reply {
+            location,
+            letter,
+            text,
+        },
+    )?;
+    let r: proto::ReplyResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
+    println!("{}", r.render());
+    Ok(())
+}
+
+/// `codesnob move`: put one of the user's comments on other lines.
+pub fn move_comment(query: proto::ViewerQuery) -> Result<(), String> {
+    let mut client = one_shot()?;
+    let v = request_query(&mut client, query)?;
+    let r: proto::MoveResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
     println!("{}", r.render());
     Ok(())
 }

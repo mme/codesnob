@@ -93,8 +93,37 @@ enum Cmd {
         /// (user), or every mark (all). Default: mine.
         #[arg(long, value_parser = ["mine", "user", "all"])]
         which: Option<String>,
-        /// Letters of the marks to remove instead, e.g. C D.
+        /// Letters of the marks to remove instead, e.g. C D, or replies,
+        /// e.g. C1.
         letters: Vec<String>,
+        /// Allow removing the user's comments and replies. Only when the
+        /// user explicitly asked for them to be deleted.
+        #[arg(long)]
+        user_explicitly_asked_to_delete_comments: bool,
+    },
+    /// Answer one of the user's comments, under it: C1, C2…
+    Reply {
+        /// The comment's letter, e.g. C.
+        letter: String,
+        /// The reply.
+        text: String,
+        /// The location, as the viewer names it (L3); default: the one on screen.
+        #[arg(long)]
+        location: Option<String>,
+    },
+    /// Move one of the user's comments to other lines, keeping its letter,
+    /// text and replies.
+    Move {
+        /// The comment's letter, e.g. C.
+        letter: String,
+        /// Where it goes: 40-42, or 42.
+        lines: String,
+        /// The file it goes to (default: the one it is on).
+        #[arg(long)]
+        path: Option<String>,
+        /// The location, as the viewer names it (L3); default: the one on screen.
+        #[arg(long)]
+        location: Option<String>,
     },
     /// Run the daemon in the foreground (it normally starts on demand).
     Daemon,
@@ -124,9 +153,39 @@ fn main() -> Result<()> {
             location,
             which,
             letters,
+            user_explicitly_asked_to_delete_comments,
         }) => {
             let which = which.unwrap_or_else(|| "mine".to_string());
-            return link::clear(location, which, letters).map_err(|e| anyhow::anyhow!(e));
+            return link::clear(
+                location,
+                which,
+                letters,
+                user_explicitly_asked_to_delete_comments,
+            )
+            .map_err(|e| anyhow::anyhow!(e));
+        }
+        Some(Cmd::Reply {
+            letter,
+            text,
+            location,
+        }) => {
+            return link::reply(location, letter, text).map_err(|e| anyhow::anyhow!(e));
+        }
+        Some(Cmd::Move {
+            letter,
+            lines,
+            path,
+            location,
+        }) => {
+            let args = serde_json::json!({
+                "letter": letter,
+                "lines": lines,
+                "path": path,
+                "location": location,
+            });
+            let cwd = std::env::current_dir()?;
+            let query = mcp::move_args(&args, &cwd).map_err(|e| anyhow::anyhow!(e))?;
+            return link::move_comment(query).map_err(|e| anyhow::anyhow!(e));
         }
         Some(Cmd::Mcp) => return mcp::serve(),
         Some(Cmd::Prune) => {

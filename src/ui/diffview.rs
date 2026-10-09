@@ -17,6 +17,8 @@ pub enum Row {
     Desc(usize),
     /// A highlight's number and note, above its lines.
     Mark(usize),
+    /// A reply under a mark's row: the mark's index, the reply's index.
+    Reply(usize, usize),
     File(usize),
     Hunk(usize, usize),
     Line(usize, usize, usize),
@@ -51,6 +53,17 @@ pub struct Mark {
     pub old_side: bool,
     /// The letter of the mark this one answers.
     pub re: Option<String>,
+    /// The answers under it, oldest first.
+    pub replies: Vec<Reply>,
+}
+
+/// An answer under a comment, drawn on a row of its own below it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reply {
+    /// The comment's letter and its number under it: A1, A2…
+    pub label: String,
+    pub author: Author,
+    pub text: String,
 }
 
 /// Lines the user marked for a comment, in the terms marks are kept in.
@@ -79,6 +92,8 @@ pub struct Anchor {
     /// The cursor was on a mark's own row: the mark, by its place in the
     /// order marks were made.
     at_mark: Option<usize>,
+    /// The cursor was on a reply under that mark: the reply, by index.
+    at_reply: Option<usize>,
     /// How many rows below the top of the view the cursor sat.
     offset: usize,
 }
@@ -176,8 +191,9 @@ impl DiffView {
         match self.mark_rows.get(i).copied().flatten() {
             Some(row) => {
                 self.jump_to(row);
-                if matches!(self.rows.get(row + 1), Some(Row::Line(..))) {
-                    self.cursor = row + 1;
+                let below = self.below_mark(row);
+                if matches!(self.rows.get(below), Some(Row::Line(..))) {
+                    self.cursor = below;
                 }
                 self.current_mark = Some(i);
                 true
@@ -250,13 +266,13 @@ impl DiffView {
         }
     }
 
-    /// The mark above the cursor; the mark whose row or first line the
-    /// cursor is on is where we are, not where we go.
+    /// The mark above the cursor; the mark whose row, replies or first
+    /// line the cursor is on is where we are, not where we go.
     pub fn prev_mark(&mut self) {
         let marks = self.shown_marks();
         let here = marks
             .iter()
-            .find(|(r, _)| *r == self.cursor || *r + 1 == self.cursor)
+            .find(|(r, _)| (*r..=self.below_mark(*r)).contains(&self.cursor))
             .map_or(self.cursor, |(r, _)| *r);
         if let Some((_, i)) = marks.into_iter().rev().find(|(r, _)| *r < here) {
             self.go_to_mark(i);
@@ -277,6 +293,25 @@ impl DiffView {
     /// The row the cursor is on.
     pub fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    /// The first row below mark row `row` and the replies under it.
+    fn below_mark(&self, row: usize) -> usize {
+        let mut r = row + 1;
+        while matches!(self.rows.get(r), Some(Row::Reply(..))) {
+            r += 1;
+        }
+        r
+    }
+
+    /// The reply whose row the cursor is on: its comment, by its place in
+    /// the order marks were made, and the reply, by index.
+    pub fn reply_at_cursor(&self) -> Option<(usize, usize, &Reply)> {
+        let Row::Reply(m, r) = *self.rows.get(self.cursor)? else {
+            return None;
+        };
+        let mark = &self.marks[m];
+        Some((mark.seq, r, &mark.replies[r]))
     }
 
     /// The user's comment under the cursor, by its place in the order marks
@@ -564,6 +599,8 @@ impl DiffView {
                             placed[m] = true;
                             self.mark_rows[m] = Some(self.rows.len());
                             self.rows.push(Row::Mark(m));
+                            self.rows
+                                .extend((0..mark.replies.len()).map(|r| Row::Reply(m, r)));
                         }
                     }
                     self.rows.push(Row::Line(fi, hi, li));
@@ -575,6 +612,8 @@ impl DiffView {
                     placed[m] = true;
                     self.mark_rows[m] = Some(self.rows.len());
                     self.rows.push(Row::Mark(m));
+                    self.rows
+                        .extend((0..mark.replies.len()).map(|r| Row::Reply(m, r)));
                 }
             }
         }
@@ -594,6 +633,7 @@ impl DiffView {
         let fi = self.current_file()?;
         let path = self.files[fi].path.clone();
         let mut at_mark = None;
+        let mut at_reply = None;
         let (line, at_hunk) = match self.rows.get(self.cursor)? {
             Row::Line(fi, hi, li) => {
                 let l = &self.files[*fi].hunks[*hi].lines[*li];
@@ -608,10 +648,14 @@ impl DiffView {
                 };
                 (Some(at), true)
             }
-            // A mark's row: its first line, and the row itself if it stays.
-            Row::Mark(m) => {
+            // A mark's row or a reply's: the mark's first line, and the row
+            // itself if it stays.
+            Row::Mark(m) | Row::Reply(m, _) => {
                 let mark = &self.marks[*m];
                 at_mark = Some(mark.seq);
+                if let Row::Reply(_, r) = self.rows[self.cursor] {
+                    at_reply = Some(r);
+                }
                 let old = mark.old_side || self.files[fi].status == Status::Deleted;
                 (Some((if old { 0 } else { 1 }, mark.start)), false)
             }
@@ -622,6 +666,7 @@ impl DiffView {
             line,
             at_hunk,
             at_mark,
+            at_reply,
             offset: self.cursor - self.scroll,
         })
     }
@@ -666,16 +711,22 @@ impl DiffView {
             Some((_, r)) => r,
             None => start,
         };
-        // Back onto the mark's row when we were on one and it is still
-        // there, among the rows of the marks above the line.
+        // Back onto the mark's row, or the reply's under it, when we were on
+        // one and it is still there, among the rows of the marks above the
+        // line.
         if let Some(seq) = a.at_mark {
             let mut r = self.cursor;
             while r > 0
-                && let Some(Row::Mark(m)) = self.rows.get(r - 1)
+                && let Some(Row::Mark(m) | Row::Reply(m, _)) = self.rows.get(r - 1)
             {
                 r -= 1;
-                if self.marks[*m].seq == seq {
-                    self.cursor = r;
+                if matches!(self.rows[r], Row::Mark(_)) && self.marks[*m].seq == seq {
+                    // A reply that went leaves the cursor on the one above.
+                    let replies = self.marks[*m].replies.len();
+                    self.cursor = match a.at_reply {
+                        Some(i) if replies > 0 => r + 1 + i.min(replies - 1),
+                        _ => r,
+                    };
                     break;
                 }
             }
@@ -949,6 +1000,24 @@ impl DiffView {
                 if let Some(note) = &mark.note {
                     spans.push(Span::styled(note.clone(), tint.fg(fg)));
                 }
+                buf.set_line(area.x, area.y, &Line::from(spans), area.width);
+            }
+            Row::Reply(m, r) => {
+                let reply = &self.marks[m].replies[r];
+                let (bg, fg) = p.mark_colors(reply.author);
+                let tint = Style::default().bg(bg);
+                buf.set_style(area, tint);
+                let who = match reply.author {
+                    Author::User => "you: ",
+                    Author::Agent => "",
+                };
+                let spans = vec![
+                    Span::styled(
+                        format!("      [{}] {who}", reply.label),
+                        tint.fg(fg).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(reply.text.clone(), tint.fg(fg)),
+                ];
                 buf.set_line(area.x, area.y, &Line::from(spans), area.width);
             }
             Row::Desc(i) => {
