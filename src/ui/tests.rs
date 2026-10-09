@@ -2454,6 +2454,54 @@ fn enter_on_an_agents_highlight_answers_it() {
     cleanup(dir);
 }
 
+#[test]
+fn angle_brackets_step_from_the_cursor_not_from_the_last_jump() {
+    let dir = repo_with_long_file("ui-marks-from-cursor");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![
+        hl("src/long.rs", 10, 10, Some("a")),
+        hl("src/long.rs", 30, 30, Some("b")),
+        hl("src/long.rs", 50, 50, Some("c")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    assert!(h.status().contains("[A] 1 of 3"), "{}", h.status());
+    // Twenty-five lines down, plus [B]'s own row on the way.
+    h.keys(&"j".repeat(26));
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 35"), "{text}");
+    h.keys(">");
+    assert!(
+        h.status().contains("[C] 3 of 3"),
+        "the next below the cursor: {}",
+        h.status()
+    );
+    h.keys(&"k".repeat(16));
+    h.keys("<");
+    assert!(
+        h.status().contains("[B] 2 of 3"),
+        "the one above the cursor: {}",
+        h.status()
+    );
+    h.keys("<");
+    assert!(
+        h.status().contains("[A] 1 of 3"),
+        "from a mark's first line, the one before it: {}",
+        h.status()
+    );
+    h.keys("k<");
+    assert!(
+        h.status().contains("[A] 1 of 3"),
+        "from the row itself, nothing above: {}",
+        h.status()
+    );
+    h.keys("G<");
+    assert!(h.status().contains("[C] 3 of 3"), "{}", h.status());
+    cleanup(dir);
+}
+
 fn repo_with_long_file(name: &str) -> PathBuf {
     let dir = branch_with_history(name);
     let body: String = (1..=60).map(|i| format!("// line {i}\n")).collect();
@@ -2885,10 +2933,12 @@ fn highlights_are_numbered_by_where_they_sit_not_the_order_given() {
     assert!(at_top(&mut h).contains("[C] lowest"), "stays on the last");
     h.keys("jjj<");
     assert!(
-        at_top(&mut h).contains("[B] middle"),
-        "scrolling does not change the order: {}",
+        at_top(&mut h).contains("[C] lowest"),
+        "< goes to the mark above the cursor, which is still [C]: {}",
         at_top(&mut h)
     );
+    h.keys("<");
+    assert!(at_top(&mut h).contains("[B] middle"), "{}", at_top(&mut h));
     assert!(h.status().contains("[B] 2 of 3"), "{}", h.status());
     cleanup(dir);
 }
@@ -2983,9 +3033,12 @@ fn a_line_outside_the_highlights_opens_at_the_line() {
     );
     h.keys(">");
     assert_eq!(
-        h.screen().lines().position(|l| l.contains("[A] early")),
-        Some(1)
+        h.screen().lines().position(|l| l.contains("[B] late")),
+        Some(1),
+        "the next mark below line 30"
     );
+    assert!(h.status().contains("[B] 2 of 2"), "{}", h.status());
+    h.keys("<<");
     assert!(h.status().contains("[A] 1 of 2"), "{}", h.status());
     cleanup(dir);
 }

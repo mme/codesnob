@@ -227,18 +227,40 @@ impl DiffView {
         covering.into_iter().map(|m| m.label.clone()).collect()
     }
 
-    /// The next highlight by number; highlights not shown are skipped.
-    pub fn next_mark(&mut self) {
-        let from = self.current_mark.map_or(0, |c| c + 1);
-        let _ = (from..self.mark_rows.len()).any(|i| self.go_to_mark(i));
+    /// The marks shown, as (row, index), top to bottom.
+    fn shown_marks(&self) -> Vec<(usize, usize)> {
+        let mut rows: Vec<(usize, usize)> = self
+            .mark_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.map(|r| (r, i)))
+            .collect();
+        rows.sort_unstable();
+        rows
     }
 
+    /// The next mark below the cursor.
+    pub fn next_mark(&mut self) {
+        let next = self
+            .shown_marks()
+            .into_iter()
+            .find(|(r, _)| *r > self.cursor);
+        if let Some((_, i)) = next {
+            self.go_to_mark(i);
+        }
+    }
+
+    /// The mark above the cursor; the mark whose row or first line the
+    /// cursor is on is where we are, not where we go.
     pub fn prev_mark(&mut self) {
-        let Some(c) = self.current_mark else {
-            self.first_mark();
-            return;
-        };
-        let _ = (0..c).rev().any(|i| self.go_to_mark(i));
+        let marks = self.shown_marks();
+        let here = marks
+            .iter()
+            .find(|(r, _)| *r == self.cursor || *r + 1 == self.cursor)
+            .map_or(self.cursor, |(r, _)| *r);
+        if let Some((_, i)) = marks.into_iter().rev().find(|(r, _)| *r < here) {
+            self.go_to_mark(i);
+        }
     }
 
     /// The mark covering a line of file `fi`, if any: the newest when
