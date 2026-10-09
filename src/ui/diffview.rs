@@ -47,6 +47,22 @@ pub struct Mark {
     pub note: Option<String>,
     /// Its lines no longer exist; drawn near where they were, untinted.
     pub stale: bool,
+    /// Its lines are the old side's: deleted lines in a diff.
+    pub old_side: bool,
+}
+
+/// Lines the user marked for a comment, in the terms marks are kept in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub path: String,
+    pub start: usize,
+    pub end: usize,
+    /// The lines are the old side's: only deleted lines were marked.
+    pub old_side: bool,
+    /// Deleted lines were among those marked, with others.
+    pub with_deletions: bool,
+    /// The marked lines as they are now.
+    pub text: Vec<String>,
 }
 
 /// Where the cursor is, expressed in terms that survive a reload.
@@ -92,6 +108,8 @@ pub struct DiffView {
     mark_rows: Vec<Option<usize>>,
     /// The highlight last jumped to, by index; `<` and `>` go on from here.
     current_mark: Option<usize>,
+    /// Rows being marked for a comment, drawn as a would-be mark.
+    pub marking: Option<(usize, usize)>,
 }
 
 impl DiffView {
@@ -195,13 +213,11 @@ impl DiffView {
             return Vec::new();
         };
         let f = &self.files[*fi];
-        let Some(no) = line_no(f, &f.hunks[*hi].lines[*li]) else {
-            return Vec::new();
-        };
+        let line = &f.hunks[*hi].lines[*li];
         let mut covering: Vec<&Mark> = self
             .marks
             .iter()
-            .filter(|m| !m.stale && m.path == f.path && (m.start..=m.end).contains(&no))
+            .filter(|m| !m.stale && m.path == f.path && m.covers(f, line))
             .collect();
         covering.sort_by_key(|m| m.seq);
         covering.into_iter().map(|m| m.label.clone()).collect()
@@ -225,12 +241,92 @@ impl DiffView {
     /// several do, and never a stale one.
     fn mark_on(&self, fi: usize, line: &crate::diff::DiffLine) -> Option<(&Mark, usize)> {
         let f = &self.files[fi];
-        let no = line_no(f, line)?;
         self.marks
             .iter()
-            .filter(|m| !m.stale && m.path == f.path && (m.start..=m.end).contains(&no))
+            .filter(|m| !m.stale && m.path == f.path && m.covers(f, line))
             .max_by_key(|m| m.seq)
-            .map(|m| (m, no))
+            .and_then(|m| mark_no(f, line, m.old_side).map(|no| (m, no)))
+    }
+
+    /// The row the cursor is on.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// The user's comment under the cursor, by its place in the order marks
+    /// were made: the newest covering the cursor's line, or the one whose
+    /// row the cursor is on.
+    pub fn comment_at_cursor(&self) -> Option<usize> {
+        match self.rows.get(self.cursor)? {
+            Row::Mark(m) => {
+                let mark = &self.marks[*m];
+                (mark.author == Author::User).then_some(mark.seq)
+            }
+            Row::Line(fi, hi, li) => {
+                let f = &self.files[*fi];
+                let line = &f.hunks[*hi].lines[*li];
+                self.marks
+                    .iter()
+                    .filter(|m| {
+                        m.author == Author::User
+                            && !m.stale
+                            && m.path == f.path
+                            && m.covers(f, line)
+                    })
+                    .max_by_key(|m| m.seq)
+                    .map(|m| m.seq)
+            }
+            _ => None,
+        }
+    }
+
+    /// The lines between rows `a` and `b` (either order) as a region to
+    /// comment on: the lines of the file `a` is in, up to its end. `None`
+    /// when `a` is not on a line.
+    pub fn region(&self, a: usize, b: usize) -> Option<Region> {
+        let Row::Line(fi, ..) = *self.rows.get(a)? else {
+            return None;
+        };
+        let f = &self.files[fi];
+        let (lo, hi) = (a.min(b), a.max(b));
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        let mut deletions = false;
+        for row in &self.rows[lo..=hi] {
+            match *row {
+                Row::Line(f2, hi, li) if f2 == fi => {
+                    let l = &f.hunks[hi].lines[li];
+                    match l.kind {
+                        Kind::Del => {
+                            deletions = true;
+                            old.extend(l.old_no);
+                        }
+                        _ => new.extend(l.new_no),
+                    }
+                }
+                Row::Line(..) | Row::File(_) => break,
+                _ => {}
+            }
+        }
+        let (start, end, old_side, lines) = if new.is_empty() {
+            let (s, e) = (*old.iter().min()?, *old.iter().max()?);
+            (s, e, true, &f.old_lines)
+        } else {
+            let (s, e) = (*new.iter().min()?, *new.iter().max()?);
+            (s, e, false, &f.new_lines)
+        };
+        let text = lines
+            .get(start - 1..end)
+            .map(<[String]>::to_vec)
+            .unwrap_or_default();
+        Some(Region {
+            path: f.path.clone(),
+            start,
+            end,
+            old_side,
+            with_deletions: deletions && !old_side,
+            text,
+        })
     }
 
     /// How wide the gutter's mark column is: the longest letter.
@@ -401,18 +497,19 @@ impl DiffView {
                 for li in 0..h.lines.len() {
                     // A mark's row goes above its first line shown; a stale
                     // mark's above the first line at or past where it was.
-                    if let Some(no) = line_no(f, &h.lines[li]) {
-                        for (m, mark) in self.marks.iter().enumerate() {
-                            let here = if mark.stale {
-                                no >= mark.start
-                            } else {
-                                (mark.start..=mark.end).contains(&no)
-                            };
-                            if !placed[m] && mark.path == f.path && here {
-                                placed[m] = true;
-                                self.mark_rows[m] = Some(self.rows.len());
-                                self.rows.push(Row::Mark(m));
-                            }
+                    for (m, mark) in self.marks.iter().enumerate() {
+                        let Some(no) = mark_no(f, &h.lines[li], mark.old_side) else {
+                            continue;
+                        };
+                        let here = if mark.stale {
+                            no >= mark.start
+                        } else {
+                            (mark.start..=mark.end).contains(&no)
+                        };
+                        if !placed[m] && mark.path == f.path && here {
+                            placed[m] = true;
+                            self.mark_rows[m] = Some(self.rows.len());
+                            self.rows.push(Row::Mark(m));
                         }
                     }
                     self.rows.push(Row::Line(fi, hi, li));
@@ -432,7 +529,8 @@ impl DiffView {
             self.rows.push(Row::Note("no files changed"));
         }
         // With marks, room for their letters so they never cover a digit.
-        self.gutter_w = max_no.to_string().len().max(3) + self.label_w();
+        self.gutter_w = max_no.to_string().len().max(3)
+            + self.label_w().max(usize::from(self.marking.is_some()));
         self.fit();
     }
 
@@ -753,7 +851,7 @@ impl DiffView {
                 break;
             };
             let line = Rect::new(area.x, y, area.width, 1);
-            self.render_row(row, line, buf, p, hl);
+            self.render_row(idx, row, line, buf, p, hl);
             if idx == self.cursor {
                 self.render_cursor(row, line, buf, p);
             }
@@ -762,8 +860,10 @@ impl DiffView {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_row(
         &self,
+        idx: usize,
         row: Row,
         area: Rect,
         buf: &mut Buffer,
@@ -827,7 +927,7 @@ impl DiffView {
                 let line = Line::from(Span::styled(text, Style::default().fg(p.hunk_fg)));
                 buf.set_line(area.x, area.y, &line, area.width);
             }
-            Row::Line(fi, hi, li) => self.render_line(fi, hi, li, area, buf, p, hl),
+            Row::Line(fi, hi, li) => self.render_line(idx, fi, hi, li, area, buf, p, hl),
         }
     }
 
@@ -910,6 +1010,7 @@ impl DiffView {
     #[allow(clippy::too_many_arguments)]
     fn render_line(
         &self,
+        idx: usize,
         fi: usize,
         hi: usize,
         li: usize,
@@ -927,9 +1028,13 @@ impl DiffView {
         // Highlighted context lines take the highlight's tint; changed lines
         // keep their color and get the bar in the gutter only.
         let marked = self.mark_on(fi, l);
-        let line_bg = match (line_bg, marked) {
-            (None, Some((m, _))) => Some(p.mark_colors(m.author).0),
-            (bg, _) => bg,
+        let marking = self
+            .marking
+            .is_some_and(|(lo, hi)| (lo..=hi).contains(&idx));
+        let line_bg = match (line_bg, marked, marking) {
+            (None, _, true) => Some(p.comment_bg),
+            (None, Some((m, _)), _) => Some(p.mark_colors(m.author).0),
+            (bg, ..) => bg,
         };
         let row_style = match line_bg {
             Some(bg) => Style::default().bg(bg),
@@ -963,8 +1068,17 @@ impl DiffView {
             Kind::Context => (marker, row_style),
         };
         let mut spans = Vec::new();
-        // The mark column: its letter on the mark's first line, a bar below.
+        // The mark column: its letter on the mark's first line, a bar below;
+        // a bar too on lines being marked.
         let gutter = match marked {
+            _ if marking => {
+                let w = self.label_w().max(1);
+                spans.push(Span::styled(
+                    format!("{:<w$}", "▌"),
+                    row_style.fg(p.comment_fg).add_modifier(Modifier::BOLD),
+                ));
+                gutter.chars().skip(w).collect()
+            }
             Some((m, no)) => {
                 let w = self.label_w();
                 let fg = p.mark_colors(m.author).1;
@@ -1051,11 +1165,28 @@ impl DiffView {
     }
 }
 
+impl Mark {
+    /// Whether `line` of `f` is among this mark's lines.
+    fn covers(&self, f: &FileDiff, line: &crate::diff::DiffLine) -> bool {
+        mark_no(f, line, self.old_side).is_some_and(|no| (self.start..=self.end).contains(&no))
+    }
+}
+
 /// The number a highlight is addressed by: the new side's, or the old side's
 /// in a deleted file.
 fn line_no(f: &FileDiff, line: &crate::diff::DiffLine) -> Option<usize> {
     match f.status {
         Status::Deleted => line.old_no,
         _ => line.new_no,
+    }
+}
+
+/// The number a mark addresses `line` by: the old side's for a mark on
+/// deleted lines, else as `line_no`.
+fn mark_no(f: &FileDiff, line: &crate::diff::DiffLine, old_side: bool) -> Option<usize> {
+    if old_side {
+        line.old_no
+    } else {
+        line_no(f, line)
     }
 }

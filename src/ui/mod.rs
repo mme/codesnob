@@ -204,6 +204,12 @@ enum Focus {
     Files(Vec<String>),
 }
 
+/// Something the user is asked before it happens.
+enum Confirm {
+    /// Remove the user's comments on the location on screen.
+    ClearComments,
+}
+
 /// What Esc returns to after an agent changed the view.
 enum AgentReturn {
     /// The view this location had before the agent's call.
@@ -229,6 +235,10 @@ struct LocMark {
     text: Option<Vec<String>>,
     /// Its lines are nowhere to be found since the last load.
     stale: bool,
+    /// Its lines are the old side's: a comment on deleted lines.
+    old_side: bool,
+    /// Deleted lines were among those commented on, with others.
+    with_deletions: bool,
 }
 
 impl LocMark {
@@ -242,6 +252,7 @@ impl LocMark {
             author: self.author,
             note: self.note.clone(),
             stale: self.stale,
+            old_side: self.old_side,
         }
     }
 }
@@ -281,10 +292,13 @@ fn anchor_mark(m: &mut LocMark, lines: &[String]) -> bool {
 
 /// Follow every mark to its text; returns the letters of those that just
 /// went stale. Marks on files `lines_of` does not know stay as they are.
-fn reanchor(marks: &mut [LocMark], lines_of: &dyn Fn(&str) -> Option<Vec<String>>) -> Vec<String> {
+fn reanchor(
+    marks: &mut [LocMark],
+    lines_of: &dyn Fn(&str, bool) -> Option<Vec<String>>,
+) -> Vec<String> {
     let mut gone = Vec::new();
     for m in marks.iter_mut() {
-        let Some(lines) = lines_of(&m.path) else {
+        let Some(lines) = lines_of(&m.path, m.old_side) else {
             continue;
         };
         let was = m.stale;
@@ -336,7 +350,7 @@ impl Location {
         start: usize,
         end: usize,
         note: Option<String>,
-    ) -> &LocMark {
+    ) -> &mut LocMark {
         let seq = self.marks_made;
         self.marks_made += 1;
         self.marks.push(LocMark {
@@ -349,8 +363,18 @@ impl Location {
             note,
             text: None,
             stale: false,
+            old_side: false,
+            with_deletions: false,
         });
-        self.marks.last().expect("just pushed")
+        self.marks.last_mut().expect("just pushed")
+    }
+
+    /// The user's comments here.
+    fn comments(&self) -> usize {
+        self.marks
+            .iter()
+            .filter(|m| m.author == diffview::Author::User)
+            .count()
     }
 
     /// Has only ever shown a message: not a repository, a pull request
@@ -429,6 +453,13 @@ pub struct App {
     locations: Vec<Location>,
     next_id: u64,
     panel: Option<Panel>,
+    /// Lines being marked for a comment: the row the marking started on.
+    marking: Option<usize>,
+    /// The comment the prompt is for: its lines, and the comment being
+    /// edited, by its place in the order marks were made, if not new.
+    composing: Option<(diffview::Region, Option<usize>)>,
+    /// A question on the status bar, answered with y or n.
+    confirm: Option<Confirm>,
     /// Where to return when a previewing list is closed with Esc.
     origin: Option<Origin>,
     /// Recently chosen panel entries per list, newest first.
@@ -469,6 +500,9 @@ impl App {
             locations: Vec::new(),
             next_id: 1,
             panel: None,
+            marking: None,
+            composing: None,
+            confirm: None,
             origin: None,
             recent: HashMap::new(),
             message: None,
@@ -1165,7 +1199,7 @@ impl App {
             return;
         }
         let anchor = if same_view { loc.view.anchor() } else { None };
-        let gone = reanchor(&mut loc.marks, &|path| {
+        let gone = reanchor(&mut loc.marks, &|path, _| {
             code.files
                 .iter()
                 .find(|(p, _)| p == path)
@@ -1292,11 +1326,17 @@ impl App {
         let anchor = if same_range { loc.view.anchor() } else { None };
         let (info, files) = Info::split(snap);
         loc.fingerprint = fingerprint;
-        let gone = reanchor(&mut loc.marks, &|path| {
+        let gone = reanchor(&mut loc.marks, &|path, old_side| {
             files
                 .iter()
                 .find(|f| f.new_path.as_deref().or(f.old_path.as_deref()) == Some(path))
-                .and_then(|f| f.new.as_deref().or(f.old.as_deref()))
+                .and_then(|f| {
+                    if old_side {
+                        f.old.as_deref()
+                    } else {
+                        f.new.as_deref().or(f.old.as_deref())
+                    }
+                })
                 .map(crate::diff::text_lines)
         });
         let ranges: Vec<(String, usize, usize)> = loc
@@ -1420,7 +1460,19 @@ impl App {
             let rows = self.panel_rows();
             let before = self.panel.as_ref().and_then(|p| p.selected_key());
             let outcome = self.panel.as_mut().map(|p| p.key(k, rows));
+            let composing = self
+                .panel
+                .as_ref()
+                .is_some_and(|p| p.kind == panel::Kind::Comment);
             match outcome {
+                Some(Outcome::Close) if composing => {
+                    self.panel = None;
+                    self.composing = None;
+                }
+                Some(Outcome::Submit { input, .. }) if composing => {
+                    self.panel = None;
+                    self.save_comment(input);
+                }
                 Some(Outcome::Close) => self.close_panel(true),
                 Some(Outcome::Choose(action, key)) => {
                     let kind = self.panel.as_ref().map(|p| p.kind);
@@ -1454,6 +1506,39 @@ impl App {
         self.message = None;
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
+        if let Some(confirm) = self.confirm.take() {
+            match (k.code, confirm) {
+                (KeyCode::Char('y') | KeyCode::Char('Y'), Confirm::ClearComments) => {
+                    self.clear_comments();
+                }
+                _ => self.message = Some("kept".to_string()),
+            }
+            return;
+        }
+        let ctrl_space = matches!(k.code, KeyCode::Null)
+            || k.code == KeyCode::Char(' ') && ctrl
+            || k.code == KeyCode::Char('@') && ctrl;
+        if self.marking.is_some() {
+            match k.code {
+                KeyCode::Esc => {
+                    self.marking = None;
+                    self.message = Some("marking cancelled".to_string());
+                    return;
+                }
+                KeyCode::Enter => {
+                    self.end_region();
+                    return;
+                }
+                _ if ctrl_space => {
+                    self.end_region();
+                    return;
+                }
+                _ => {}
+            }
+        } else if ctrl_space {
+            self.perform(Action::MarkRegion);
+            return;
+        }
         let flips =
             k.code == KeyCode::Char('-') || alt && matches!(k.code, KeyCode::Left | KeyCode::Right);
         if !flips {
@@ -1494,6 +1579,11 @@ impl App {
             (KeyCode::Char('c'), false, false) => self.perform(Action::Commits),
             (KeyCode::Char('<'), false, false) => self.perform(Action::PrevMark),
             (KeyCode::Char('>'), false, false) => self.perform(Action::NextMark),
+            (KeyCode::Enter, false, false) => self.perform(Action::Comment),
+            (KeyCode::Char('v'), false, false) => self.perform(Action::MarkRegion),
+            (KeyCode::Char('e'), false, false) => self.perform(Action::EditComment),
+            (KeyCode::Char('x'), false, false) => self.perform(Action::DeleteComment),
+            (KeyCode::Char('X'), false, false) => self.perform(Action::ClearComments),
             (KeyCode::Char('d'), false, false) => self.perform(Action::ToggleDescription),
             (KeyCode::Char('u'), false, false) => self.toggle_uncommitted(),
             (KeyCode::Char('L'), false, false) => {
@@ -1530,9 +1620,9 @@ impl App {
             | (KeyCode::Char('G'), false, false)
             | (KeyCode::Char('>'), false, true) => self.perform(Action::Bottom),
 
-            (KeyCode::Char('n'), false, false)
-            | (KeyCode::Char(']'), false, false)
-            | (KeyCode::Enter, _, _) => self.perform(Action::NextHunk),
+            (KeyCode::Char('n'), false, false) | (KeyCode::Char(']'), false, false) => {
+                self.perform(Action::NextHunk)
+            }
             (KeyCode::Char('p'), false, false) | (KeyCode::Char('['), false, false) => {
                 self.perform(Action::PrevHunk)
             }
@@ -2280,6 +2370,9 @@ impl App {
             Action::PreviousLocation | Action::NextLocation | Action::CloseLocation => several,
             Action::Commits => has_info,
             Action::NextMark | Action::PrevMark => loc.view.has_marks(),
+            Action::Comment | Action::MarkRegion => has_rows,
+            Action::EditComment | Action::DeleteComment => loc.view.comment_at_cursor().is_some(),
+            Action::ClearComments => loc.comments() > 0,
             Action::OlderCommit | Action::NewerCommit => loc
                 .info
                 .as_ref()
@@ -2301,6 +2394,151 @@ impl App {
             Action::Reload => loc.repo || loc.pr.is_some(),
             Action::Quit => true,
         }
+    }
+
+    // ---- comments ------------------------------------------------------------
+
+    /// Enter: a comment on the cursor's line, or edit the comment whose row
+    /// the cursor is on.
+    fn comment_here(&mut self) {
+        let Some(loc) = self.cur() else { return };
+        let cursor = loc.view.cursor();
+        if let Some(seq) = loc.view.comment_at_cursor()
+            && loc.view.region(cursor, cursor).is_none()
+        {
+            self.edit(seq);
+            return;
+        }
+        match loc.view.region(cursor, cursor) {
+            Some(region) => self.compose(region, None),
+            None => self.message = Some("move onto a line first".to_string()),
+        }
+    }
+
+    fn start_region(&mut self) {
+        let Some(loc) = self.cur() else { return };
+        let cursor = loc.view.cursor();
+        if loc.view.region(cursor, cursor).is_some() {
+            self.marking = Some(cursor);
+        } else {
+            self.message = Some("move onto a line first".to_string());
+        }
+    }
+
+    fn end_region(&mut self) {
+        let Some(from) = self.marking.take() else {
+            return;
+        };
+        let Some(loc) = self.cur() else { return };
+        match loc.view.region(from, loc.view.cursor()) {
+            Some(region) => self.compose(region, None),
+            None => self.message = Some("nothing to comment on".to_string()),
+        }
+    }
+
+    /// Open the prompt for a comment on `region`: a new one, or the one
+    /// `editing` names, whose text is put up to change.
+    fn compose(&mut self, region: diffview::Region, editing: Option<usize>) {
+        let Some(loc) = self.cur() else { return };
+        let existing = editing.and_then(|seq| loc.marks.iter().find(|m| m.seq == seq));
+        let text = existing.and_then(|m| m.note.clone()).unwrap_or_default();
+        let where_ = match (region.start == region.end, region.old_side) {
+            (true, false) => format!("{} {}", region.path, region.start),
+            (false, false) => format!("{} {}-{}", region.path, region.start, region.end),
+            (true, true) => format!("{} old {}", region.path, region.start),
+            (false, true) => format!("{} old {}-{}", region.path, region.start, region.end),
+        };
+        let note = match existing {
+            Some(m) => format!("[{}] {where_}", m.label),
+            None => where_,
+        };
+        let mut panel = Panel::new(panel::Kind::Comment, Vec::new(), Vec::new(), None);
+        panel.set_input(text);
+        panel.note = Some(note);
+        self.panel = Some(panel);
+        self.composing = Some((region, editing));
+    }
+
+    fn edit(&mut self, seq: usize) {
+        let Some(loc) = self.cur() else { return };
+        let Some(m) = loc.marks.iter().find(|m| m.seq == seq) else {
+            return;
+        };
+        let region = diffview::Region {
+            path: m.path.clone(),
+            start: m.start,
+            end: m.end,
+            old_side: m.old_side,
+            with_deletions: m.with_deletions,
+            text: m.text.clone().unwrap_or_default(),
+        };
+        self.compose(region, Some(seq));
+    }
+
+    fn edit_comment(&mut self) {
+        match self.cur().and_then(|l| l.view.comment_at_cursor()) {
+            Some(seq) => self.edit(seq),
+            None => self.message = Some("no comment of yours here".to_string()),
+        }
+    }
+
+    /// The prompt was answered: a new comment, or new text for one.
+    fn save_comment(&mut self, text: String) {
+        let Some((region, editing)) = self.composing.take() else {
+            return;
+        };
+        let Some(loc) = self.cur_mut() else { return };
+        let note = Some(text);
+        let label = match editing.and_then(|seq| loc.marks.iter_mut().find(|m| m.seq == seq)) {
+            Some(m) => {
+                m.note = note;
+                m.label.clone()
+            }
+            None => {
+                let m = loc.add_mark(
+                    diffview::Author::User,
+                    region.path,
+                    region.start,
+                    region.end,
+                    note,
+                );
+                m.old_side = region.old_side;
+                m.with_deletions = region.with_deletions;
+                m.text = Some(region.text);
+                m.label.clone()
+            }
+        };
+        loc.view
+            .set_marks(loc.marks.iter().map(LocMark::drawn).collect());
+        self.message = Some(format!("[{label}] saved"));
+    }
+
+    fn delete_comment(&mut self) {
+        let Some(loc) = self.cur_mut() else { return };
+        let Some(seq) = loc.view.comment_at_cursor() else {
+            self.message = Some("no comment of yours here".to_string());
+            return;
+        };
+        let label = loc
+            .marks
+            .iter()
+            .find(|m| m.seq == seq)
+            .map(|m| m.label.clone())
+            .unwrap_or_default();
+        loc.marks.retain(|m| m.seq != seq);
+        loc.view
+            .set_marks(loc.marks.iter().map(LocMark::drawn).collect());
+        self.message = Some(format!("[{label}] removed"));
+    }
+
+    fn clear_comments(&mut self) {
+        let Some(loc) = self.cur_mut() else { return };
+        let n = loc.comments();
+        loc.marks.retain(|m| m.author != diffview::Author::User);
+        loc.view
+            .set_marks(loc.marks.iter().map(LocMark::drawn).collect());
+        let s = if n == 1 { "" } else { "s" };
+        self.message = Some(format!("{n} comment{s} cleared"));
     }
 
     fn open_palette(&mut self) {
@@ -2378,6 +2616,23 @@ impl App {
                     (false, true) => v.prev_mark(),
                     (true, false) => v.next_hunk(),
                     (false, false) => v.prev_hunk(),
+                }
+            }
+            Action::Comment => self.comment_here(),
+            Action::MarkRegion => match self.marking {
+                Some(_) => self.end_region(),
+                None => self.start_region(),
+            },
+            Action::EditComment => self.edit_comment(),
+            Action::DeleteComment => self.delete_comment(),
+            Action::ClearComments => {
+                let n = self.cur().map_or(0, Location::comments);
+                if n == 0 {
+                    self.message = Some("no comments of yours here".to_string());
+                } else {
+                    let s = if n == 1 { "" } else { "s" };
+                    self.message = Some(format!("clear your {n} comment{s} here? y/n"));
+                    self.confirm = Some(Confirm::ClearComments);
                 }
             }
             Action::OlderCommit => self.step(true),
@@ -2682,7 +2937,10 @@ impl App {
                 loc.desc_width = body.width;
             }
         }
+        let marking = self.marking;
         if let Some(loc) = self.locations.first_mut() {
+            let cursor = loc.view.cursor();
+            loc.view.marking = marking.map(|from| (from.min(cursor), from.max(cursor)));
             loc.view.resize(self.body_h);
             // A target line inside a highlight opens at that highlight, its
             // note at the top; any other target line sits about a third of
@@ -2765,6 +3023,18 @@ impl App {
         }
         let left = format!(" {}", self.scope());
         let mut right = String::new();
+        if let Some(from) = self.marking
+            && let Some(loc) = self.cur()
+        {
+            let lines = match loc.view.region(from, loc.view.cursor()) {
+                Some(r) if r.start == r.end => format!("line {}", r.start),
+                Some(r) => format!("lines {}-{}", r.start, r.end),
+                None => "nothing yet".to_string(),
+            };
+            let text = format!(" marking {lines} · Enter or Ctrl-Space to comment · Esc cancels");
+            buf.set_span(area.x, area.y, &Span::styled(text, style), area.width);
+            return;
+        }
         if let Some(m) = &self.message {
             // A message gets the whole line.
             buf.set_span(
@@ -2823,6 +3093,9 @@ impl App {
             Some((None, 1)) => right.insert_str(0, " 1 mark  ·"),
             Some((None, n)) => right.insert_str(0, &format!(" {n} marks  ·")),
             None => {}
+        }
+        if let Some(n) = self.cur().map(Location::comments).filter(|&n| n > 0) {
+            right.insert_str(0, &format!(" {n} yours  ·"));
         }
         // Several marks under the cursor: all their letters, newest last.
         if let Some(labels) = self.cur().map(|l| l.view.labels_at_cursor())

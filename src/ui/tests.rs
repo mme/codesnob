@@ -170,6 +170,7 @@ impl Harness {
             p.add_bg,
             p.del_bg,
             p.mark_bg,
+            p.comment_bg,
             p.header_bg,
             p.add_emph,
             p.del_emph,
@@ -1780,6 +1781,230 @@ fn a_reload_keeps_the_cursor_on_its_line_and_screen_row() {
     h.keys("r");
     assert!(h.screen().contains("fresh.txt"), "{}", h.screen());
     assert_eq!(h.cursor(), before);
+    cleanup(dir);
+}
+
+#[test]
+fn enter_comments_on_the_cursors_line() {
+    let dir = repo_with_long_file("ui-comment-line");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    h.keys("jjjjj<enter>");
+    let screen = h.screen();
+    assert!(
+        screen.contains(" Comment ") && screen.contains("src/long.rs 5"),
+        "the prompt names the line:\n{screen}"
+    );
+    assert!(screen.contains("Enter saves, Esc cancels"), "{screen}");
+    h.keys("looks good<enter>");
+    let screen = h.screen();
+    assert!(
+        screen.contains("[A] you: looks good"),
+        "the comment sits above its line, lettered:\n{screen}"
+    );
+    let line5 = screen.lines().find(|l| l.contains("// line 5")).unwrap();
+    assert!(line5.starts_with("A "), "{line5}");
+    assert!(h.status().contains("[A] saved"), "{}", h.status());
+    h.keys("j");
+    assert!(
+        h.status().contains("1 yours") && h.status().contains("1 mark"),
+        "{}",
+        h.status()
+    );
+
+    // Esc in the prompt keeps nothing.
+    h.keys("jjj<enter>nope<esc>");
+    assert!(!h.screen().contains("nope") && !h.screen().contains("[B]"));
+    assert_eq!(h.app.cur().unwrap().marks.len(), 1);
+
+    // Enter on the comment's own row edits it.
+    h.keys("<");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("// line 5"),
+        "the jump lands on the first line: {text}"
+    );
+    h.keys("k<enter>");
+    let screen = h.screen();
+    assert!(screen.contains("[A] src/long.rs 5"), "edits [A]:\n{screen}");
+    h.keys("<c-u>still good<enter>");
+    assert!(h.screen().contains("[A] you: still good"), "{}", h.screen());
+    assert_eq!(h.app.cur().unwrap().marks.len(), 1, "edited, not added");
+    cleanup(dir);
+}
+
+#[test]
+fn ctrl_space_marks_a_region_for_a_comment() {
+    let dir = repo_with_long_file("ui-comment-region");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    h.keys("jjjjjjjjjj<c- >");
+    assert!(
+        h.status()
+            .starts_with("marking line 10 · Enter or Ctrl-Space to comment · Esc cancels"),
+        "{}",
+        h.status()
+    );
+    h.keys("jjj");
+    assert!(
+        h.status().starts_with("marking lines 10-13"),
+        "{}",
+        h.status()
+    );
+    let screen = h.screen();
+    let barred: Vec<&str> = screen.lines().filter(|l| l.starts_with('▌')).collect();
+    assert_eq!(
+        barred.len(),
+        4,
+        "the lines being marked carry a bar:\n{screen}"
+    );
+    h.keys("kkkkkk");
+    assert!(
+        h.status().starts_with("marking lines 7-10"),
+        "upwards too: {}",
+        h.status()
+    );
+    h.keys("<esc>");
+    assert!(h.status().contains("marking cancelled"), "{}", h.status());
+    assert!(!h.screen().lines().any(|l| l.starts_with('▌')));
+
+    // v starts one too; a second Ctrl-Space ends it.
+    h.keys("vjj<c- >");
+    assert!(h.screen().contains("src/long.rs 7-9"), "{}", h.screen());
+    h.keys("three lines<enter>");
+    let screen = h.screen();
+    assert!(screen.contains("[A] you: three lines"), "{screen}");
+    let m = &h.app.cur().unwrap().marks[0];
+    assert_eq!((m.start, m.end), (7, 9));
+    assert_eq!(
+        m.text.as_deref(),
+        Some(
+            &[
+                "// line 7".to_string(),
+                "// line 8".to_string(),
+                "// line 9".to_string()
+            ][..]
+        )
+    );
+    assert!(
+        h.screen().contains("[A] you: three lines"),
+        "{}",
+        h.screen()
+    );
+    h.keys(":");
+    assert!(
+        h.screen().contains("Mark lines to comment on [Ctrl-Space]"),
+        "{}",
+        h.screen()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn comments_are_deleted_one_by_one_or_cleared_after_a_question() {
+    let dir = repo_with_long_file("ui-comment-delete");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![hl("src/long.rs", 2, 3, Some("theirs"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    // Opens at [A], the cursor on line 2.
+    h.keys("jjjj<enter>one<enter>");
+    h.keys("jjjj<enter>two<enter>");
+    h.keys("kj");
+    assert!(
+        h.status().contains("2 yours") && h.status().contains("3 marks"),
+        "{}",
+        h.status()
+    );
+    h.keys("x");
+    assert!(h.status().contains("[C] removed"), "{}", h.status());
+    assert!(
+        !h.screen().contains("[C] you") && h.screen().contains("[B] you: one"),
+        "{}",
+        h.screen()
+    );
+    h.keys("gjx");
+    assert!(
+        h.status().contains("no comment of yours here"),
+        "an agent's highlight stays: {}",
+        h.status()
+    );
+    assert!(h.screen().contains("[A] theirs"));
+    h.keys("X");
+    assert!(
+        h.status().contains("clear your 1 comment here? y/n"),
+        "{}",
+        h.status()
+    );
+    h.keys("n");
+    assert!(h.status().contains("kept") && h.screen().contains("[B] you: one"));
+    h.keys("Xy");
+    assert!(h.status().contains("1 comment cleared"), "{}", h.status());
+    assert!(!h.screen().contains("[B]") && h.screen().contains("[A] theirs"));
+    h.keys("X");
+    assert!(
+        h.status().contains("no comments of yours here"),
+        "{}",
+        h.status()
+    );
+    // The letters go on where they left off.
+    h.keys("jjjjjjj<enter>again<enter>");
+    assert!(h.screen().contains("[D] you: again"), "{}", h.screen());
+    cleanup(dir);
+}
+
+#[test]
+fn a_comment_on_deleted_lines_speaks_in_old_line_numbers() {
+    let dir = branch_with_history("ui-comment-deleted");
+    let mut h = Harness::open(&dir);
+    // gone.txt is deleted: its one line is on the old side only.
+    h.keys("fgone<enter>");
+    let (_, text) = h.cursor();
+    assert!(text.contains("gone.txt"), "{text}");
+    h.keys("jj<enter>");
+    assert!(h.screen().contains("gone.txt old 1"), "{}", h.screen());
+    h.keys("why<enter>");
+    let m = &h.app.cur().unwrap().marks[0];
+    assert!(m.old_side && (m.start, m.end) == (1, 1) && !m.with_deletions);
+    assert!(h.screen().contains("[A] you: why"), "{}", h.screen());
+    // Deleted and added lines together: the new side's numbers, flagged.
+    h.keys("fa.txt<enter>");
+    h.keys("jj<c- >j<enter>");
+    assert!(h.screen().contains("a.txt 1"), "{}", h.screen());
+    h.keys("both<enter>");
+    let m = &h.app.cur().unwrap().marks[1];
+    assert!(
+        !m.old_side && m.with_deletions && (m.start, m.end) == (1, 1),
+        "{:?}",
+        (m.start, m.end)
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn a_comment_follows_its_lines_through_an_edit() {
+    let dir = repo_with_long_file("ui-comment-follow");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    h.keys("jjjjjjjjjj<enter>here<enter>");
+    assert_eq!(h.app.cur().unwrap().marks[0].start, 10);
+    let body: String = std::iter::once("// new\n".to_string())
+        .chain((1..=60).map(|i| format!("// line {i}\n")))
+        .collect();
+    std::fs::write(dir.join("src/long.rs"), body).unwrap();
+    wait_until(&mut h, &|h| h.app.cur().unwrap().marks[0].start == 11);
+    assert!(h.screen().contains("[A] you: here"), "{}", h.screen());
     cleanup(dir);
 }
 
