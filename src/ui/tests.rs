@@ -2164,6 +2164,8 @@ fn append_adds_files_and_keeps_every_mark() {
             && screen.contains("[C] second"),
         "every mark stays and the new file joins:\n{screen}"
     );
+    assert!(h.status().contains("agent added [C]"), "{}", h.status());
+    h.keys("k");
     assert!(
         h.status().starts_with("2 files · working tree"),
         "{}",
@@ -2186,6 +2188,193 @@ fn append_adds_files_and_keeps_every_mark() {
         "the user's comment stays, off screen"
     );
     cleanup(dir);
+}
+
+#[test]
+fn a_switch_waits_behind_a_banner_while_comments_are_unread() {
+    let a = repo_with_long_file("ui-gate-a");
+    let b = small_repo("ui-gate-b");
+    let mut h = Harness::open(&a);
+    h.keys("jj<enter>look<enter>k");
+    assert!(h.status().contains("1 unread"), "{}", h.status());
+    h.app.dispatch(Msg::View(
+        target(&b),
+        Box::new(view(None, &["readme.md"])),
+        None,
+    ));
+    h.settle();
+    let screen = h.screen();
+    assert_eq!(h.app.cur().unwrap().dir, a, "still here");
+    let banner = screen.lines().next().unwrap();
+    assert!(
+        banner.starts_with(" the agent wants to show codesnob-ui-gate-b-")
+            && banner.contains(": readme.md · y switches · Esc drops it"),
+        "the banner:\n{screen}"
+    );
+    assert!(
+        screen.contains("[A] you: look"),
+        "the review stays on screen:\n{screen}"
+    );
+    assert_eq!(h.app.cur().unwrap().view.scroll, 0);
+    h.keys("j");
+    assert!(
+        h.screen().contains("the agent wants"),
+        "other keys leave the banner up"
+    );
+    h.keys("y");
+    assert_eq!(h.app.cur().unwrap().dir, b, "y switches");
+    assert!(!h.screen().contains("the agent wants"), "{}", h.screen());
+    assert!(
+        h.status().contains("switched to codesnob-ui-gate-b-")
+            && h.status().contains(": readme.md, as the agent asked"),
+        "{}",
+        h.status()
+    );
+    h.keys("-");
+    assert_eq!(h.app.cur().unwrap().dir, a);
+    assert_eq!(
+        h.app.cur().unwrap().unread(),
+        1,
+        "the comment is still there"
+    );
+    cleanup(a);
+    cleanup(b);
+}
+
+#[test]
+fn a_held_request_is_dropped_with_esc_or_replaced_by_a_newer_one() {
+    let a = repo_with_long_file("ui-gate-drop");
+    let b = small_repo("ui-gate-drop-b");
+    let c = small_repo("ui-gate-drop-c");
+    let mut h = Harness::open(&a);
+    h.keys("jj<enter>look<enter>");
+    let ack = h.app.show_view(target(&b), view(None, &[]));
+    assert!(ack.applied, "show_view itself never holds; dispatch does");
+    h.keys("-");
+    assert_eq!(h.app.cur().unwrap().dir, a);
+    h.app.dispatch(Msg::Show(target(&b), None));
+    h.app.dispatch(Msg::Show(target(&c), None));
+    h.settle();
+    assert!(
+        h.screen().contains("wants to show codesnob-ui-gate-drop-c"),
+        "the newer one waits: {}",
+        h.screen()
+    );
+    h.keys("<esc>");
+    assert!(!h.screen().contains("wants to show"));
+    assert!(
+        h.status().contains("the agent's request was dropped"),
+        "{}",
+        h.status()
+    );
+    assert_eq!(h.app.cur().unwrap().dir, a);
+    cleanup(a);
+    cleanup(b);
+    cleanup(c);
+}
+
+#[test]
+fn a_held_request_applies_once_the_agent_reads_the_comments() {
+    let a = repo_with_long_file("ui-gate-read");
+    let b = small_repo("ui-gate-read-b");
+    let mut h = Harness::open(&a);
+    h.keys("jj<enter>look<enter>");
+    h.app.dispatch(Msg::View(
+        target(&b),
+        Box::new(view(None, &["readme.md"])),
+        None,
+    ));
+    h.settle();
+    assert_eq!(h.app.cur().unwrap().dir, a);
+    let r = h.app.review(None).unwrap();
+    assert_eq!(r.unread, 1);
+    h.settle();
+    assert_eq!(
+        h.app.cur().unwrap().dir,
+        b,
+        "read, the request goes through"
+    );
+    assert!(!h.screen().contains("wants to show"));
+    cleanup(a);
+    cleanup(b);
+}
+
+#[test]
+fn typing_holds_a_switch_even_without_unread_comments() {
+    let a = repo_with_long_file("ui-gate-typing");
+    let b = small_repo("ui-gate-typing-b");
+    let mut h = Harness::open(&a);
+    h.keys("jj<enter>half a thou");
+    h.app.dispatch(Msg::Show(target(&b), None));
+    h.settle();
+    assert_eq!(h.app.cur().unwrap().dir, a);
+    h.keys("ght<enter>");
+    assert!(
+        h.screen().contains("[A] you: half a thought"),
+        "{}",
+        h.screen()
+    );
+    assert!(
+        h.screen()
+            .contains("wants to show codesnob-ui-gate-typing-b"),
+        "{}",
+        h.screen()
+    );
+    // Reading while the user types changes nothing; afterwards it does.
+    h.keys("v");
+    h.app.review(None).unwrap();
+    assert_eq!(
+        h.app.cur().unwrap().dir,
+        a,
+        "a marking in progress keeps it held"
+    );
+    h.keys("<esc>");
+    h.app.review(None).unwrap();
+    assert_eq!(h.app.cur().unwrap().dir, b);
+    cleanup(a);
+    cleanup(b);
+}
+
+#[test]
+fn an_update_of_the_same_location_goes_through_and_says_what_it_added() {
+    let dir = repo_with_long_file("ui-gate-inplace");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    h.keys("jjjjjjjjjj<enter>here<enter>");
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![
+        hl("src/long.rs", 30, 30, Some("one")),
+        hl("src/long.rs", 40, 40, Some("two")),
+    ];
+    h.app
+        .dispatch(Msg::View(target(&dir), Box::new(spec), None));
+    h.settle();
+    assert!(h.status().contains("agent added [B] [C]"), "{}", h.status());
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 10"), "the cursor stays put: {text}");
+    assert!(!h.screen().contains("wants to show"));
+    cleanup(dir);
+}
+
+#[test]
+fn without_a_review_in_progress_a_switch_is_immediate() {
+    let a = repo_with_long_file("ui-gate-free");
+    let b = small_repo("ui-gate-free-b");
+    let mut h = Harness::open(&a);
+    h.keys("jj<enter>look<enter>");
+    h.app.review(None).unwrap();
+    h.app.dispatch(Msg::View(
+        target(&b),
+        Box::new(view(None, &["readme.md"])),
+        None,
+    ));
+    h.settle();
+    assert_eq!(h.app.cur().unwrap().dir, b);
+    cleanup(a);
+    cleanup(b);
 }
 
 fn repo_with_long_file(name: &str) -> PathBuf {

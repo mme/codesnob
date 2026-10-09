@@ -76,6 +76,7 @@ need to start:
 | Enter | comment on the cursor's line; on a comment's own row, edit it |
 | Ctrl-Space or `v` | start marking lines for a comment; move to extend, Enter or Ctrl-Space again to write it, Esc to stop |
 | `e` `x` | edit or delete the comment under the cursor; `X` clears all of yours here, after asking |
+| `y` | switch to what the agent asked to show while you were reviewing: a request that would take you away from unread comments or a comment you are typing waits behind a banner until you press `y`, the agent reads your comments, or Esc drops it |
 | `<` `>` | previous and next mark, or hunk when there are none. Marks are lettered `[A]`, `[B]`… in the order they were made and keep their letters, so you and the agent mean the same thing by "B". A mark whose lines are gone stays, flagged stale |
 | `u` | only the uncommitted changes, and back |
 | `f` | the changed files; `z` narrows the view to one |

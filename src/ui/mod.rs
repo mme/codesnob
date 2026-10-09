@@ -204,6 +204,14 @@ enum Focus {
     Files(Vec<String>),
 }
 
+/// A show request held back until the user is done reviewing.
+struct PendingShow {
+    target: Target,
+    view: Option<crate::proto::ViewSpec>,
+    /// What it would show, in words.
+    words: String,
+}
+
 /// Something the user is asked before it happens.
 enum Confirm {
     /// Remove the user's comments on the location on screen.
@@ -499,6 +507,9 @@ pub struct App {
     composing: Option<(diffview::Region, Option<usize>)>,
     /// A question on the status bar, answered with y or n.
     confirm: Option<Confirm>,
+    /// An agent's request to show something else, held while the user is
+    /// reviewing: applied with y, or once the agent reads the comments.
+    pending_show: Option<PendingShow>,
     /// Where to return when a previewing list is closed with Esc.
     origin: Option<Origin>,
     /// Recently chosen panel entries per list, newest first.
@@ -542,6 +553,7 @@ impl App {
             marking: None,
             composing: None,
             confirm: None,
+            pending_show: None,
             origin: None,
             recent: HashMap::new(),
             message: None,
@@ -1437,14 +1449,22 @@ impl App {
             }
             Msg::Loaded { loc, seq, result } => self.apply_loaded(loc, seq, *result),
             Msg::Show(target, reply) => {
-                self.open(target);
+                let ack = if self.held(&target, None) {
+                    self.hold(target, None)
+                } else {
+                    self.open(target);
+                    self.ack(Vec::new())
+                };
                 if let Some(id) = reply {
-                    let ack = self.ack(Vec::new());
                     self.link.reply(id, serde_json::json!(ack));
                 }
             }
             Msg::View(target, view, reply) => {
-                let ack = self.show_view(target, *view);
+                let ack = if self.held(&target, Some(&view)) {
+                    self.hold(target, Some(*view))
+                } else {
+                    self.show_view(target, *view)
+                };
                 if let Some(id) = reply {
                     self.link.reply(id, serde_json::json!(ack));
                 }
@@ -1563,6 +1583,11 @@ impl App {
         self.message = None;
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
+        let flips =
+            k.code == KeyCode::Char('-') || alt && matches!(k.code, KeyCode::Left | KeyCode::Right);
+        if !flips {
+            self.flip = None;
+        }
         if let Some(confirm) = self.confirm.take() {
             match (k.code, confirm) {
                 (KeyCode::Char('y') | KeyCode::Char('Y'), Confirm::ClearComments) => {
@@ -1596,10 +1621,19 @@ impl App {
             self.perform(Action::MarkRegion);
             return;
         }
-        let flips =
-            k.code == KeyCode::Char('-') || alt && matches!(k.code, KeyCode::Left | KeyCode::Right);
-        if !flips {
-            self.flip = None;
+        if self.pending_show.is_some() {
+            match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.apply_pending();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.pending_show = None;
+                    self.message = Some("the agent's request was dropped".to_string());
+                    return;
+                }
+                _ => {}
+            }
         }
         let page = self.body_h.saturating_sub(2).max(1) as isize;
         let half = (self.body_h / 2).max(1) as isize;
@@ -1882,8 +1916,13 @@ impl App {
                 .code
                 .as_ref()
                 .is_some_and(|c| c.files.iter().any(|f| f.line.is_some()));
+        let before = self.cur().map(|l| l.id);
         self.show_view_inner(target, view);
         let mut added = Vec::new();
+        // An update while the user is reviewing here leaves their cursor
+        // alone and says what came.
+        let reviewing =
+            self.cur().map(|l| l.id) == before && self.cur().is_some_and(|l| l.unread() > 0);
         if let Some(loc) = self.cur_mut() {
             // A new call replaces the agent's own marks; the user's stay.
             if !append {
@@ -1894,10 +1933,14 @@ impl App {
                 added.push(m.info());
             }
             loc.view.set_marks(Vec::new());
-            loc.place_pending = placed;
+            loc.place_pending = placed && !reviewing;
             // Rebuild even if the content is unchanged: marks need lines.
             loc.fingerprint = 0;
             loc.code_fp = 0;
+        }
+        if reviewing && !added.is_empty() {
+            let letters: Vec<String> = added.iter().map(|m| format!("[{}]", m.label)).collect();
+            self.message = Some(format!("agent added {}", letters.join(" ")));
         }
         self.request();
         self.ack(added)
@@ -1964,6 +2007,7 @@ impl App {
         } else {
             "not on screen".to_string()
         };
+        let is_current = Some(loc.id) == current;
         let unread = loc.unread();
         let mut marks: Vec<&mut LocMark> = loc.marks.iter_mut().collect();
         marks.sort_by_key(|m| (m.path.clone(), m.old_side, m.start, m.end, m.seq));
@@ -1975,13 +2019,18 @@ impl App {
                 info
             })
             .collect();
-        Ok(crate::proto::ReviewResult {
+        let result = crate::proto::ReviewResult {
             location: loc.label(),
             dir: loc.dir.clone(),
             showing,
             marks: infos,
             unread,
-        })
+        };
+        // Read, the comments no longer hold the agent's request back.
+        if is_current && !self.typing() {
+            self.apply_pending();
+        }
+        Ok(result)
     }
 
     fn clear_marks(
@@ -2621,6 +2670,74 @@ impl App {
         }
     }
 
+    // ---- holding an agent's switch ------------------------------------------
+
+    /// The user is in the middle of writing or answering something.
+    fn typing(&self) -> bool {
+        self.marking.is_some() || self.composing.is_some() || self.confirm.is_some()
+    }
+
+    /// Whether showing `target` would move away from the location on
+    /// screen, as `show_view_inner` would resolve it.
+    fn would_switch(&self, target: &Target, view: Option<&crate::proto::ViewSpec>) -> bool {
+        let Some(cur) = self.cur() else { return false };
+        if let Some(spec) = view
+            .and_then(|v| v.range.as_deref())
+            .and_then(crate::pr::parse)
+        {
+            return cur.pr.as_ref().is_none_or(|p| p.spec != spec);
+        }
+        let dir = if target.repo {
+            checkout_root(&target.dir)
+        } else {
+            target.dir.clone()
+        };
+        cur.dir != dir
+    }
+
+    /// A request that would take the user away from a review they are in
+    /// the middle of waits: while they type, or hold comments no agent has
+    /// read.
+    fn held(&self, target: &Target, view: Option<&crate::proto::ViewSpec>) -> bool {
+        self.would_switch(target, view)
+            && (self.typing() || self.cur().is_some_and(|l| l.unread() > 0))
+    }
+
+    fn hold(
+        &mut self,
+        target: Target,
+        view: Option<crate::proto::ViewSpec>,
+    ) -> crate::proto::ShowAck {
+        let words = describe_request(&target, view.as_ref());
+        // Only the latest request waits.
+        self.pending_show = Some(PendingShow {
+            target: target.clone(),
+            view,
+            words,
+        });
+        crate::proto::ShowAck {
+            location: String::new(),
+            dir: target.dir,
+            marks: Vec::new(),
+            unread: self.cur().map_or(0, Location::unread),
+            applied: false,
+        }
+    }
+
+    /// Show what the agent asked for while the user was busy.
+    fn apply_pending(&mut self) {
+        let Some(p) = self.pending_show.take() else {
+            return;
+        };
+        match p.view {
+            Some(view) => {
+                self.show_view(p.target, view);
+            }
+            None => self.open(p.target),
+        }
+        self.message = Some(format!("switched to {}, as the agent asked", p.words));
+    }
+
     // ---- comments ------------------------------------------------------------
 
     /// Enter: a comment on the cursor's line, or edit the comment whose row
@@ -3163,6 +3280,13 @@ impl App {
         };
         let panel_area = Rect::new(body.x, body.bottom() - panel_h, body.width, panel_h);
         body.height -= panel_h;
+        // The banner for a held request takes the top line of the body.
+        let banner = self.pending_show.as_ref().map(|p| {
+            let banner = Rect::new(body.x, body.y, body.width, 1);
+            body.y += 1;
+            body.height = body.height.saturating_sub(1);
+            (banner, p.words.clone())
+        });
         self.body_h = body.height as usize;
         self.body_y = body.y;
         let rebuild = self
@@ -3209,6 +3333,20 @@ impl App {
                     loc.view.render(body, buf, &self.palette, &mut self.hl);
                 }
             }
+        }
+        if let Some((area, words)) = banner {
+            let style = Style::default()
+                .bg(self.palette.comment_bg)
+                .fg(self.palette.comment_fg);
+            buf.set_style(area, style);
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" the agent wants to show {words} "),
+                    style.add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("· y switches · Esc drops it ", style),
+            ]);
+            buf.set_line(area.x, area.y, &line, area.width);
         }
         self.render_status(status, buf);
         let cursor = self
@@ -3393,6 +3531,28 @@ fn checkout_root(dir: &std::path::Path) -> PathBuf {
 }
 
 /// A directory's short name.
+/// An agent's request in a few words: the checkout, and the files, range
+/// or PR it asks for.
+fn describe_request(target: &Target, view: Option<&crate::proto::ViewSpec>) -> String {
+    let name = dir_name(&target.dir);
+    let Some(view) = view else {
+        return name;
+    };
+    if let Some(code) = &view.code {
+        return match code.files.as_slice() {
+            [one] => format!("{name}: {}", one.path),
+            many => format!("{name}: {} files", many.len()),
+        };
+    }
+    match (&view.range, view.files.as_slice()) {
+        (Some(r), _) if crate::pr::parse(r).is_some() => r.clone(),
+        (Some(r), _) => format!("{name}: {r}"),
+        (None, []) => format!("{name}: the diff"),
+        (None, [one]) => format!("{name}: {one}"),
+        (None, many) => format!("{name}: {} files", many.len()),
+    }
+}
+
 fn dir_name(dir: &std::path::Path) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().into_owned())
