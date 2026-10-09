@@ -13,6 +13,14 @@ pub enum Action {
     CloseLocation,
     NextMark,
     PrevMark,
+    /// Comment on the cursor's line.
+    Comment,
+    /// Start marking lines for a comment, or end the marking.
+    MarkRegion,
+    EditComment,
+    DeleteComment,
+    /// Remove every comment of the user's on this location.
+    ClearComments,
     Commits,
     OlderCommit,
     NewerCommit,
@@ -46,13 +54,38 @@ pub struct Command {
 /// In palette order: what the palette is for first, movement after.
 pub const COMMANDS: &[Command] = &[
     Command {
+        action: Action::Comment,
+        name: "Comment on this line",
+        keys: "Enter",
+    },
+    Command {
+        action: Action::MarkRegion,
+        name: "Mark lines to comment on",
+        keys: "Ctrl-Space",
+    },
+    Command {
+        action: Action::EditComment,
+        name: "Edit comment",
+        keys: "e",
+    },
+    Command {
+        action: Action::DeleteComment,
+        name: "Delete comment",
+        keys: "x",
+    },
+    Command {
+        action: Action::ClearComments,
+        name: "Clear your comments here",
+        keys: "X",
+    },
+    Command {
         action: Action::NextMark,
-        name: "Next highlight",
+        name: "Next mark",
         keys: ">",
     },
     Command {
         action: Action::PrevMark,
-        name: "Previous highlight",
+        name: "Previous mark",
         keys: "<",
     },
     Command {

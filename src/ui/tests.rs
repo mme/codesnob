@@ -72,10 +72,13 @@ impl Harness {
         let mut h = Self {
             app,
             rx,
-            term: Terminal::new(TestBackend::new(100, 30)).unwrap(),
+            term: Terminal::new(TestBackend::new(120, 30)).unwrap(),
             scratch: Vec::new(),
         };
         h.settle();
+        // Drawn once, as the real viewer is before any key arrives, so the
+        // view knows how much is in sight.
+        h.screen();
         h
     }
 
@@ -157,6 +160,44 @@ impl Harness {
             .unwrap_or("")
             .trim()
             .to_string()
+    }
+
+    /// The screen row drawn as the cursor's, and its text.
+    fn cursor(&mut self) -> (usize, String) {
+        let screen = self.screen();
+        let p = Palette::dark();
+        let bases = [
+            p.add_bg,
+            p.del_bg,
+            p.mark_bg,
+            p.comment_bg,
+            p.header_bg,
+            p.add_emph,
+            p.del_emph,
+        ];
+        let cursor_bgs: Vec<Color> = std::iter::once(p.cursor_bg)
+            .chain(bases.iter().map(|&c| p.cursor_over(c)))
+            .collect();
+        let buf = self.term.backend().buffer();
+        let (w, h) = (buf.area.width, buf.area.height);
+        let rows: Vec<usize> = (0..h - 1)
+            .filter(|&y| cursor_bgs.contains(&buf[(w - 1, y)].bg))
+            .map(|y| y as usize)
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one cursor row:\n{screen}");
+        let text = screen.lines().nth(rows[0]).unwrap_or("").to_string();
+        (rows[0], text)
+    }
+
+    fn click(&mut self, row: u16) {
+        self.app
+            .dispatch(Msg::Input(Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 10,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })));
+        self.settle();
     }
 }
 
@@ -992,11 +1033,14 @@ fn leaving_a_location_mid_preview_puts_its_range_back() {
     let b = small_repo("ui-show-preview-b");
     let mut h = Harness::open(&a);
     h.keys("c<down>");
-    h.app.dispatch(Msg::Show(Target {
-        dir: b.clone(),
-        base: None,
-        repo: true,
-    }));
+    h.app.dispatch(Msg::Show(
+        Target {
+            dir: b.clone(),
+            base: None,
+            repo: true,
+        },
+        None,
+    ));
     h.settle();
     h.keys("-");
     assert_eq!(h.app.cur().unwrap().dir, a);
@@ -1612,6 +1656,852 @@ fn code(rev: Option<&str>, files: &[(&str, Option<usize>)]) -> crate::proto::Vie
 }
 
 /// A repo whose src/long.rs has 60 numbered lines.
+#[test]
+fn the_cursor_moves_within_the_view_and_the_view_follows_near_the_edge() {
+    let dir = repo_with_long_file("ui-cursor");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    let (row, text) = h.cursor();
+    assert_eq!(row, 0, "opens with the cursor on the header: {text}");
+    let buf = h.term.backend().buffer();
+    assert!(
+        !buf[(0, 1)].modifier.contains(Modifier::BOLD),
+        "other rows keep plain line numbers"
+    );
+
+    h.keys(&"j".repeat(20));
+    let (row, text) = h.cursor();
+    assert!(text.contains("// line 20"), "{text}");
+    assert_eq!(
+        row, 20,
+        "the view stays put while the cursor is clear of the edge"
+    );
+    let buf = h.term.backend().buffer();
+    assert!(
+        buf[(0, 20)].modifier.contains(Modifier::BOLD),
+        "the cursor row's line number is bold"
+    );
+
+    h.keys(&"j".repeat(8));
+    let (row, text) = h.cursor();
+    assert!(text.contains("// line 28"), "{text}");
+    assert_eq!(
+        row, 28,
+        "the cursor reaches the bottom row before anything scrolls"
+    );
+    assert!(h.screen().contains("// line 1\n"), "{}", h.screen());
+
+    h.keys("jj");
+    let (row, text) = h.cursor();
+    assert!(text.contains("// line 30"), "{text}");
+    let screen = h.screen();
+    assert!(
+        !screen.contains("// line 1\n") && screen.contains("// line 30"),
+        "then the view follows:\n{screen}"
+    );
+    assert!(
+        screen.lines().next().unwrap().contains("src/long.rs"),
+        "the header sticks once scrolled:\n{screen}"
+    );
+    assert_eq!(row, 28, "the cursor stays on the bottom row:\n{screen}");
+
+    h.keys("G");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("// line 60"),
+        "G lands on the last row: {text}"
+    );
+    assert!(
+        h.screen().lines().nth(28).unwrap().contains("// line 60"),
+        "with the last row at the bottom:\n{}",
+        h.screen()
+    );
+    h.keys(&"k".repeat(31));
+    let (row, text) = h.cursor();
+    assert!(text.contains("// line 29"), "{text}");
+    assert_eq!(
+        row, 1,
+        "the view scrolls up once the cursor would leave it at the top"
+    );
+
+    h.keys("g");
+    assert_eq!(h.cursor().0, 0);
+    cleanup(dir);
+}
+
+#[test]
+fn paging_moves_the_view_and_keeps_the_cursor_in_sight() {
+    let dir = repo_with_long_file("ui-cursor-page");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.keys(" ");
+    let screen = h.screen();
+    let (_, text) = h.cursor();
+    assert!(
+        !screen.contains("// line 2\n"),
+        "a page down moves the view:\n{screen}"
+    );
+    assert!(
+        text.contains("// line 27"),
+        "the cursor keeps its place on screen, now the top row: {text}"
+    );
+    h.keys("<c-u>");
+    let (row, text) = h.cursor();
+    assert!(
+        row == 1 && text.contains("// line 13"),
+        "half a page up moves view and cursor alike: {row} {text}"
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn the_cursor_skips_blank_rows_and_follows_a_click() {
+    let dir = branch_with_history("ui-cursor-blank");
+    let mut h = Harness::open(&dir);
+    let mut seen = Vec::new();
+    for _ in 0..40 {
+        h.keys("j");
+        let (_, text) = h.cursor();
+        assert!(!text.trim().is_empty(), "never rests on a blank row");
+        seen.push(text);
+    }
+    assert!(
+        seen.iter().filter(|t| t.contains("/")).count() >= 2,
+        "steps onto the file headers on the way: {seen:?}"
+    );
+    h.keys("g");
+    h.click(5);
+    let (row, text) = h.cursor();
+    assert_eq!(row, 5, "{text}");
+    h.click(0);
+    assert_eq!(h.cursor().0, 0, "the header counts too");
+    cleanup(dir);
+}
+
+#[test]
+fn a_reload_keeps_the_cursor_on_its_line_and_screen_row() {
+    let dir = branch_with_history("ui-cursor-reload");
+    let mut h = Harness::open(&dir);
+    h.keys("jjjjj");
+    let before = h.cursor();
+    std::fs::write(dir.join("fresh.txt"), "new file\n").unwrap();
+    h.keys("r");
+    assert!(h.screen().contains("fresh.txt"), "{}", h.screen());
+    assert_eq!(h.cursor(), before);
+    cleanup(dir);
+}
+
+#[test]
+fn enter_comments_on_the_cursors_line() {
+    let dir = repo_with_long_file("ui-comment-line");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    h.keys("jjjjj<enter>");
+    let screen = h.screen();
+    assert!(
+        screen.contains(" Comment ") && screen.contains("src/long.rs 5"),
+        "the prompt names the line:\n{screen}"
+    );
+    assert!(screen.contains("Enter saves, Esc cancels"), "{screen}");
+    h.keys("looks good<enter>");
+    let screen = h.screen();
+    assert!(
+        screen.contains("[A] you: looks good"),
+        "the comment sits above its line, lettered:\n{screen}"
+    );
+    let line5 = screen.lines().find(|l| l.contains("// line 5")).unwrap();
+    assert!(line5.starts_with("A "), "{line5}");
+    assert!(h.status().contains("[A] saved"), "{}", h.status());
+    h.keys("j");
+    assert!(
+        h.status().contains("1 yours") && h.status().contains("1 mark"),
+        "{}",
+        h.status()
+    );
+
+    // Esc in the prompt keeps nothing.
+    h.keys("jjj<enter>nope<esc>");
+    assert!(!h.screen().contains("nope") && !h.screen().contains("[B]"));
+    assert_eq!(h.app.cur().unwrap().marks.len(), 1);
+
+    // Enter on the comment's own row edits it.
+    h.keys("<");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("// line 5"),
+        "the jump lands on the first line: {text}"
+    );
+    h.keys("k<enter>");
+    let screen = h.screen();
+    assert!(screen.contains("[A] src/long.rs 5"), "edits [A]:\n{screen}");
+    h.keys("<c-u>still good<enter>");
+    assert!(h.screen().contains("[A] you: still good"), "{}", h.screen());
+    assert_eq!(h.app.cur().unwrap().marks.len(), 1, "edited, not added");
+    cleanup(dir);
+}
+
+#[test]
+fn ctrl_space_marks_a_region_for_a_comment() {
+    let dir = repo_with_long_file("ui-comment-region");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    h.keys("jjjjjjjjjj<c- >");
+    assert!(
+        h.status()
+            .starts_with("marking line 10 · Enter or Ctrl-Space to comment · Esc cancels"),
+        "{}",
+        h.status()
+    );
+    h.keys("jjj");
+    assert!(
+        h.status().starts_with("marking lines 10-13"),
+        "{}",
+        h.status()
+    );
+    let screen = h.screen();
+    let barred: Vec<&str> = screen.lines().filter(|l| l.starts_with('▌')).collect();
+    assert_eq!(
+        barred.len(),
+        4,
+        "the lines being marked carry a bar:\n{screen}"
+    );
+    h.keys("kkkkkk");
+    assert!(
+        h.status().starts_with("marking lines 7-10"),
+        "upwards too: {}",
+        h.status()
+    );
+    h.keys("<esc>");
+    assert!(h.status().contains("marking cancelled"), "{}", h.status());
+    assert!(!h.screen().lines().any(|l| l.starts_with('▌')));
+
+    // v starts one too; a second Ctrl-Space ends it.
+    h.keys("vjj<c- >");
+    assert!(h.screen().contains("src/long.rs 7-9"), "{}", h.screen());
+    h.keys("three lines<enter>");
+    let screen = h.screen();
+    assert!(screen.contains("[A] you: three lines"), "{screen}");
+    let m = &h.app.cur().unwrap().marks[0];
+    assert_eq!((m.start, m.end), (7, 9));
+    assert_eq!(
+        m.text.as_deref(),
+        Some(
+            &[
+                "// line 7".to_string(),
+                "// line 8".to_string(),
+                "// line 9".to_string()
+            ][..]
+        )
+    );
+    assert!(
+        h.screen().contains("[A] you: three lines"),
+        "{}",
+        h.screen()
+    );
+    h.keys(":");
+    assert!(
+        h.screen().contains("Mark lines to comment on [Ctrl-Space]"),
+        "{}",
+        h.screen()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn comments_are_deleted_one_by_one_or_cleared_after_a_question() {
+    let dir = repo_with_long_file("ui-comment-delete");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![hl("src/long.rs", 2, 3, Some("theirs"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    // Opens at [A], the cursor on line 2.
+    h.keys("jjjj<enter>one<enter>");
+    h.keys("jjjj<enter>two<enter>");
+    h.keys("kj");
+    assert!(
+        h.status().contains("2 yours") && h.status().contains("3 marks"),
+        "{}",
+        h.status()
+    );
+    h.keys("x");
+    assert!(h.status().contains("[C] removed"), "{}", h.status());
+    assert!(
+        !h.screen().contains("[C] you") && h.screen().contains("[B] you: one"),
+        "{}",
+        h.screen()
+    );
+    h.keys("gjx");
+    assert!(
+        h.status().contains("no comment of yours here"),
+        "an agent's highlight stays: {}",
+        h.status()
+    );
+    assert!(h.screen().contains("[A] theirs"));
+    h.keys("X");
+    assert!(
+        h.status().contains("clear your 1 comment here? y/n"),
+        "{}",
+        h.status()
+    );
+    h.keys("n");
+    assert!(h.status().contains("kept") && h.screen().contains("[B] you: one"));
+    h.keys("Xy");
+    assert!(h.status().contains("1 comment cleared"), "{}", h.status());
+    assert!(!h.screen().contains("[B]") && h.screen().contains("[A] theirs"));
+    h.keys("X");
+    assert!(
+        h.status().contains("no comments of yours here"),
+        "{}",
+        h.status()
+    );
+    // The letters go on where they left off.
+    h.keys("jjjjjjj<enter>again<enter>");
+    assert!(h.screen().contains("[D] you: again"), "{}", h.screen());
+    cleanup(dir);
+}
+
+#[test]
+fn a_comment_on_deleted_lines_speaks_in_old_line_numbers() {
+    let dir = branch_with_history("ui-comment-deleted");
+    let mut h = Harness::open(&dir);
+    // gone.txt is deleted: its one line is on the old side only.
+    h.keys("fgone<enter>");
+    let (_, text) = h.cursor();
+    assert!(text.contains("gone.txt"), "{text}");
+    h.keys("jj<enter>");
+    assert!(h.screen().contains("gone.txt old 1"), "{}", h.screen());
+    h.keys("why<enter>");
+    let m = &h.app.cur().unwrap().marks[0];
+    assert!(m.old_side && (m.start, m.end) == (1, 1) && !m.with_deletions);
+    assert!(h.screen().contains("[A] you: why"), "{}", h.screen());
+    // Deleted and added lines together: the new side's numbers, flagged.
+    h.keys("fa.txt<enter>");
+    h.keys("jj<c- >j<enter>");
+    assert!(h.screen().contains("a.txt 1"), "{}", h.screen());
+    h.keys("both<enter>");
+    let m = &h.app.cur().unwrap().marks[1];
+    assert!(
+        !m.old_side && m.with_deletions && (m.start, m.end) == (1, 1),
+        "{:?}",
+        (m.start, m.end)
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn a_comment_follows_its_lines_through_an_edit() {
+    let dir = repo_with_long_file("ui-comment-follow");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    h.keys("jjjjjjjjjj<enter>here<enter>");
+    assert_eq!(h.app.cur().unwrap().marks[0].start, 10);
+    let body: String = std::iter::once("// new\n".to_string())
+        .chain((1..=60).map(|i| format!("// line {i}\n")))
+        .collect();
+    std::fs::write(dir.join("src/long.rs"), body).unwrap();
+    wait_until(&mut h, &|h| h.app.cur().unwrap().marks[0].start == 11);
+    assert!(h.screen().contains("[A] you: here"), "{}", h.screen());
+    cleanup(dir);
+}
+
+#[test]
+fn an_agents_call_is_answered_with_letters_location_and_unread_count() {
+    let dir = repo_with_long_file("ui-ack");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![
+        hl("src/long.rs", 30, 30, Some("later")),
+        hl("src/long.rs", 10, 11, None),
+    ];
+    let ack = h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    assert_eq!(ack.location, "L1");
+    assert_eq!(ack.dir, dir);
+    let letters: Vec<(String, usize)> = ack
+        .marks
+        .iter()
+        .map(|m| (m.label.clone(), m.start))
+        .collect();
+    assert_eq!(
+        letters,
+        [("A".to_string(), 10), ("B".to_string(), 30)],
+        "lettered by position, as the viewer shows them"
+    );
+    assert!(ack.applied && ack.unread == 0);
+    assert!(h.status().contains("L1  ·"), "{}", h.status());
+
+    h.keys("jjjjj<enter>hm<enter>k");
+    assert!(h.status().contains("1 yours (1 unread)"), "{}", h.status());
+    let ack = h
+        .app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    assert_eq!(ack.unread, 1, "the reply nudges the agent");
+    assert!(ack.marks.is_empty());
+    cleanup(dir);
+}
+
+#[test]
+fn get_review_lists_every_mark_and_counts_comments_as_read() {
+    let dir = repo_with_long_file("ui-review");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![hl("src/long.rs", 20, 22, Some("the loop"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    h.keys("jjj<enter>needs a name<enter>");
+    let r = h.app.review(None).unwrap();
+    assert_eq!((r.location.as_str(), r.unread), ("L1", 1));
+    assert_eq!(r.dir, dir);
+    assert_eq!(r.showing, "src/long.rs · working tree");
+    assert_eq!(r.marks.len(), 2);
+    let a = &r.marks[0];
+    assert_eq!(
+        (a.label.as_str(), a.author.as_str(), a.start, a.end),
+        ("A", "agent", 20, 22)
+    );
+    assert_eq!(a.text.as_deref(), Some("the loop"));
+    assert!(a.lines.is_empty(), "no code for the agent's own highlights");
+    let b = &r.marks[1];
+    assert_eq!(
+        (b.label.as_str(), b.author.as_str(), b.start, b.end),
+        ("B", "user", 23, 23)
+    );
+    assert!(b.new, "not read before");
+    assert_eq!(b.lines, ["// line 23"]);
+    assert_eq!(b.text.as_deref(), Some("needs a name"));
+    let text = r.render();
+    assert!(
+        text.contains("[B] comment src/long.rs 23 (new): needs a name\n    23 | // line 23"),
+        "{text}"
+    );
+
+    // Read once, a comment stays until edited.
+    let r = h.app.review(Some("L1")).unwrap();
+    assert!(!r.marks[1].new && r.unread == 0, "{r:?}");
+    assert!(!h.status().contains("unread"), "{}", h.status());
+    h.keys("<");
+    h.keys("jjje<c-u>better name<enter>");
+    let r = h.app.review(None).unwrap();
+    assert!(
+        r.marks[1].new && r.unread == 1,
+        "an edit makes it new again: {r:?}"
+    );
+
+    let err = h.app.review(Some("L9")).unwrap_err();
+    assert_eq!(err, "no location L9 in this viewer");
+    let err = h.app.review(Some("nine")).unwrap_err();
+    assert!(err.contains("look like L3"), "{err}");
+    cleanup(dir);
+}
+
+#[test]
+fn clear_marks_takes_letters_or_an_author() {
+    let dir = repo_with_long_file("ui-clear");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![
+        hl("src/long.rs", 10, 10, Some("a")),
+        hl("src/long.rs", 20, 20, Some("b")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    h.keys("jj<enter>one<enter>");
+    h.keys("jjjjj<enter>two<enter>");
+    let r = h.app.clear_marks(None, "mine", &["c".to_string()]).unwrap();
+    assert_eq!(r.cleared, ["C"]);
+    assert_eq!((r.remaining, r.unread), (3, 1));
+    assert!(h.status().contains("agent cleared [C]"), "{}", h.status());
+    assert!(!h.screen().contains("[C] you"), "{}", h.screen());
+    let err = h
+        .app
+        .clear_marks(None, "mine", &["Z".to_string()])
+        .unwrap_err();
+    assert_eq!(err, "no mark [Z] on L1");
+    let r = h.app.clear_marks(None, "mine", &[]).unwrap();
+    assert_eq!(r.cleared, ["A", "B"]);
+    assert!(h.screen().contains("[D] you: two") && !h.screen().contains("[A] a"));
+    let r = h.app.clear_marks(Some("L1"), "user", &[]).unwrap();
+    assert_eq!(
+        (r.cleared.as_slice(), r.remaining),
+        (["D".to_string()].as_slice(), 0)
+    );
+    let r = h.app.clear_marks(None, "all", &[]).unwrap();
+    assert!(r.cleared.is_empty());
+    cleanup(dir);
+}
+
+#[test]
+fn append_adds_files_and_keeps_every_mark() {
+    let dir = repo_with_long_file("ui-append");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![hl("src/long.rs", 10, 10, Some("first"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    h.keys("jjj<enter>mine<enter>");
+    let mut spec = code(None, &[("a.txt", None)]);
+    spec.highlights = vec![hl("a.txt", 1, 1, Some("second"))];
+    spec.append = true;
+    let ack = h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    assert_eq!(ack.marks[0].label, "C");
+    assert!(
+        screen.contains("[A] first")
+            && screen.contains("[B] you: mine")
+            && screen.contains("[C] second"),
+        "every mark stays and the new file joins:\n{screen}"
+    );
+    assert!(h.status().contains("agent added [C]"), "{}", h.status());
+    h.keys("k");
+    assert!(
+        h.status().starts_with("2 files · working tree"),
+        "{}",
+        h.status()
+    );
+
+    // Without append the next call replaces the view and the agent's marks.
+    let mut spec = code(None, &[("a.txt", None)]);
+    spec.highlights = vec![hl("a.txt", 1, 1, Some("third"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen.contains("[D] third") && !screen.contains("[C]"),
+        "{screen}"
+    );
+    assert_eq!(
+        h.app.cur().unwrap().marks.len(),
+        2,
+        "the user's comment stays, off screen"
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn a_switch_waits_behind_a_banner_while_comments_are_unread() {
+    let a = repo_with_long_file("ui-gate-a");
+    let b = small_repo("ui-gate-b");
+    let mut h = Harness::open(&a);
+    h.keys("jj<enter>look<enter>k");
+    assert!(h.status().contains("1 unread"), "{}", h.status());
+    h.app.dispatch(Msg::View(
+        target(&b),
+        Box::new(view(None, &["readme.md"])),
+        None,
+    ));
+    h.settle();
+    let screen = h.screen();
+    assert_eq!(h.app.cur().unwrap().dir, a, "still here");
+    let banner = screen.lines().next().unwrap();
+    assert!(
+        banner.starts_with(" the agent wants to show codesnob-ui-gate-b-")
+            && banner.contains(": readme.md · y switches · Esc drops it"),
+        "the banner:\n{screen}"
+    );
+    assert!(
+        screen.contains("[A] you: look"),
+        "the review stays on screen:\n{screen}"
+    );
+    h.keys("j");
+    assert!(
+        h.screen().contains("the agent wants"),
+        "other keys leave the banner up"
+    );
+    h.keys("y");
+    assert_eq!(h.app.cur().unwrap().dir, b, "y switches");
+    assert!(!h.screen().contains("the agent wants"), "{}", h.screen());
+    assert!(
+        h.status().contains("switched to codesnob-ui-gate-b-")
+            && h.status().contains(": readme.md, as the agent asked"),
+        "{}",
+        h.status()
+    );
+    h.keys("-");
+    assert_eq!(h.app.cur().unwrap().dir, a);
+    assert_eq!(
+        h.app.cur().unwrap().unread(),
+        1,
+        "the comment is still there"
+    );
+    cleanup(a);
+    cleanup(b);
+}
+
+#[test]
+fn a_held_request_is_dropped_with_esc_or_replaced_by_a_newer_one() {
+    let a = repo_with_long_file("ui-gate-drop");
+    let b = small_repo("ui-gate-drop-b");
+    let c = small_repo("ui-gate-drop-c");
+    let mut h = Harness::open(&a);
+    h.keys("jj<enter>look<enter>");
+    let ack = h.app.show_view(target(&b), view(None, &[]));
+    assert!(ack.applied, "show_view itself never holds; dispatch does");
+    h.keys("-");
+    assert_eq!(h.app.cur().unwrap().dir, a);
+    h.app.dispatch(Msg::Show(target(&b), None));
+    h.app.dispatch(Msg::Show(target(&c), None));
+    h.settle();
+    assert!(
+        h.screen().contains("wants to show codesnob-ui-gate-drop-c"),
+        "the newer one waits: {}",
+        h.screen()
+    );
+    h.keys("<esc>");
+    assert!(!h.screen().contains("wants to show"));
+    assert!(
+        h.status().contains("the agent's request was dropped"),
+        "{}",
+        h.status()
+    );
+    assert_eq!(h.app.cur().unwrap().dir, a);
+    cleanup(a);
+    cleanup(b);
+    cleanup(c);
+}
+
+#[test]
+fn a_held_request_applies_once_the_agent_reads_the_comments() {
+    let a = repo_with_long_file("ui-gate-read");
+    let b = small_repo("ui-gate-read-b");
+    let mut h = Harness::open(&a);
+    h.keys("jj<enter>look<enter>");
+    h.app.dispatch(Msg::View(
+        target(&b),
+        Box::new(view(None, &["readme.md"])),
+        None,
+    ));
+    h.settle();
+    assert_eq!(h.app.cur().unwrap().dir, a);
+    let r = h.app.review(None).unwrap();
+    assert_eq!(r.unread, 1);
+    h.settle();
+    assert_eq!(
+        h.app.cur().unwrap().dir,
+        b,
+        "read, the request goes through"
+    );
+    assert!(!h.screen().contains("wants to show"));
+    cleanup(a);
+    cleanup(b);
+}
+
+#[test]
+fn typing_holds_a_switch_even_without_unread_comments() {
+    let a = repo_with_long_file("ui-gate-typing");
+    let b = small_repo("ui-gate-typing-b");
+    let mut h = Harness::open(&a);
+    h.keys("jj<enter>half a thou");
+    h.app.dispatch(Msg::Show(target(&b), None));
+    h.settle();
+    assert_eq!(h.app.cur().unwrap().dir, a);
+    h.keys("ght<enter>");
+    assert!(
+        h.screen().contains("[A] you: half a thought"),
+        "{}",
+        h.screen()
+    );
+    assert!(
+        h.screen()
+            .contains("wants to show codesnob-ui-gate-typing-b"),
+        "{}",
+        h.screen()
+    );
+    // Reading while the user types changes nothing; afterwards it does.
+    h.keys("v");
+    h.app.review(None).unwrap();
+    assert_eq!(
+        h.app.cur().unwrap().dir,
+        a,
+        "a marking in progress keeps it held"
+    );
+    h.keys("<esc>");
+    h.app.review(None).unwrap();
+    assert_eq!(h.app.cur().unwrap().dir, b);
+    cleanup(a);
+    cleanup(b);
+}
+
+#[test]
+fn an_update_of_the_same_location_goes_through_and_says_what_it_added() {
+    let dir = repo_with_long_file("ui-gate-inplace");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    h.keys("jjjjjjjjjj<enter>here<enter>");
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![
+        hl("src/long.rs", 30, 30, Some("one")),
+        hl("src/long.rs", 40, 40, Some("two")),
+    ];
+    h.app
+        .dispatch(Msg::View(target(&dir), Box::new(spec), None));
+    h.settle();
+    assert!(h.status().contains("agent added [B] [C]"), "{}", h.status());
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 10"), "the cursor stays put: {text}");
+    assert!(!h.screen().contains("wants to show"));
+    cleanup(dir);
+}
+
+#[test]
+fn without_a_review_in_progress_a_switch_is_immediate() {
+    let a = repo_with_long_file("ui-gate-free");
+    let b = small_repo("ui-gate-free-b");
+    let mut h = Harness::open(&a);
+    h.keys("jj<enter>look<enter>");
+    h.app.review(None).unwrap();
+    h.app.dispatch(Msg::View(
+        target(&b),
+        Box::new(view(None, &["readme.md"])),
+        None,
+    ));
+    h.settle();
+    assert_eq!(h.app.cur().unwrap().dir, b);
+    cleanup(a);
+    cleanup(b);
+}
+
+#[test]
+fn deleting_a_comment_from_its_own_row_leaves_the_cursor_on_its_line() {
+    let dir = repo_with_long_file("ui-comment-row-delete");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    h.keys(&"j".repeat(40));
+    h.keys("<enter>gone soon<enter>");
+    h.keys("k");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("[A] you: gone soon"),
+        "on the comment's row: {text}"
+    );
+    h.keys("e<c-u>still here<enter>");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("[A] you: still here"),
+        "an edit keeps the cursor on the row: {text}"
+    );
+    h.keys("x");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("// line 40"),
+        "the cursor lands on the line it was about: {text}"
+    );
+    assert!(
+        h.screen().contains("// line 39"),
+        "and the view stays put: {}",
+        h.screen()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn enter_on_an_agents_highlight_answers_it() {
+    let dir = repo_with_long_file("ui-comment-reply");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![hl("src/long.rs", 20, 22, Some("the loop"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    h.keys("k");
+    let (_, text) = h.cursor();
+    assert!(text.contains("[A] the loop"), "{text}");
+    h.keys("<enter>");
+    assert!(
+        h.screen().contains("re [A] src/long.rs 20-22"),
+        "{}",
+        h.screen()
+    );
+    h.keys("not a loop<enter>");
+    let screen = h.screen();
+    assert!(screen.contains("[B] you re [A]: not a loop"), "{screen}");
+    let m = &h.app.cur().unwrap().marks[1];
+    assert_eq!((m.start, m.end, m.re.as_deref()), (20, 22, Some("A")));
+    assert_eq!(m.text.as_deref().map(|t| t.len()), Some(3));
+    let r = h.app.review(None).unwrap();
+    assert!(
+        r.render()
+            .contains("[B] comment src/long.rs 20-22 (new, re [A]): not a loop"),
+        "{}",
+        r.render()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn angle_brackets_step_from_the_cursor_not_from_the_last_jump() {
+    let dir = repo_with_long_file("ui-marks-from-cursor");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![
+        hl("src/long.rs", 10, 10, Some("a")),
+        hl("src/long.rs", 30, 30, Some("b")),
+        hl("src/long.rs", 50, 50, Some("c")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    assert!(h.status().contains("[A] 1 of 3"), "{}", h.status());
+    // Twenty-five lines down, plus [B]'s own row on the way.
+    h.keys(&"j".repeat(26));
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 35"), "{text}");
+    h.keys(">");
+    assert!(
+        h.status().contains("[C] 3 of 3"),
+        "the next below the cursor: {}",
+        h.status()
+    );
+    h.keys(&"k".repeat(16));
+    h.keys("<");
+    assert!(
+        h.status().contains("[B] 2 of 3"),
+        "the one above the cursor: {}",
+        h.status()
+    );
+    h.keys("<");
+    assert!(
+        h.status().contains("[A] 1 of 3"),
+        "from a mark's first line, the one before it: {}",
+        h.status()
+    );
+    h.keys("k<");
+    assert!(
+        h.status().contains("[A] 1 of 3"),
+        "from the row itself, nothing above: {}",
+        h.status()
+    );
+    h.keys("G<");
+    assert!(h.status().contains("[C] 3 of 3"), "{}", h.status());
+    cleanup(dir);
+}
+
 fn repo_with_long_file(name: &str) -> PathBuf {
     let dir = branch_with_history(name);
     let body: String = (1..=60).map(|i| format!("// line {i}\n")).collect();
@@ -1768,39 +2658,148 @@ fn highlights_are_numbered_tinted_and_stepped_through() {
     h.app.show_view(target(&dir), spec);
     h.settle();
     let screen = h.screen();
-    let note = screen.lines().find(|l| l.contains('①')).expect("numbered");
+    let note = screen
+        .lines()
+        .find(|l| l.contains("[A]"))
+        .expect("lettered");
     assert!(note.contains("the loop"), "{note}");
-    let row = screen.lines().position(|l| l.contains('①')).unwrap();
+    let row = screen.lines().position(|l| l.contains("[A]")).unwrap();
     assert_eq!(
         row, 1,
-        "① sits at the top, under the file header:\n{screen}"
+        "[A] sits at the top, under the file header:\n{screen}"
     );
     let marked: Vec<&str> = screen
         .lines()
-        .filter(|l| l.starts_with('▌') && l.contains("// line 2"))
+        .filter(|l| (l.starts_with('▌') || l.starts_with('A')) && l.contains("// line 2"))
         .collect();
-    assert_eq!(marked.len(), 3, "lines 20-22 carry the bar: {screen}");
+    assert_eq!(marked.len(), 3, "lines 20-22 carry the mark: {screen}");
+    assert!(
+        marked[0].starts_with("A ") && marked[1].starts_with("▌ "),
+        "the letter on the first line, the bar below: {marked:?}"
+    );
     assert!(
         marked.iter().all(|l| l.contains(" 2")),
-        "the bar sits beside the number, not on it: {marked:?}"
+        "the mark sits beside the number, not on it: {marked:?}"
     );
-    assert!(h.status().contains("highlight 1 of 2"), "{}", h.status());
+    assert!(h.status().contains("[A] 1 of 2"), "{}", h.status());
 
     h.keys(">");
     assert_eq!(
-        h.screen().lines().position(|l| l.contains('②')),
+        h.screen().lines().position(|l| l.contains("[B]")),
         Some(1),
         "every jump puts the note at the top"
     );
-    assert!(h.status().contains("highlight 2 of 2"), "{}", h.status());
+    assert!(h.status().contains("[B] 2 of 2"), "{}", h.status());
     h.keys("<");
-    assert!(h.status().contains("highlight 1 of 2"), "{}", h.status());
+    assert!(h.status().contains("[A] 1 of 2"), "{}", h.status());
     h.keys(":");
-    assert!(h.screen().contains("Next highlight [>]"), "{}", h.screen());
+    assert!(h.screen().contains("Next mark [>]"), "{}", h.screen());
     h.keys("<esc><esc>");
     assert!(
-        !h.screen().contains('①'),
-        "Esc returns and the highlights go"
+        h.status().contains("of 2") && h.screen().contains("+60"),
+        "Esc returns to the diff and the marks stay with their code: {}",
+        h.status()
+    );
+    h.keys("><");
+    assert!(h.screen().contains("[A] the loop"), "{}", h.screen());
+    cleanup(dir);
+}
+
+#[test]
+fn letters_are_fixed_and_a_new_call_continues_the_sequence() {
+    let dir = repo_with_long_file("ui-marks-letters");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![
+        hl("src/long.rs", 10, 11, Some("first")),
+        hl("src/long.rs", 30, 30, Some("second")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen.contains("[A] first") && screen.contains("[B] second"),
+        "{screen}"
+    );
+
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![hl("src/long.rs", 20, 20, Some("third"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen.contains("[C] third"),
+        "the next call goes on from where the letters were:\n{screen}"
+    );
+    assert!(
+        !screen.contains("[A]") && !screen.contains("[B]"),
+        "and replaces the agent's earlier highlights:\n{screen}"
+    );
+    assert!(h.status().contains("[C] 1 of 1"), "{}", h.status());
+
+    // Twenty-six more and the letters go on past Z.
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = (1..=20).map(|i| hl("src/long.rs", i, i, None)).collect();
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = (40..=43).map(|i| hl("src/long.rs", i, i, None)).collect();
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen.contains("[X]") && screen.contains("[AA]"),
+        "{screen}"
+    );
+    let line40 = screen.lines().find(|l| l.contains("// line 40")).unwrap();
+    assert!(
+        line40.starts_with("X  40"),
+        "a two-letter column, padded: {line40}"
+    );
+    let line43 = screen.lines().find(|l| l.contains("// line 43")).unwrap();
+    assert!(line43.starts_with("AA 43"), "{line43}");
+    cleanup(dir);
+}
+
+#[test]
+fn overlapping_marks_show_the_newest_letter_and_all_of_them_under_the_cursor() {
+    let dir = repo_with_long_file("ui-marks-overlap");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![
+        hl("src/long.rs", 10, 20, Some("outer")),
+        hl("src/long.rs", 15, 16, Some("inner")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    let line = |n: usize| {
+        screen
+            .lines()
+            .find(|l| l.contains(&format!("// line {n}")))
+            .unwrap()
+            .to_string()
+    };
+    assert!(line(10).starts_with("A "), "{}", line(10));
+    assert!(line(12).starts_with("▌ "), "{}", line(12));
+    assert!(
+        line(15).starts_with("B "),
+        "the newer mark wins the gutter: {}",
+        line(15)
+    );
+    assert!(line(16).starts_with("▌ "), "{}", line(16));
+    assert!(
+        line(17).starts_with("▌ "),
+        "back to the outer mark: {}",
+        line(17)
+    );
+    assert!(!h.status().contains("[A] [B]"), "{}", h.status());
+    // Five lines down and over [B]'s own row.
+    h.keys("jjjjjj");
+    assert!(
+        h.cursor().1.contains("// line 15") && h.status().contains("[A] [B]"),
+        "both letters under the cursor: {}",
+        h.status()
     );
     cleanup(dir);
 }
@@ -1829,7 +2828,7 @@ fn a_highlight_on_an_unchanged_line_shows_it_in_the_diff() {
         .lines()
         .find(|l| l.contains("// line 50"))
         .expect("line 50 shows");
-    assert!(line50.starts_with('▌'), "{line50}");
+    assert!(line50.starts_with('A'), "{line50}");
     cleanup(dir);
 }
 
@@ -1857,16 +2856,26 @@ fn highlights_follow_their_code_and_go_when_it_does() {
         "follows lines 30-31 to their new place"
     );
 
-    // Its text replaced: the highlight is removed, and the status bar says so.
+    // Its text replaced: the highlight goes stale, keeps its letter, and
+    // the status bar says so.
     let body: String = (1..=60).map(|i| format!("// other {i}\n")).collect();
     std::fs::write(dir.join("src/long.rs"), body).unwrap();
-    wait_until(&mut h, &|h| h.app.cur().unwrap().marks.is_empty());
-    assert!(h.app.cur().unwrap().marks.is_empty());
+    wait_until(&mut h, &|h| h.app.cur().unwrap().marks[0].stale);
     assert!(
-        h.status()
-            .contains("a highlight no longer matches its code; removed"),
+        h.status().contains("[A] no longer matches its code"),
         "{}",
         h.status()
+    );
+    let screen = h.screen();
+    assert!(
+        screen.contains("[A] stale · watch me"),
+        "the row stays, flagged:\n{screen}"
+    );
+    assert!(
+        !screen
+            .lines()
+            .any(|l| l.starts_with('▌') || l.starts_with('A')),
+        "no line is tinted or barred:\n{screen}"
     );
     cleanup(dir);
 }
@@ -1893,7 +2902,7 @@ fn angle_brackets_move_between_hunks_without_highlights() {
         "> goes to the next hunk"
     );
     h.keys("<");
-    assert!(!h.status().contains("highlight"));
+    assert!(!h.status().contains("mark"));
     cleanup(dir);
 }
 
@@ -1912,23 +2921,25 @@ fn highlights_are_numbered_by_where_they_sit_not_the_order_given() {
     h.settle();
     let at_top = |h: &mut Harness| h.screen().lines().nth(1).unwrap_or("").to_string();
     assert!(
-        at_top(&mut h).contains("① highest"),
-        "opens at ①: {}",
+        at_top(&mut h).contains("[A] highest"),
+        "opens at [A]: {}",
         at_top(&mut h)
     );
     h.keys(">");
-    assert!(at_top(&mut h).contains("② middle"), "{}", at_top(&mut h));
+    assert!(at_top(&mut h).contains("[B] middle"), "{}", at_top(&mut h));
     h.keys(">");
-    assert!(at_top(&mut h).contains("③ lowest"), "{}", at_top(&mut h));
+    assert!(at_top(&mut h).contains("[C] lowest"), "{}", at_top(&mut h));
     h.keys(">");
-    assert!(at_top(&mut h).contains("③ lowest"), "stays on the last");
+    assert!(at_top(&mut h).contains("[C] lowest"), "stays on the last");
     h.keys("jjj<");
     assert!(
-        at_top(&mut h).contains("② middle"),
-        "scrolling does not change the order: {}",
+        at_top(&mut h).contains("[C] lowest"),
+        "< goes to the mark above the cursor, which is still [C]: {}",
         at_top(&mut h)
     );
-    assert!(h.status().contains("highlight 2 of 3"), "{}", h.status());
+    h.keys("<");
+    assert!(at_top(&mut h).contains("[B] middle"), "{}", at_top(&mut h));
+    assert!(h.status().contains("[B] 2 of 3"), "{}", h.status());
     cleanup(dir);
 }
 
@@ -1953,10 +2964,10 @@ fn highlights_across_files_go_in_the_order_the_files_are_shown() {
             .position(|l| l.contains(want))
             .unwrap_or_else(|| panic!("{want} on screen:\n{screen}"))
     };
-    assert!(row("① long high") < row("② long low"), "{screen}");
-    assert!(row("② long low") < row("③ in one"), "{screen}");
+    assert!(row("[A] long high") < row("[B] long low"), "{screen}");
+    assert!(row("[B] long low") < row("[C] in one"), "{screen}");
     h.keys(">>");
-    assert!(h.status().contains("highlight 3 of 3"), "{}", h.status());
+    assert!(h.status().contains("[C] 3 of 3"), "{}", h.status());
     cleanup(dir);
 }
 
@@ -1976,7 +2987,11 @@ fn a_line_inside_a_highlight_opens_at_that_highlight() {
     h.settle();
     let screen = h.screen();
     assert!(
-        screen.lines().nth(1).unwrap_or("").contains("③ the point"),
+        screen
+            .lines()
+            .nth(1)
+            .unwrap_or("")
+            .contains("[C] the point"),
         "its note at the top:\n{screen}"
     );
     assert!(
@@ -1985,11 +3000,11 @@ fn a_line_inside_a_highlight_opens_at_that_highlight() {
             .any(|l| l.contains('▶') && l.contains("// line 40")),
         "the line is marked:\n{screen}"
     );
-    assert!(h.status().contains("highlight 3 of 4"), "{}", h.status());
+    assert!(h.status().contains("[C] 3 of 4"), "{}", h.status());
     h.keys(">");
-    assert!(h.status().contains("highlight 4 of 4"), "{}", h.status());
+    assert!(h.status().contains("[D] 4 of 4"), "{}", h.status());
     h.keys("<<");
-    assert!(h.status().contains("highlight 2 of 4"), "{}", h.status());
+    assert!(h.status().contains("[B] 2 of 4"), "{}", h.status());
     cleanup(dir);
 }
 
@@ -2012,16 +3027,19 @@ fn a_line_outside_the_highlights_opens_at_the_line() {
         "{screen}"
     );
     assert!(
-        h.status().contains("2 highlights") && !h.status().contains(" of 2"),
+        h.status().contains("2 marks") && !h.status().contains(" of 2"),
         "no highlight is current yet: {}",
         h.status()
     );
     h.keys(">");
     assert_eq!(
-        h.screen().lines().position(|l| l.contains("① early")),
-        Some(1)
+        h.screen().lines().position(|l| l.contains("[B] late")),
+        Some(1),
+        "the next mark below line 30"
     );
-    assert!(h.status().contains("highlight 1 of 2"), "{}", h.status());
+    assert!(h.status().contains("[B] 2 of 2"), "{}", h.status());
+    h.keys("<<");
+    assert!(h.status().contains("[A] 1 of 2"), "{}", h.status());
     cleanup(dir);
 }
 

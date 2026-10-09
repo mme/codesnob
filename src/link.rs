@@ -59,6 +59,14 @@ impl Link {
         self.update(|e| e.target = Some(target));
     }
 
+    /// Answer a show or query event the daemon relays, under its id.
+    pub fn reply(&self, id: String, result: serde_json::Value) {
+        self.inner
+            .lock()
+            .unwrap()
+            .send(Method::ViewerReply { id, result });
+    }
+
     pub fn set_window(&self, window: Option<wm::Window>, platform: &'static str) {
         self.update(|e| {
             e.platform = Some(platform.to_string());
@@ -143,19 +151,22 @@ fn session(tx: &Sender<Msg>, link: &Link) -> Result<(), String> {
         if n == 0 {
             return Err("daemon closed".to_string());
         }
-        if let Ok(ServerFrame::Event(Event::Show {
-            viewer,
-            target,
-            view,
-        })) = ServerFrame::parse(&line)
-            && viewer == my_id
-        {
-            let msg = match view {
-                Some(view) => Msg::View(target, Box::new(view)),
-                None => Msg::Show(target),
-            };
-            tx.send(msg).map_err(|_| "ui gone")?;
-        }
+        let msg = match ServerFrame::parse(&line) {
+            Ok(ServerFrame::Event(Event::Show {
+                viewer,
+                target,
+                view,
+                id,
+            })) if viewer == my_id => match view {
+                Some(view) => Msg::View(target, Box::new(view), id),
+                None => Msg::Show(target, id),
+            },
+            Ok(ServerFrame::Event(Event::Query { viewer, id, query })) if viewer == my_id => {
+                Msg::Query { id, query }
+            }
+            _ => continue,
+        };
+        tx.send(msg).map_err(|_| "ui gone")?;
     }
 }
 
@@ -173,6 +184,15 @@ pub fn request_show(
         view,
     })?;
     serde_json::from_value(v).map_err(|e| e.to_string())
+}
+
+/// Ask the viewer on our workspace something and get its answer.
+pub fn request_query(
+    client: &mut proto::Client,
+    query: proto::ViewerQuery,
+) -> Result<serde_json::Value, String> {
+    let workspace = wm::own_workspace();
+    client.call(Method::Query { workspace, query })
 }
 
 pub fn describe(r: &proto::ShowResult) -> String {
@@ -213,6 +233,38 @@ pub fn show(dir: PathBuf, range: Option<String>) -> Result<(), String> {
         eprintln!("codesnob: {} is not inside a git repository", dir.display());
     }
     println!("{}", describe(&r));
+    Ok(())
+}
+
+/// `codesnob review`: the marks on a location, as an agent sees them.
+pub fn review(location: Option<String>, json: bool) -> Result<(), String> {
+    let mut client = one_shot()?;
+    let v = request_query(&mut client, proto::ViewerQuery::Review { location })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    let r: proto::ReviewResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
+    println!("{}", r.render());
+    Ok(())
+}
+
+/// `codesnob clear`: remove marks on a location.
+pub fn clear(location: Option<String>, which: String, letters: Vec<String>) -> Result<(), String> {
+    let mut client = one_shot()?;
+    let v = request_query(
+        &mut client,
+        proto::ViewerQuery::ClearMarks {
+            location,
+            which,
+            letters,
+        },
+    )?;
+    let r: proto::ClearResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
+    println!("{}", r.render());
     Ok(())
 }
 

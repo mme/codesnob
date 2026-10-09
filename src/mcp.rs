@@ -81,7 +81,7 @@ fn initialize(params: &Value) -> Value {
 }
 
 /// Always in the agent's context, so this is what makes it reach for codesnob.
-const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a terminal beside you. When the user wants to see code, show it there instead of pasting it into the chat: `show_code` for files and lines, with highlights; `show_diff` for what changed between any two states (the branch point, commits, branches, staged work, a pull request). Typical requests: \"show me the code\", \"where is this handled\", \"open that file\", \"what changed\", \"show me the diff\", \"compare main and this branch\", \"show me PR 123\". A call updates that repository's view in the viewer; the user gets back to where they were with Esc. Read files with your own tools; codesnob is for showing. Add notes to highlights only when the user asks you to explain or comment on the code; otherwise show the code without them.";
+const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a terminal beside you. When the user wants to see code, show it there instead of pasting it into the chat: `show_code` for files and lines, with highlights; `show_diff` for what changed between any two states (the branch point, commits, branches, staged work, a pull request). Typical requests: \"show me the code\", \"where is this handled\", \"open that file\", \"what changed\", \"show me the diff\", \"compare main and this branch\", \"show me PR 123\". A call updates that repository's view in the viewer; the user gets back to where they were with Esc. Read files with your own tools; codesnob is for showing. Add notes to highlights only when the user asks you to explain or comment on the code; otherwise show the code without them. Marks are lettered [A], [B]… in the viewer, shared between you and the user: your highlights and the user's comments alike. The user writes comments on lines in the viewer; call `get_review` whenever they say they reviewed, commented or marked something, or a reply tells you they have unread comments, and answer to the letters. Every location has an id like L3, given in replies; pass it back to address that location. `clear_marks` removes marks you have dealt with.";
 
 fn tools() -> Value {
     json!([{
@@ -102,7 +102,7 @@ fn tools() -> Value {
                             "excerpts": { "type": "boolean", "description": "true shows only this file's line and highlights, each with a few lines around it, like a diff; false shows the whole file." },
                             "highlights": {
                                 "type": "array",
-                                "description": "Line ranges to highlight in this file. The viewer numbers all of a call's highlights by where they sit, not by the order you list them: by file in the order of files, then by line, so the first file's highlights come first. At most 20 per call, ① to ⑳. The user steps through them with < and >; the result lists each number with its file and lines, so refer to them by those numbers.",
+                                "description": "Line ranges to highlight in this file. The viewer letters marks as [A], [B] and so on, in the order they are made, by file in the order of files, then by line; the letters are fixed and never reused, and a new call replaces your earlier highlights but keeps the user's comments and continues the sequence. At most 20 per call. The user steps through them with < and >; the result lists them in that order, so refer to them by their letters.",
                                 "items": {
                                     "type": "object",
                                     "properties": {
@@ -117,10 +117,11 @@ fn tools() -> Value {
                     }
                 },
                 "rev": { "type": "string", "description": "Show the files as of this revision instead of the working tree." },
-                "repo": { "type": "string", "description": "A directory in the repository. Defaults to your working directory." }
+                "repo": { "type": "string", "description": "A directory in the repository. Defaults to your working directory." },
+                "append": { "type": "boolean", "description": "true adds these files and highlights to what the location already shows and keeps every mark; false (the default) replaces the view and your earlier highlights." }
             },
             "required": ["files"],
-            // With highlights the view opens at ①, so no file takes a line.
+            // With highlights the view opens at the first, so no file takes a line.
             "if": { "properties": { "files": { "contains": { "required": ["highlights"] } } } },
             "then": { "properties": { "files": { "items": { "not": { "required": ["line"] } } } } }
         }
@@ -134,7 +135,7 @@ fn tools() -> Value {
                 "files": { "type": "array", "items": { "type": "string" }, "description": "Show only these files. Paths are relative to your working directory." },
                 "highlights": {
                     "type": "array",
-                    "description": "Line ranges to highlight. Lines are the new side's, or the old side's in a deleted file; unchanged lines are shown too. The viewer numbers them by where they sit, not by the order you list them: by file in path order, as the diff lists its files, then by line. At most 20 per call, ① to ⑳. The user steps through them with < and >; the result lists each number with its file and lines, so refer to them by those numbers.",
+                    "description": "Line ranges to highlight. Lines are the new side's, or the old side's in a deleted file; unchanged lines are shown too. The viewer letters marks as [A], [B] and so on, in the order they are made, by file in path order, as the diff lists its files, then by line; the letters are fixed and never reused, and a new call replaces your earlier highlights but keeps the user's comments and continues the sequence. At most 20 per call. The user steps through them with < and >; the result lists them in that order, so refer to them by their letters.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -148,6 +149,26 @@ fn tools() -> Value {
                 "repo": { "type": "string", "description": "A directory in the repository. Defaults to your working directory." }
             }
         }
+    }, {
+        "name": "get_review",
+        "description": "Read every mark on a location in the user's codesnob viewer: your highlights and the user's comments, each with its letter, file and lines, and the commented code. Call it whenever the user says they reviewed, commented on or marked something, or a reply says they have unread comments. Comments count as read once returned; those made or edited since your last call are flagged new. Comments on deleted lines give old-side line numbers; a stale mark's lines no longer exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "location": { "type": "string", "description": "The location id from an earlier reply, like L3. Defaults to the location on screen." }
+            }
+        }
+    }, {
+        "name": "clear_marks",
+        "description": "Remove marks from a location in the user's codesnob viewer: the ones named by letter, else all of yours (mine), the user's (user) or every mark (all). Clear the comments you have addressed so the user sees what is still open; leave the rest.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "location": { "type": "string", "description": "The location id from an earlier reply, like L3. Defaults to the location on screen." },
+                "which": { "type": "string", "enum": ["mine", "user", "all"], "description": "Which marks to remove when no letters are given. Default: mine." },
+                "letters": { "type": "array", "items": { "type": "string" }, "description": "The marks to remove, by letter: [\"C\", \"D\"]." }
+            }
+        }
     }])
 }
 
@@ -157,6 +178,8 @@ fn call(params: &Value) -> Value {
     match name {
         "show_diff" => tool_result(show_diff(&args)),
         "show_code" => tool_result(show_code(&args)),
+        "get_review" => tool_result(get_review(&args)),
+        "clear_marks" => tool_result(clear_marks(&args)),
         _ => tool_result(Err(format!("unknown tool: {name}"))),
     }
 }
@@ -173,20 +196,130 @@ fn show_diff(args: &Value) -> Result<String, String> {
     let (root, view, what) = prepare_diff(args, &cwd)?;
     let mut client = link::connect()?;
     let r = link::request_show(&mut client, root, Some(view)).map_err(no_viewer)?;
-    Ok(format!(
-        "{}: {what}; the user gets back to their previous view with Esc",
-        link::describe(&r)
-    ))
+    Ok(shown(&r, &what))
 }
 
 fn show_code(args: &Value) -> Result<String, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let (root, view, what) = prepare_code(args, &cwd)?;
+    let (root, mut view, what) = prepare_code(args, &cwd)?;
+    view.append = args.get("append").and_then(Value::as_bool).unwrap_or(false);
     let mut client = link::connect()?;
     let r = link::request_show(&mut client, root, Some(view)).map_err(no_viewer)?;
+    Ok(shown(&r, &what))
+}
+
+/// Words for a show reply: where it went, what it was, and what the viewer
+/// made of it when it answered.
+fn shown(r: &crate::proto::ShowResult, what: &str) -> String {
+    // With the viewer's answer, the letters say it all; without, the
+    // order the highlights were sent in is the best there is.
+    let what = match &r.ack {
+        Some(ack) if !ack.marks.is_empty() => {
+            what.split("; highlights, lettered").next().unwrap_or(what)
+        }
+        _ => what,
+    };
+    let mut text = format!("{}: {what}", link::describe(r));
+    match &r.ack {
+        Some(ack) => {
+            if !ack.marks.is_empty() {
+                let each: Vec<String> = ack
+                    .marks
+                    .iter()
+                    .map(|m| format!("[{}] {} {}", m.label, m.path, m.lines_word()))
+                    .collect();
+                text.push_str(&format!("; marks {}", each.join(", ")));
+            }
+            if !ack.location.is_empty() {
+                text.push_str(&format!(
+                    "; location {} ({})",
+                    ack.location,
+                    ack.dir.display()
+                ));
+            }
+            if !ack.applied {
+                text.push_str("; the user is reviewing, so the viewer holds this until they accept it or you read their comments");
+            }
+            let location = if ack.location.is_empty() {
+                "the location on screen"
+            } else {
+                ack.location.as_str()
+            };
+            text.push_str(&crate::proto::unread_note(location, ack.unread));
+        }
+        None => text.push_str(
+            "; the viewer did not say which letters it gave, call get_review to see them",
+        ),
+    }
+    text.push_str("; the user gets back to their previous view with Esc");
+    text
+}
+
+fn location_arg(args: &Value) -> Option<String> {
+    args.get("location")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn get_review(args: &Value) -> Result<String, String> {
+    let mut client = link::connect()?;
+    let v = link::request_query(
+        &mut client,
+        crate::proto::ViewerQuery::Review {
+            location: location_arg(args),
+        },
+    )
+    .map_err(no_viewer)?;
+    let r: crate::proto::ReviewResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
+    Ok(r.render())
+}
+
+/// Check a clear_marks call: which marks, and the letters, upper-cased and
+/// without brackets.
+fn clear_args(args: &Value) -> Result<(String, Vec<String>), String> {
+    let which = args
+        .get("which")
+        .and_then(Value::as_str)
+        .unwrap_or("mine")
+        .to_string();
+    if !["mine", "user", "all"].contains(&which.as_str()) {
+        return Err(format!("which must be mine, user or all, not {which}"));
+    }
+    let letters: Vec<String> = match args.get("letters") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(|s| s.trim().trim_matches(['[', ']']).to_uppercase())
+                    .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_uppercase()))
+                    .ok_or(format!("{v} is not a mark's letter"))
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err("letters must be a list".to_string()),
+    };
+    Ok((which, letters))
+}
+
+fn clear_marks(args: &Value) -> Result<String, String> {
+    let (which, letters) = clear_args(args)?;
+    let mut client = link::connect()?;
+    let v = link::request_query(
+        &mut client,
+        crate::proto::ViewerQuery::ClearMarks {
+            location: location_arg(args),
+            which,
+            letters,
+        },
+    )
+    .map_err(no_viewer)?;
+    let r: crate::proto::ClearResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
     Ok(format!(
-        "{}: {what}; the user gets back to their previous view with Esc",
-        link::describe(&r)
+        "{}{}",
+        r.render(),
+        crate::proto::unread_note(&r.location, r.unread)
     ))
 }
 
@@ -358,24 +491,26 @@ fn check_count(n: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// The highlights with the numbers the user sees, in order.
+/// The highlights in the order the viewer letters them.
 fn list_highlights(highlights: &[crate::proto::HighlightSpec]) -> String {
     if highlights.is_empty() {
         return String::new();
     }
     let each: Vec<String> = highlights
         .iter()
-        .enumerate()
-        .map(|(i, h)| {
+        .map(|h| {
             let lines = if h.start == h.end {
                 h.start.to_string()
             } else {
                 format!("{}-{}", h.start, h.end)
             };
-            format!("{} {} {lines}", crate::proto::circled(i + 1), h.path)
+            format!("{} {lines}", h.path)
         })
         .collect();
-    format!("; highlights {}", each.join(", "))
+    format!(
+        "; highlights, lettered in this order in the viewer: {}",
+        each.join(", ")
+    )
 }
 
 fn no_viewer(e: String) -> String {
@@ -579,7 +714,10 @@ mod tests {
                 note: Some("here".into()),
             }]
         );
-        assert_eq!(what, "a.txt; highlights ① a.txt 1");
+        assert_eq!(
+            what,
+            "a.txt; highlights, lettered in this order in the viewer: a.txt 1"
+        );
         let err = prepare_code(
             &json!({ "files": [{ "path": "a.txt", "highlights": [{ "lines": "1-5" }] }] }),
             &dir,
@@ -595,7 +733,9 @@ mod tests {
         assert_eq!(view.highlights.len(), 2);
         assert_eq!((view.highlights[1].start, view.highlights[1].end), (2, 3));
         assert!(
-            what.ends_with("; highlights ① a.txt 1, ② src/deep/one.rs 2-3"),
+            what.ends_with(
+                "; highlights, lettered in this order in the viewer: a.txt 1, src/deep/one.rs 2-3"
+            ),
             "{what}"
         );
         for bad in ["0-2", "5-3", "x"] {
@@ -625,7 +765,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             what,
-            "b.txt, a.txt as of HEAD~2; highlights ① b.txt 1, ② a.txt 1"
+            "b.txt, a.txt as of HEAD~2; highlights, lettered in this order in the viewer: b.txt 1, a.txt 1"
         );
         let notes: Vec<_> = view.highlights.iter().map(|h| h.note.as_deref()).collect();
         assert_eq!(notes, [Some("b"), Some("a")]);
@@ -643,7 +783,7 @@ mod tests {
         .unwrap();
         assert!(
             what.ends_with(
-                "; highlights ① a.txt 5, ② b.txt 7-8, ③ src/deep/one.rs 3, ④ src/deep/one.rs 9"
+                "; highlights, lettered in this order in the viewer: a.txt 5, b.txt 7-8, src/deep/one.rs 3, src/deep/one.rs 9"
             ),
             "{what}"
         );
@@ -662,7 +802,7 @@ mod tests {
         };
         let (_, view, what) = prepare_diff(&json!({ "highlights": many(20) }), &dir).unwrap();
         assert_eq!(view.highlights.len(), 20);
-        assert!(what.contains("⑳ a.txt 1"), "{what}");
+        assert_eq!(what.matches("a.txt 1").count(), 20, "{what}");
         let err = prepare_diff(&json!({ "highlights": many(21) }), &dir).unwrap_err();
         assert_eq!(
             err,
@@ -698,6 +838,94 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, "excerpts is true or false");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_show_reply_names_the_letters_the_location_and_unread_comments() {
+        let mut r = crate::proto::ShowResult {
+            repo: true,
+            viewer: "v1".to_string(),
+            workspace: None,
+            picked_by: "first".to_string(),
+            ack: Some(crate::proto::ShowAck {
+                location: "L2".to_string(),
+                dir: PathBuf::from("/r"),
+                marks: vec![
+                    crate::proto::MarkInfo {
+                        label: "C".to_string(),
+                        path: "a.txt".to_string(),
+                        start: 5,
+                        end: 5,
+                        ..Default::default()
+                    },
+                    crate::proto::MarkInfo {
+                        label: "D".to_string(),
+                        path: "b.txt".to_string(),
+                        start: 7,
+                        end: 8,
+                        old_side: true,
+                        ..Default::default()
+                    },
+                ],
+                unread: 2,
+                applied: true,
+            }),
+        };
+        assert_eq!(
+            shown(
+                &r,
+                "a.txt, b.txt; highlights, lettered in this order in the viewer: a.txt 5, b.txt 7-8"
+            ),
+            "shown in viewer v1: a.txt, b.txt; marks [C] a.txt 5, [D] b.txt old 7-8; location L2 (/r); the user has 2 unread comments on L2, call get_review; the user gets back to their previous view with Esc"
+        );
+        r.ack.as_mut().unwrap().applied = false;
+        assert!(
+            shown(&r, "x").contains("holds this until"),
+            "{}",
+            shown(&r, "x")
+        );
+        r.ack = None;
+        assert!(
+            shown(&r, "x").contains("did not say which letters"),
+            "{}",
+            shown(&r, "x")
+        );
+    }
+
+    #[test]
+    fn clear_arguments_are_checked() {
+        let (which, letters) = clear_args(&json!({})).unwrap();
+        assert_eq!((which.as_str(), letters.as_slice()), ("mine", &[][..]));
+        let (which, letters) =
+            clear_args(&json!({ "which": "all", "letters": [" c", "[D]", "aa"] })).unwrap();
+        assert_eq!(which, "all");
+        assert_eq!(letters, ["C", "D", "AA"]);
+        let err = clear_args(&json!({ "which": "theirs" })).unwrap_err();
+        assert_eq!(err, "which must be mine, user or all, not theirs");
+        let err = clear_args(&json!({ "letters": ["3"] })).unwrap_err();
+        assert_eq!(err, "\"3\" is not a mark's letter");
+        let err = clear_args(&json!({ "letters": "C" })).unwrap_err();
+        assert_eq!(err, "letters must be a list");
+    }
+
+    #[test]
+    fn the_review_tools_are_listed() {
+        let tools = tools();
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["show_code", "show_diff", "get_review", "clear_marks"]
+        );
+        assert!(tools[0]["inputSchema"]["properties"]["append"].is_object());
+        assert_eq!(
+            tools[3]["inputSchema"]["properties"]["which"]["enum"],
+            json!(["mine", "user", "all"])
+        );
     }
 
     #[test]

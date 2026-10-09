@@ -20,6 +20,8 @@ pub enum Kind {
     Commits,
     Open,
     Locations,
+    /// A line of text for a comment; no list.
+    Comment,
 }
 
 impl Kind {
@@ -30,14 +32,20 @@ impl Kind {
             Kind::Commits => "Commits",
             Kind::Open => "Open",
             Kind::Locations => "Locations",
+            Kind::Comment => "Comment",
         }
+    }
+
+    /// Enter submits what was typed rather than choosing a row.
+    fn takes_input(self) -> bool {
+        matches!(self, Kind::Open | Kind::Comment)
     }
 
     /// Lists whose order means something keep it; the rest put recent first.
     fn recent_first(self) -> bool {
         match self {
             Kind::Commands => true,
-            Kind::Files | Kind::Commits | Kind::Open | Kind::Locations => false,
+            Kind::Files | Kind::Commits | Kind::Open | Kind::Locations | Kind::Comment => false,
         }
     }
 
@@ -187,7 +195,7 @@ impl Panel {
         match (k.code, ctrl) {
             (KeyCode::Char('c'), true) => return Outcome::Quit,
             (KeyCode::Esc, _) => return Outcome::Close,
-            (KeyCode::Enter, _) if self.kind == Kind::Open => {
+            (KeyCode::Enter, _) if self.kind.takes_input() => {
                 return Outcome::Submit {
                     input: self.input.clone(),
                     selected: self.selected_action(),
@@ -273,6 +281,7 @@ impl Panel {
             let text = match self.kind {
                 Kind::Open if self.items.is_empty() => "  type a path, Tab completes",
                 Kind::Open => "  Enter opens the path",
+                Kind::Comment => "  Enter saves, Esc cancels",
                 _ => "  no matches",
             };
             buf.set_span(area.x, area.y + 1, &Span::styled(text, dim), area.width);

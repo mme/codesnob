@@ -34,12 +34,18 @@ codesnob show PATH     show PATH in the viewer on your workspace
   --range R             what to compare: main...feature, HEAD~3..HEAD, a commit,
                         worktree, staged, unstaged, or a PR
 codesnob status        list connected viewers and their workspaces
+codesnob review        the marks on the location shown: highlights and your comments
+  --location L3         another location, by the id the status bar shows
+codesnob clear [C D…]  remove marks: the letters given, or --which mine|user|all
 codesnob mcp           MCP server over stdio, for agents
 codesnob prune         remove PR checkouts no viewer has open
 ```
 
 Give your coding agent the `show_code` and `show_diff` tools, so "show me the
-code" or "what changed" lands in your viewer. `codesnob mcp` is a standard
+code" or "what changed" lands in your viewer, and `get_review` and
+`clear_marks`, so the comments you write in the viewer reach it. Every reply
+names the location (`L3`) and the letters of the marks it placed, and says when
+you have comments it has not read. `codesnob mcp` is a standard
 MCP server over stdio, so any agent that speaks MCP can use it:
 
 ```
@@ -63,10 +69,15 @@ need to start:
 
 | Key | Does |
 |---|---|
+| `j` `k` ↑ ↓ | move the cursor line; the view scrolls once the cursor reaches an edge. A click moves it too |
 | `o` | open a directory or a file, a file as of a revision (`main:src/diff.rs`), a PR (`#123`, `owner/repo#123`, a URL), or a comparison (`main...feature`, `HEAD~3`, `staged`) |
 | `c` | the branch's commits; moving through the list previews each one |
 | Alt-↑ Alt-↓ | older and newer commit, directly |
-| `<` `>` | previous and next highlight an agent placed, or hunk when there are none |
+| Enter | comment on the cursor's line; on a comment's own row, edit it; on an agent's highlight, answer it |
+| Ctrl-Space or `v` | start marking lines for a comment; move to extend, Enter or Ctrl-Space again to write it, Esc to stop |
+| `e` `x` | edit or delete the comment under the cursor; `X` clears all of yours here, after asking |
+| `y` | switch to what the agent asked to show while you were reviewing: a request that would take you away from unread comments or a comment you are typing waits behind a banner until you press `y`, the agent reads your comments, or Esc drops it |
+| `<` `>` | previous and next mark, or hunk when there are none. Marks are lettered `[A]`, `[B]`… in the order they were made and keep their letters, so you and the agent mean the same thing by "B". A mark whose lines are gone stays, flagged stale |
 | `u` | only the uncommitted changes, and back |
 | `f` | the changed files; `z` narrows the view to one |
 | `d` | show or hide the commit message or PR description |
