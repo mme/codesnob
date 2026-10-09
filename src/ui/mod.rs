@@ -501,6 +501,124 @@ impl Location {
             .then_some((m.seq, Some(n)))
     }
 
+    /// What it shows, in words, without key hints: the files it is
+    /// narrowed to, then its range.
+    fn scope_words(&self) -> String {
+        let scope = self.range_words();
+        match &self.focus {
+            Focus::File(path) => format!("{path} only · {scope}"),
+            Focus::Files(paths) => format!("{} files only · {scope}", paths.len()),
+            Focus::All => scope,
+        }
+    }
+
+    /// What its range shows, in words: "feature · 2 commits since main".
+    fn range_words(&self) -> String {
+        let loc = self;
+        if let Some(code) = &loc.code {
+            let what = match code.files.as_slice() {
+                [one] => one.path.clone(),
+                many => format!("{} files", many.len()),
+            };
+            return match (&loc.code_rev, &code.rev) {
+                (Some(r), _) | (None, Some(r)) => format!("{what} @ {r}"),
+                (None, None) => format!("{what} · working tree"),
+            };
+        }
+        if let Some(p) = &loc.pr {
+            let n = p.spec.number;
+            let doing = if p.fetching {
+                "fetching"
+            } else {
+                "could not be opened"
+            };
+            let Some(info) = &p.info else {
+                return format!("#{n} · {doing}");
+            };
+            if !p.ready {
+                return format!("#{n} {} · {doing}", info.title);
+            }
+            match loc.range {
+                Range::Everything => {
+                    let mut s = format!("#{n} {} · into {}", info.title, info.base_ref_name);
+                    if info.is_draft {
+                        s.push_str(" · draft");
+                    }
+                    match info.state.as_str() {
+                        "MERGED" => s.push_str(" · merged"),
+                        "CLOSED" => s.push_str(" · closed"),
+                        _ => {}
+                    }
+                    return s;
+                }
+                Range::Uncommitted => return format!("#{n} · local edits"),
+                Range::Commit(_) | Range::Compare(..) => {}
+            }
+        }
+        if !loc.repo {
+            return format!("no repository · {}", loc.dir.display());
+        }
+        let Some(info) = &loc.info else {
+            return loc.dir.display().to_string();
+        };
+        let head = &info.head_label;
+        if info.unborn {
+            return format!("{head} · no commits yet");
+        }
+        match &loc.range {
+            Range::Everything => match &info.base.name {
+                None if info.dirty => format!("{head} · uncommitted changes"),
+                None => format!("{head} · no changes"),
+                Some(base) => {
+                    let n = info.commits.len();
+                    let mut parts = Vec::new();
+                    if n > 0 {
+                        let more = if info.commits_truncated { "+" } else { "" };
+                        let noun = if n == 1 && more.is_empty() {
+                            "commit"
+                        } else {
+                            "commits"
+                        };
+                        parts.push(format!("{n}{more} {noun}"));
+                    }
+                    if info.dirty {
+                        parts.push("uncommitted work".to_string());
+                    }
+                    if parts.is_empty() {
+                        format!("{head} · no changes since {base}")
+                    } else {
+                        format!("{head} · {} since {base}", parts.join(" and "))
+                    }
+                }
+            },
+            Range::Uncommitted => format!("{head} · uncommitted changes"),
+            Range::Compare(..) => format!(
+                "{head} · {}",
+                loc.range_label.as_deref().unwrap_or("comparison")
+            ),
+            Range::Commit(id) => {
+                let n = info.commits.len();
+                match info.commits.iter().position(|c| c.id == *id) {
+                    Some(i) => {
+                        let c = &info.commits[i];
+                        format!(
+                            "{COMMIT_ICON} commit {} of {n} · {} {}",
+                            i + 1,
+                            c.short,
+                            c.subject
+                        )
+                    }
+                    None => match &info.commit {
+                        Some(c) if c.id == *id => {
+                            format!("{COMMIT_ICON} {} {}", c.short, c.subject)
+                        }
+                        _ => format!("{head} · commit"),
+                    },
+                }
+            }
+        }
+    }
+
     /// "L3": how agents name this location.
     fn label(&self) -> String {
         format!("L{}", self.id)
@@ -2089,6 +2207,7 @@ impl App {
     /// Answer an agent's query.
     fn answer(&mut self, query: crate::proto::ViewerQuery) -> Result<serde_json::Value, String> {
         match query {
+            crate::proto::ViewerQuery::Locations => Ok(serde_json::json!(self.locations_info())),
             crate::proto::ViewerQuery::Review { location } => {
                 let r = self.review(location.as_deref())?;
                 Ok(serde_json::json!(r))
@@ -2120,6 +2239,32 @@ impl App {
                 let r = self.move_comment(location.as_deref(), &letter, path, start, end)?;
                 Ok(serde_json::json!(r))
             }
+        }
+    }
+
+    /// Every location open here for an agent, the one on screen first.
+    fn locations_info(&self) -> crate::proto::LocationsResult {
+        let locations = self
+            .locations
+            .iter()
+            .enumerate()
+            .map(|(i, l)| crate::proto::LocationInfo {
+                location: l.label(),
+                name: match l.pr.as_ref().and_then(|p| p.info.as_ref()) {
+                    Some(info) => format!("{} {}", l.name(), info.title),
+                    None => l.name(),
+                },
+                dir: l.dir.clone(),
+                showing: l.scope_words(),
+                on_screen: i == 0,
+                marks: l.marks.len(),
+                comments: l.comments(),
+                unread: l.unread(),
+            })
+            .collect();
+        crate::proto::LocationsResult {
+            viewer: format!("v{}", std::process::id()),
+            locations,
         }
     }
 
@@ -3475,123 +3620,11 @@ impl App {
 
     /// What the screen shows, for an agent: the scope without key hints.
     fn scope_words(&self) -> String {
-        let scope = self.range_scope();
-        let Some(loc) = self.cur() else {
-            return scope;
-        };
-        match &loc.focus {
-            Focus::File(path) => format!("{path} only · {scope}"),
-            Focus::Files(paths) => format!("{} files only · {scope}", paths.len()),
-            Focus::All => scope,
-        }
+        self.cur().map(Location::scope_words).unwrap_or_default()
     }
 
     fn range_scope(&self) -> String {
-        let Some(loc) = self.cur() else {
-            return String::new();
-        };
-        if let Some(code) = &loc.code {
-            let what = match code.files.as_slice() {
-                [one] => one.path.clone(),
-                many => format!("{} files", many.len()),
-            };
-            return match (&loc.code_rev, &code.rev) {
-                (Some(r), _) | (None, Some(r)) => format!("{what} @ {r}"),
-                (None, None) => format!("{what} · working tree"),
-            };
-        }
-        if let Some(p) = &loc.pr {
-            let n = p.spec.number;
-            let doing = if p.fetching {
-                "fetching"
-            } else {
-                "could not be opened"
-            };
-            let Some(info) = &p.info else {
-                return format!("#{n} · {doing}");
-            };
-            if !p.ready {
-                return format!("#{n} {} · {doing}", info.title);
-            }
-            match loc.range {
-                Range::Everything => {
-                    let mut s = format!("#{n} {} · into {}", info.title, info.base_ref_name);
-                    if info.is_draft {
-                        s.push_str(" · draft");
-                    }
-                    match info.state.as_str() {
-                        "MERGED" => s.push_str(" · merged"),
-                        "CLOSED" => s.push_str(" · closed"),
-                        _ => {}
-                    }
-                    return s;
-                }
-                Range::Uncommitted => return format!("#{n} · local edits"),
-                Range::Commit(_) | Range::Compare(..) => {}
-            }
-        }
-        if !loc.repo {
-            return format!("no repository · {}", loc.dir.display());
-        }
-        let Some(info) = &loc.info else {
-            return loc.dir.display().to_string();
-        };
-        let head = &info.head_label;
-        if info.unborn {
-            return format!("{head} · no commits yet");
-        }
-        match &loc.range {
-            Range::Everything => match &info.base.name {
-                None if info.dirty => format!("{head} · uncommitted changes"),
-                None => format!("{head} · no changes"),
-                Some(base) => {
-                    let n = info.commits.len();
-                    let mut parts = Vec::new();
-                    if n > 0 {
-                        let more = if info.commits_truncated { "+" } else { "" };
-                        let noun = if n == 1 && more.is_empty() {
-                            "commit"
-                        } else {
-                            "commits"
-                        };
-                        parts.push(format!("{n}{more} {noun}"));
-                    }
-                    if info.dirty {
-                        parts.push("uncommitted work".to_string());
-                    }
-                    if parts.is_empty() {
-                        format!("{head} · no changes since {base}")
-                    } else {
-                        format!("{head} · {} since {base}", parts.join(" and "))
-                    }
-                }
-            },
-            Range::Uncommitted => format!("{head} · uncommitted changes"),
-            Range::Compare(..) => format!(
-                "{head} · {}",
-                loc.range_label.as_deref().unwrap_or("comparison")
-            ),
-            Range::Commit(id) => {
-                let n = info.commits.len();
-                match info.commits.iter().position(|c| c.id == *id) {
-                    Some(i) => {
-                        let c = &info.commits[i];
-                        format!(
-                            "{COMMIT_ICON} commit {} of {n} · {} {}",
-                            i + 1,
-                            c.short,
-                            c.subject
-                        )
-                    }
-                    None => match &info.commit {
-                        Some(c) if c.id == *id => {
-                            format!("{COMMIT_ICON} {} {}", c.short, c.subject)
-                        }
-                        _ => format!("{head} · commit"),
-                    },
-                }
-            }
-        }
+        self.cur().map(Location::range_words).unwrap_or_default()
     }
 
     /// The centered text shown instead of a diff, if any.

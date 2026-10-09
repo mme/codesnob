@@ -81,7 +81,7 @@ fn initialize(params: &Value) -> Value {
 }
 
 /// Always in the agent's context, so this is what makes it reach for codesnob.
-const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a terminal beside you. When the user wants to see code, show it there instead of pasting it into the chat: `show_code` for files and lines, with highlights; `show_diff` for what changed between any two states (the branch point, commits, branches, staged work, a pull request). Typical requests: \"show me the code\", \"where is this handled\", \"open that file\", \"what changed\", \"show me the diff\", \"compare main and this branch\", \"show me PR 123\". A call updates that repository's view in the viewer; the user gets back to where they were with Esc. Read files with your own tools; codesnob is for showing. Add notes to highlights only when the user asks you to explain or comment on the code; otherwise show the code without them. Marks are lettered [A], [B]… in the viewer, shared between you and the user: your highlights and the user's comments alike. The user writes comments on lines in the viewer; call `get_review` whenever they say they reviewed, commented or marked something, or a reply tells you they have unread comments, and answer to the letters. Every location has an id like L3, given in replies; pass it back to address that location. The user's comments are theirs: answer one under it with `reply_to_comment` (numbered C1, C2… after its letter), and when you change the code under one, keep it on the right lines with `move_comment`. `clear_marks` removes your own highlights and replies; the user's comments only when the user explicitly asks you to delete them.";
+const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a terminal beside you. When the user wants to see code, show it there instead of pasting it into the chat: `show_code` for files and lines, with highlights; `show_diff` for what changed between any two states (the branch point, commits, branches, staged work, a pull request). Typical requests: \"show me the code\", \"where is this handled\", \"open that file\", \"what changed\", \"show me the diff\", \"compare main and this branch\", \"show me PR 123\". A call updates that repository's view in the viewer; the user gets back to where they were with Esc. Read files with your own tools; codesnob is for showing. Add notes to highlights only when the user asks you to explain or comment on the code; otherwise show the code without them. Marks are lettered [A], [B]… in the viewer, shared between you and the user: your highlights and the user's comments alike. The user writes comments on lines in the viewer; call `get_review` whenever they say they reviewed, commented or marked something, or a reply tells you they have unread comments, and answer to the letters. Every location has an id like L3, given in replies; pass it back to address that location. `list_locations` lists the locations open, with their unread comments, for comments the user left on one that is not on screen. The user's comments are theirs: answer one under it with `reply_to_comment` (numbered C1, C2… after its letter), and when you change the code under one, keep it on the right lines with `move_comment`. `clear_marks` removes your own highlights and replies; the user's comments only when the user explicitly asks you to delete them.";
 
 fn tools() -> Value {
     json!([{
@@ -150,6 +150,10 @@ fn tools() -> Value {
             }
         }
     }, {
+        "name": "list_locations",
+        "description": "List the locations open in the user's codesnob viewer: each one's id (L3), what it shows, which is on screen, and how many marks, comments by the user and unread comments it has; and the other viewers running. get_review reads only the location on screen unless given an id, so use this when the user says they commented and the location on screen has nothing new, or to find a location they mean.",
+        "inputSchema": { "type": "object", "properties": {} }
+    }, {
         "name": "get_review",
         "description": "Read every mark on a location in the user's codesnob viewer: your highlights and the user's comments, each with its letter, file and lines, the commented code, and the replies under it (C1, C2…). Call it whenever the user says they reviewed, commented on or marked something, or a reply says they have unread comments. Comments and replies count as read once returned; those made or edited since your last call are flagged new. Comments on deleted lines give old-side line numbers; a stale mark's lines no longer exist.",
         "inputSchema": {
@@ -205,6 +209,7 @@ fn call(params: &Value) -> Value {
     match name {
         "show_diff" => tool_result(show_diff(&args)),
         "show_code" => tool_result(show_code(&args)),
+        "list_locations" => tool_result(list_locations()),
         "get_review" => tool_result(get_review(&args)),
         "clear_marks" => tool_result(clear_marks(&args)),
         "reply_to_comment" => tool_result(reply_to_comment(&args)),
@@ -290,6 +295,11 @@ fn location_arg(args: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
+}
+
+fn list_locations() -> Result<String, String> {
+    let mut client = link::connect()?;
+    link::request_locations(&mut client).map_err(no_viewer)
 }
 
 fn get_review(args: &Value) -> Result<String, String> {
@@ -1026,6 +1036,43 @@ mod tests {
     }
 
     #[test]
+    fn other_viewers_are_named_as_out_of_reach() {
+        let r = crate::proto::LocationsResult {
+            viewer: "v1".to_string(),
+            locations: Vec::new(),
+        };
+        let viewer = |id: &str, ws: Option<&str>, dir: Option<&str>| crate::proto::ViewerEntry {
+            id: id.to_string(),
+            pid: 1,
+            since: 0,
+            platform: None,
+            window: None,
+            workspace: ws.map(str::to_owned),
+            position: None,
+            target: dir.map(|d| crate::proto::Target {
+                dir: PathBuf::from(d),
+                base: None,
+                repo: true,
+            }),
+        };
+        let one = [viewer("v1", Some("2"), Some("/a"))];
+        assert_eq!(
+            link::describe_locations(&r, &one),
+            "viewer v1: 0 locations, the one on screen first"
+        );
+        let more = [
+            viewer("v1", Some("2"), Some("/a")),
+            viewer("v2", Some("5"), Some("/b")),
+            viewer("v3", None, None),
+        ];
+        assert_eq!(
+            link::describe_locations(&r, &more),
+            "viewer v1: 0 locations, the one on screen first\n\
+             other viewers, which these requests do not reach: v2 on workspace 5 (/b), v3"
+        );
+    }
+
+    #[test]
     fn a_move_is_checked_and_its_path_made_relative_to_the_checkout() {
         let dir = branch_with_history("mcp-move");
         let sub = dir.join("deep");
@@ -1081,22 +1128,36 @@ mod tests {
             [
                 "show_code",
                 "show_diff",
+                "list_locations",
                 "get_review",
                 "reply_to_comment",
                 "move_comment",
                 "clear_marks"
             ]
         );
-        assert!(tools[0]["inputSchema"]["properties"]["append"].is_object());
+        let tool = |name: &str| {
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert!(tool("show_code")["inputSchema"]["properties"]["append"].is_object());
         assert_eq!(
-            tools[3]["inputSchema"]["required"],
+            tool("list_locations")["inputSchema"]["properties"],
+            json!({})
+        );
+        assert_eq!(
+            tool("reply_to_comment")["inputSchema"]["required"],
             json!(["letter", "text"])
         );
         assert_eq!(
-            tools[4]["inputSchema"]["required"],
+            tool("move_comment")["inputSchema"]["required"],
             json!(["letter", "lines"])
         );
-        let clear = &tools[5]["inputSchema"]["properties"];
+        let clear = &tool("clear_marks")["inputSchema"]["properties"];
         assert_eq!(clear["which"]["enum"], json!(["mine", "user", "all"]));
         assert_eq!(
             clear["user_explicitly_asked_to_delete_comments"]["type"],

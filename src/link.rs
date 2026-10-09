@@ -274,6 +274,60 @@ pub fn clear(
     Ok(())
 }
 
+/// The locations of the viewer our requests reach, and the other viewers
+/// running, which they do not.
+pub fn describe_locations(r: &proto::LocationsResult, viewers: &[proto::ViewerEntry]) -> String {
+    let mut text = r.render();
+    let others: Vec<String> = viewers
+        .iter()
+        .filter(|v| v.id != r.viewer)
+        .map(|v| {
+            let ws = v
+                .workspace
+                .as_deref()
+                .map(|w| format!(" on workspace {w}"))
+                .unwrap_or_default();
+            let dir = v
+                .target
+                .as_ref()
+                .map(|t| format!(" ({})", t.dir.display()))
+                .unwrap_or_default();
+            format!("{}{ws}{dir}", v.id)
+        })
+        .collect();
+    if !others.is_empty() {
+        text.push_str(&format!(
+            "\nother viewers, which these requests do not reach: {}",
+            others.join(", ")
+        ));
+    }
+    text
+}
+
+/// Every location in the viewer our requests reach, and the other viewers.
+pub fn request_locations(client: &mut proto::Client) -> Result<String, String> {
+    let st: proto::StatusResult =
+        serde_json::from_value(client.call(Method::Status)?).map_err(|e| e.to_string())?;
+    let v = request_query(client, proto::ViewerQuery::Locations)?;
+    let r: proto::LocationsResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
+    Ok(describe_locations(&r, &st.viewers))
+}
+
+/// `codesnob locations`: what the viewer has open.
+pub fn locations(json: bool) -> Result<(), String> {
+    let mut client = one_shot()?;
+    if json {
+        let v = request_query(&mut client, proto::ViewerQuery::Locations)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    println!("{}", request_locations(&mut client)?);
+    Ok(())
+}
+
 /// `codesnob reply`: answer one of the user's comments, under it.
 pub fn reply(location: Option<String>, letter: String, text: String) -> Result<(), String> {
     let mut client = one_shot()?;

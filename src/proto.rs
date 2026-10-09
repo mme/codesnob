@@ -107,6 +107,8 @@ pub struct ViewSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ViewerQuery {
+    /// The locations open in the viewer, the one on screen first.
+    Locations,
     /// Every mark on a location, with the user's comments; the comments
     /// count as read afterwards.
     Review {
@@ -262,6 +264,78 @@ impl MarkInfo {
                 "\n    [{}] {} reply{new}: {}",
                 r.label, r.author, r.text
             ));
+        }
+        out
+    }
+}
+
+/// A location as listed for an agent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationInfo {
+    /// "L3": its id in that viewer.
+    pub location: String,
+    /// "#142 Fix the parser" for a pull request, else the directory's name.
+    pub name: String,
+    pub dir: PathBuf,
+    /// What it shows, in words.
+    pub showing: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_screen: bool,
+    pub marks: usize,
+    /// The user's comments and replies.
+    pub comments: usize,
+    /// Those the agent has not read.
+    pub unread: usize,
+}
+
+impl LocationInfo {
+    pub fn render(&self) -> String {
+        let mut out = format!("{} {} · {}", self.location, self.name, self.dir.display());
+        if self.on_screen {
+            out.push_str(" · on screen");
+        }
+        if !self.showing.is_empty() {
+            out.push_str(&format!(" · {}", self.showing));
+        }
+        out.push_str(&match self.marks {
+            0 => " · no marks".to_string(),
+            1 => " · 1 mark".to_string(),
+            n => format!(" · {n} marks"),
+        });
+        if self.comments > 0 {
+            out.push_str(&format!(", {} by the user", self.comments));
+        }
+        if self.unread > 0 {
+            out.push_str(&format!(", {} unread", self.unread));
+        }
+        out
+    }
+}
+
+/// What a viewer answers a request for its locations with.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationsResult {
+    /// The viewer's id, as `codesnob status` lists it: "v1234".
+    pub viewer: String,
+    /// The one on screen first, then the most recently visited.
+    pub locations: Vec<LocationInfo>,
+}
+
+impl LocationsResult {
+    pub fn render(&self) -> String {
+        let n = self.locations.len();
+        let mut out = format!(
+            "viewer {}: {n} location{}, the one on screen first",
+            self.viewer,
+            if n == 1 { "" } else { "s" }
+        );
+        for l in &self.locations {
+            out.push('\n');
+            out.push_str(&l.render());
+        }
+        let unread: usize = self.locations.iter().map(|l| l.unread).sum();
+        if unread > 0 {
+            out.push_str("\nread unread comments with get_review and the location's id");
         }
         out
     }
@@ -735,6 +809,50 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locations_render_one_line_each_the_one_on_screen_first() {
+        let mut r = LocationsResult {
+            viewer: "v7".to_string(),
+            locations: vec![
+                LocationInfo {
+                    location: "L2".to_string(),
+                    name: "#142 Fix the parser".to_string(),
+                    dir: PathBuf::from("/c/pr/142"),
+                    showing: "#142 Fix the parser · into main".to_string(),
+                    on_screen: true,
+                    ..Default::default()
+                },
+                LocationInfo {
+                    location: "L1".to_string(),
+                    name: "repo".to_string(),
+                    dir: PathBuf::from("/work/repo"),
+                    showing: "feature · 2 commits since main".to_string(),
+                    marks: 3,
+                    comments: 2,
+                    unread: 1,
+                    ..Default::default()
+                },
+            ],
+        };
+        assert_eq!(
+            r.render(),
+            "viewer v7: 2 locations, the one on screen first\n\
+             L2 #142 Fix the parser · /c/pr/142 · on screen · #142 Fix the parser · into main · no marks\n\
+             L1 repo · /work/repo · feature · 2 commits since main · 3 marks, 2 by the user, 1 unread\n\
+             read unread comments with get_review and the location's id"
+        );
+        r.locations.truncate(1);
+        assert!(
+            r.render().starts_with("viewer v7: 1 location,"),
+            "{}",
+            r.render()
+        );
+        assert!(
+            !r.render().contains("get_review"),
+            "nothing unread, no nudge"
+        );
+    }
 
     #[test]
     fn a_review_renders_one_line_per_mark_with_the_commented_code() {

@@ -74,6 +74,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// List the locations open in the viewer, with their marks and unread
+    /// comments, and the other viewers running.
+    Locations {
+        /// Print the raw JSON reply.
+        #[arg(long)]
+        json: bool,
+    },
     /// List the marks on a location in the viewer: the agent's highlights
     /// and the user's comments, which count as read afterwards.
     Review {
@@ -146,6 +153,9 @@ fn main() -> Result<()> {
             return link::show(dir, range).map_err(|e| anyhow::anyhow!(e));
         }
         Some(Cmd::Status { json }) => return link::status(json).map_err(|e| anyhow::anyhow!(e)),
+        Some(Cmd::Locations { json }) => {
+            return link::locations(json).map_err(|e| anyhow::anyhow!(e));
+        }
         Some(Cmd::Review { location, json }) => {
             return link::review(location, json).map_err(|e| anyhow::anyhow!(e));
         }

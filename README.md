@@ -129,12 +129,13 @@ Most other agents take a JSON configuration in this form:
 }
 ```
 
-The server gives the agent six tools:
+The server gives the agent seven tools:
 
 | Tool | Does |
 |---|---|
 | `show_code` | show whole files or excerpts, as they are or as of a revision, with highlighted lines and optional notes |
 | `show_diff` | show any comparison from [the range table](#what-is-compared), optionally limited to some files, with highlighted lines |
+| `list_locations` | list the locations open in the viewer, which one is on screen, and how many comments each has that the agent has not read; and other viewers running |
 | `get_review` | read every mark on a location: the agent's highlights, your comments and the replies under them, with the code they are on and what is new |
 | `reply_to_comment` | answer one of your comments under it, as `[C1]`, `[C2]`, … |
 | `move_comment` | put one of your comments on other lines after the agent changed the code under it; it keeps its letter, text and replies |
@@ -319,6 +320,7 @@ The subcommands talk to viewers that are already running:
 | Command | Does |
 |---|---|
 | `codesnob show PATH [--range R]` | show the repository at `PATH` in the viewer, optionally a specific range |
+| `codesnob locations [--json]` | list the locations open in the viewer, with their marks and unread comments, and the other viewers running |
 | `codesnob review [--location L3] [--json]` | print the marks on a location (default: the one on screen); the comments count as read afterwards |
 | `codesnob reply LETTER TEXT [--location L3]` | answer one of the user's comments under it |
 | `codesnob move LETTER LINES [--path P] [--location L3]` | put one of the user's comments on other lines, e.g. `codesnob move C 40-42` |

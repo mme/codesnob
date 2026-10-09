@@ -2515,6 +2515,64 @@ fn a_switch_waits_behind_a_banner_while_comments_are_unread() {
 }
 
 #[test]
+fn the_locations_are_listed_with_their_unread_comments() {
+    let a = repo_with_long_file("ui-locations-a");
+    let b = small_repo("ui-locations-b");
+    let mut h = Harness::open(&a);
+    h.keys("jj<enter>look<enter>k");
+    h.app.dispatch(Msg::View(
+        target(&b),
+        Box::new(view(None, &["readme.md"])),
+        None,
+    ));
+    h.settle();
+    h.keys("y");
+    h.settle();
+    let r = h.app.locations_info();
+    assert_eq!(r.viewer, format!("v{}", std::process::id()));
+    let each: Vec<(&str, bool, usize, usize, usize)> = r
+        .locations
+        .iter()
+        .map(|l| {
+            (
+                l.location.as_str(),
+                l.on_screen,
+                l.marks,
+                l.comments,
+                l.unread,
+            )
+        })
+        .collect();
+    assert_eq!(
+        each,
+        [("L2", true, 0, 0, 0), ("L1", false, 1, 1, 1)],
+        "the one on screen first; the comment left behind is still unread"
+    );
+    assert_eq!((&r.locations[0].dir, &r.locations[1].dir), (&b, &a));
+    assert!(
+        r.locations[0].showing.starts_with("readme.md only · "),
+        "{}",
+        r.locations[0].showing
+    );
+    assert!(
+        !r.locations[1].showing.is_empty(),
+        "described off screen too"
+    );
+    let text = r.render();
+    assert!(
+        text.contains("1 mark, 1 by the user, 1 unread")
+            && text.ends_with("read unread comments with get_review and the location's id"),
+        "{text}"
+    );
+
+    // Read by its id, it is read in the list too.
+    h.app.review(Some("L1")).unwrap();
+    assert_eq!(h.app.locations_info().locations[1].unread, 0);
+    cleanup(a);
+    cleanup(b);
+}
+
+#[test]
 fn a_held_request_is_dropped_with_esc_or_replaced_by_a_newer_one() {
     let a = repo_with_long_file("ui-gate-drop");
     let b = small_repo("ui-gate-drop-b");
