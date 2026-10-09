@@ -1,5 +1,9 @@
 <h1 align="center">
-  <img src="assets/codesnob.svg" alt="codesnob" width="640">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/codesnob-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/codesnob-transparent.svg">
+    <img src="assets/codesnob.svg" alt="codesnob" width="640">
+  </picture>
 </h1>
 
 A lean, fast terminal code viewer that agents can drive: files, diffs and pull
