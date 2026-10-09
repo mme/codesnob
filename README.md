@@ -1,4 +1,6 @@
-# codesnob
+<h1 align="center">
+  <img src="assets/codesnob.svg" alt="codesnob" width="640">
+</h1>
 
 A lean, fast terminal code viewer that agents can drive: files, diffs and pull
 requests, with highlights and notes.
