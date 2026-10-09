@@ -222,15 +222,22 @@ fn shown(r: &crate::proto::ShowResult, what: &str) -> String {
                     .collect();
                 text.push_str(&format!("; marks {}", each.join(", ")));
             }
-            text.push_str(&format!(
-                "; location {} ({})",
-                ack.location,
-                ack.dir.display()
-            ));
+            if !ack.location.is_empty() {
+                text.push_str(&format!(
+                    "; location {} ({})",
+                    ack.location,
+                    ack.dir.display()
+                ));
+            }
             if !ack.applied {
                 text.push_str("; the user is reviewing, so the viewer holds this until they accept it or you read their comments");
             }
-            text.push_str(&crate::proto::unread_note(&ack.location, ack.unread));
+            let location = if ack.location.is_empty() {
+                "the location on screen"
+            } else {
+                ack.location.as_str()
+            };
+            text.push_str(&crate::proto::unread_note(location, ack.unread));
         }
         None => text.push_str(
             "; the viewer did not say which letters it gave, call get_review to see them",
