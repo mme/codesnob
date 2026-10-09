@@ -306,6 +306,20 @@ mod tests {
         false
     }
 
+    /// Wait until the watcher is live and say how it watches. Changes made
+    /// before then are not reported, so tests wait for this, not a fixed time.
+    fn started(rx: &Receiver<Msg>) -> Mode {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(Msg::Watching { mode, .. }) => return mode,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        panic!("the watcher reports its mode");
+    }
+
     /// Wait out the tail of a burst.
     fn quiet(rx: &Receiver<Msg>) {
         while changed(rx, Duration::from_millis(800)) {}
@@ -316,10 +330,7 @@ mod tests {
         let dir = repo("edit");
         let (tx, rx) = channel();
         let _handle = spawn_watcher(dir.clone(), tx, 7);
-        let mode = match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Msg::Watching { mode, .. }) => mode,
-            _ => panic!("the watcher reports its mode first"),
-        };
+        let mode = started(&rx);
         assert!(mode == Mode::Watching, "a native watcher is available");
         // Let the watcher settle before the first change.
         std::thread::sleep(Duration::from_millis(300));
@@ -341,6 +352,7 @@ mod tests {
         let dir = repo("newdir");
         let (tx, rx) = channel();
         let _handle = spawn_watcher(dir.clone(), tx, 7);
+        started(&rx);
         std::thread::sleep(Duration::from_millis(300));
 
         std::fs::create_dir(dir.join("src")).unwrap();
@@ -363,6 +375,7 @@ mod tests {
         let dir = repo("drop");
         let (tx, rx) = channel();
         let handle = spawn_watcher(dir.clone(), tx, 7);
+        started(&rx);
         std::thread::sleep(Duration::from_millis(300));
         drop(handle);
         std::thread::sleep(Duration::from_millis(300));
