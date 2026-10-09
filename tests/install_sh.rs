@@ -368,13 +368,7 @@ fn a_pinned_version_never_asks_what_is_latest() {
     let fx = Arc::new(fixture(&dir));
     let (base, hits) = serve(fx.clone(), fx.sha256_line.clone(), false);
 
-    let run = run_installer(
-        "pinned",
-        &base,
-        &[("CODESNOB_VERSION", TAG)],
-        None,
-        &|_| {},
-    );
+    let run = run_installer("pinned", &base, &[("CODESNOB_VERSION", TAG)], None, &|_| {});
 
     assert!(run.status.success(), "stderr: {}", run.stderr);
     assert!(!hits.lock().unwrap().iter().any(|p| p == "/releases/latest"));

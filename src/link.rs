@@ -190,8 +190,7 @@ pub fn describe(r: &proto::ShowResult) -> String {
 }
 
 fn one_shot() -> Result<proto::Client, String> {
-    let stream =
-        proto::connect_or_spawn().ok_or("could not reach or start the codesnob daemon")?;
+    let stream = proto::connect_or_spawn().ok_or("could not reach or start the codesnob daemon")?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let mut client = proto::Client::new(stream, "c").map_err(|e| e.to_string())?;
     client.hello()?;
@@ -211,10 +210,7 @@ pub fn show(dir: PathBuf, range: Option<String>) -> Result<(), String> {
     });
     let r = request_show(&mut client, dir.clone(), view)?;
     if !r.repo {
-        eprintln!(
-            "codesnob: {} is not inside a git repository",
-            dir.display()
-        );
+        eprintln!("codesnob: {} is not inside a git repository", dir.display());
     }
     println!("{}", describe(&r));
     Ok(())
