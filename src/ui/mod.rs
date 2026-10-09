@@ -17,7 +17,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -58,9 +58,24 @@ pub struct Palette {
     pub hunk_fg: Color,
     pub gutter_fg: Color,
     pub note_fg: Color,
+    /// The cursor's row: its background on a plain row, and how far a
+    /// tinted row's background shifts (lighter on dark, darker on light).
+    pub cursor_bg: Color,
+    cursor_shift: i16,
+    /// The cursor row's line numbers.
+    pub cursor_fg: Color,
 }
 
 impl Palette {
+    /// The background the cursor's row gets over `bg`.
+    pub fn cursor_over(&self, bg: Color) -> Color {
+        let Color::Rgb(r, g, b) = bg else {
+            return self.cursor_bg;
+        };
+        let shift = |c: u8| (i16::from(c) + self.cursor_shift).clamp(0, 255) as u8;
+        Color::Rgb(shift(r), shift(g), shift(b))
+    }
+
     pub fn dark() -> Self {
         Self {
             key_fg: Color::Cyan,
@@ -74,6 +89,9 @@ impl Palette {
             hunk_fg: Color::Cyan,
             gutter_fg: Color::DarkGray,
             note_fg: Color::DarkGray,
+            cursor_bg: Color::Rgb(0x2a, 0x2e, 0x38),
+            cursor_shift: 0x18,
+            cursor_fg: Color::White,
         }
     }
 
@@ -90,6 +108,9 @@ impl Palette {
             hunk_fg: Color::Blue,
             gutter_fg: Color::Gray,
             note_fg: Color::Gray,
+            cursor_bg: Color::Rgb(0xe6, 0xe8, 0xee),
+            cursor_shift: -0x18,
+            cursor_fg: Color::Black,
         }
     }
 }
@@ -348,6 +369,8 @@ pub struct App {
     recent: HashMap<panel::Kind, Vec<String>>,
     message: Option<String>,
     body_h: usize,
+    /// Where the body starts on screen; mouse rows are relative to it.
+    body_y: u16,
     /// Commit messages are shown above a commit's diff unless turned off.
     show_commit_desc: bool,
     /// PR descriptions are hidden until turned on.
@@ -384,6 +407,7 @@ impl App {
             recent: HashMap::new(),
             message: None,
             body_h: 1,
+            body_y: 0,
             show_commit_desc: true,
             show_pr_desc: false,
             flip: None,
@@ -1119,7 +1143,7 @@ impl App {
             Some(a) if !place => loc.view.restore(a),
             _ => {
                 // Placed at the next draw, when the screen height is known.
-                loc.view.scroll = 0;
+                loc.view.go_top();
                 loc.view.hscroll = 0;
                 loc.view.place_target = loc.view.target.is_some() || loc.view.has_marks();
             }
@@ -1235,12 +1259,12 @@ impl App {
         match anchor.or(pending) {
             Some(a) if !loc.place_pending => loc.view.restore(a),
             _ if std::mem::take(&mut loc.place_pending) => {
-                loc.view.scroll = 0;
+                loc.view.go_top();
                 loc.view.hscroll = 0;
                 loc.view.place_target = loc.view.has_marks();
             }
             None if !same_range => {
-                loc.view.scroll = 0;
+                loc.view.go_top();
                 loc.view.hscroll = 0;
             }
             _ => {}
@@ -1292,6 +1316,15 @@ impl App {
                 let delta: isize = match m.kind {
                     MouseEventKind::ScrollDown => 3,
                     MouseEventKind::ScrollUp => -3,
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if self.panel.is_none()
+                            && let Some(y) = m.row.checked_sub(self.body_y)
+                            && let Some(loc) = self.cur_mut()
+                        {
+                            loc.view.click(y as usize);
+                        }
+                        return;
+                    }
                     _ => return,
                 };
                 match self.panel.as_mut() {
@@ -1366,6 +1399,11 @@ impl App {
                 loc.view.scroll_by(d);
             }
         };
+        let step = |app: &mut App, d: isize| {
+            if let Some(loc) = app.cur_mut() {
+                loc.view.move_cursor(d);
+            }
+        };
         let hscroll = |app: &mut App, f: &dyn Fn(usize) -> usize| {
             if let Some(loc) = app.cur_mut() {
                 loc.view.hscroll = f(loc.view.hscroll);
@@ -1405,10 +1443,10 @@ impl App {
             (KeyCode::Down, false, true) => self.perform(Action::NewerCommit),
             (KeyCode::Down, _, _)
             | (KeyCode::Char('j'), false, false)
-            | (KeyCode::Char('n'), true, false) => scroll(self, 1),
+            | (KeyCode::Char('n'), true, false) => step(self, 1),
             (KeyCode::Up, _, _)
             | (KeyCode::Char('k'), false, false)
-            | (KeyCode::Char('p'), true, false) => scroll(self, -1),
+            | (KeyCode::Char('p'), true, false) => step(self, -1),
             (KeyCode::PageDown, _, _)
             | (KeyCode::Char(' '), false, false)
             | (KeyCode::Char('v'), true, false) => scroll(self, page),
@@ -1574,7 +1612,7 @@ impl App {
             narrow_view(&mut loc.view, &loc.focus);
             match anchor {
                 Some(a) => loc.view.restore(a),
-                None => loc.view.scroll = 0,
+                None => loc.view.go_top(),
             }
             loc.pending_anchor = None;
         } else {
@@ -1755,7 +1793,7 @@ impl App {
         loc.desc_dirty = true;
         match anchor {
             Some(a) if keep => loc.view.restore(a),
-            _ => loc.view.scroll = 0,
+            _ => loc.view.go_top(),
         }
     }
 
@@ -2235,7 +2273,6 @@ impl App {
         ) {
             self.leave_code();
         }
-        let body_h = self.body_h;
         match action {
             Action::Quit => self.quit = true,
             Action::Files => self.open_files(),
@@ -2338,8 +2375,8 @@ impl App {
                     Action::PrevHunk => v.prev_hunk(),
                     Action::NextFile => v.next_file(),
                     Action::PrevFile => v.prev_file(),
-                    Action::Top => v.scroll = 0,
-                    Action::Bottom => v.scroll = v.end_scroll(body_h),
+                    Action::Top => v.go_top(),
+                    Action::Bottom => v.go_bottom(),
                     _ => {}
                 }
             }
@@ -2562,6 +2599,7 @@ impl App {
         let panel_area = Rect::new(body.x, body.bottom() - panel_h, body.width, panel_h);
         body.height -= panel_h;
         self.body_h = body.height as usize;
+        self.body_y = body.y;
         let rebuild = self
             .cur()
             .is_some_and(|l| l.desc_dirty || l.desc_width != body.width);
@@ -2574,6 +2612,7 @@ impl App {
             }
         }
         if let Some(loc) = self.locations.first_mut() {
+            loc.view.resize(self.body_h);
             // A target line inside a highlight opens at that highlight, its
             // note at the top; any other target line sits about a third of
             // the way down. Without one the view opens with ① at the top.
@@ -2584,14 +2623,13 @@ impl App {
                     .is_some_and(|(p, l)| loc.view.mark_at(p, *l));
                 if !on_mark {
                     match target.and_then(|(p, l)| loc.view.row_of_line(&p, l)) {
-                        Some(row) => loc.view.scroll = row.saturating_sub(self.body_h / 3),
+                        Some(row) => loc.view.center_on(row),
                         None => {
                             loc.view.first_mark();
                         }
                     }
                 }
             }
-            loc.view.clamp();
         }
 
         let info = self.mode_label();

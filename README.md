@@ -63,6 +63,7 @@ need to start:
 
 | Key | Does |
 |---|---|
+| `j` `k` ↑ ↓ | move the cursor line; the view follows, keeping three rows in sight around it. A click moves it too |
 | `o` | open a directory or a file, a file as of a revision (`main:src/diff.rs`), a PR (`#123`, `owner/repo#123`, a URL), or a comparison (`main...feature`, `HEAD~3`, `staged`) |
 | `c` | the branch's commits; moving through the list previews each one |
 | Alt-↑ Alt-↓ | older and newer commit, directly |

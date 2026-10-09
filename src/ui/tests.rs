@@ -76,6 +76,9 @@ impl Harness {
             scratch: Vec::new(),
         };
         h.settle();
+        // Drawn once, as the real viewer is before any key arrives, so the
+        // view knows how much is in sight.
+        h.screen();
         h
     }
 
@@ -157,6 +160,43 @@ impl Harness {
             .unwrap_or("")
             .trim()
             .to_string()
+    }
+
+    /// The screen row drawn as the cursor's, and its text.
+    fn cursor(&mut self) -> (usize, String) {
+        let screen = self.screen();
+        let p = Palette::dark();
+        let bases = [
+            p.add_bg,
+            p.del_bg,
+            p.mark_bg,
+            p.header_bg,
+            p.add_emph,
+            p.del_emph,
+        ];
+        let cursor_bgs: Vec<Color> = std::iter::once(p.cursor_bg)
+            .chain(bases.iter().map(|&c| p.cursor_over(c)))
+            .collect();
+        let buf = self.term.backend().buffer();
+        let (w, h) = (buf.area.width, buf.area.height);
+        let rows: Vec<usize> = (0..h - 1)
+            .filter(|&y| cursor_bgs.contains(&buf[(w - 1, y)].bg))
+            .map(|y| y as usize)
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one cursor row:\n{screen}");
+        let text = screen.lines().nth(rows[0]).unwrap_or("").to_string();
+        (rows[0], text)
+    }
+
+    fn click(&mut self, row: u16) {
+        self.app
+            .dispatch(Msg::Input(Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 10,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })));
+        self.settle();
     }
 }
 
@@ -1612,6 +1652,137 @@ fn code(rev: Option<&str>, files: &[(&str, Option<usize>)]) -> crate::proto::Vie
 }
 
 /// A repo whose src/long.rs has 60 numbered lines.
+#[test]
+fn the_cursor_moves_within_the_view_and_the_view_follows_near_the_edge() {
+    let dir = repo_with_long_file("ui-cursor");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    let (row, text) = h.cursor();
+    assert_eq!(row, 0, "opens with the cursor on the header: {text}");
+    let buf = h.term.backend().buffer();
+    assert!(
+        !buf[(0, 1)].modifier.contains(Modifier::BOLD),
+        "other rows keep plain line numbers"
+    );
+
+    h.keys(&"j".repeat(20));
+    let (row, text) = h.cursor();
+    assert!(text.contains("// line 20"), "{text}");
+    assert_eq!(
+        row, 20,
+        "the view stays put while the cursor is clear of the edge"
+    );
+    let buf = h.term.backend().buffer();
+    assert!(
+        buf[(0, 20)].modifier.contains(Modifier::BOLD),
+        "the cursor row's line number is bold"
+    );
+
+    h.keys(&"j".repeat(6));
+    let (row, text) = h.cursor();
+    assert!(text.contains("// line 26"), "{text}");
+    let screen = h.screen();
+    assert!(
+        !screen.contains("// line 1\n") && screen.contains("// line 29"),
+        "three rows stay in sight below the cursor:\n{screen}"
+    );
+    assert!(
+        screen.lines().next().unwrap().contains("src/long.rs"),
+        "the header sticks once scrolled:\n{screen}"
+    );
+    assert_eq!(row, 29 - 4, "{screen}");
+
+    h.keys("G");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("// line 60"),
+        "G lands on the last row: {text}"
+    );
+    assert!(
+        h.screen().lines().nth(28).unwrap().contains("// line 60"),
+        "with the last row at the bottom:\n{}",
+        h.screen()
+    );
+    h.keys(&"k".repeat(31));
+    let (row, text) = h.cursor();
+    assert!(text.contains("// line 29"), "{text}");
+    assert_eq!(
+        row,
+        1 + 3,
+        "the view scrolls up once the cursor is within three rows of the top"
+    );
+
+    h.keys("g");
+    assert_eq!(h.cursor().0, 0);
+    cleanup(dir);
+}
+
+#[test]
+fn paging_moves_the_view_and_keeps_the_cursor_in_sight() {
+    let dir = repo_with_long_file("ui-cursor-page");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.keys(" ");
+    let screen = h.screen();
+    let (_, text) = h.cursor();
+    assert!(
+        !screen.contains("// line 2\n"),
+        "a page down moves the view:\n{screen}"
+    );
+    assert!(
+        text.contains("// line 3"),
+        "the cursor is pulled along, clear of the top: {text}"
+    );
+    h.keys("<c-u>");
+    let (row, _) = h.cursor();
+    assert!(
+        row >= 3,
+        "half a page up keeps the cursor clear of the top: {row}"
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn the_cursor_skips_blank_rows_and_follows_a_click() {
+    let dir = branch_with_history("ui-cursor-blank");
+    let mut h = Harness::open(&dir);
+    let mut seen = Vec::new();
+    for _ in 0..40 {
+        h.keys("j");
+        let (_, text) = h.cursor();
+        assert!(!text.trim().is_empty(), "never rests on a blank row");
+        seen.push(text);
+    }
+    assert!(
+        seen.iter().filter(|t| t.contains("/")).count() >= 2,
+        "steps onto the file headers on the way: {seen:?}"
+    );
+    h.keys("g");
+    h.click(5);
+    let (row, text) = h.cursor();
+    assert_eq!(row, 5, "{text}");
+    h.click(0);
+    assert_eq!(h.cursor().0, 0, "the header counts too");
+    cleanup(dir);
+}
+
+#[test]
+fn a_reload_keeps_the_cursor_on_its_line_and_screen_row() {
+    let dir = branch_with_history("ui-cursor-reload");
+    let mut h = Harness::open(&dir);
+    h.keys("jjjjj");
+    let before = h.cursor();
+    std::fs::write(dir.join("fresh.txt"), "new file\n").unwrap();
+    h.keys("r");
+    assert!(h.screen().contains("fresh.txt"), "{}", h.screen());
+    assert_eq!(h.cursor(), before);
+    cleanup(dir);
+}
+
 fn repo_with_long_file(name: &str) -> PathBuf {
     let dir = branch_with_history(name);
     let body: String = (1..=60).map(|i| format!("// line {i}\n")).collect();

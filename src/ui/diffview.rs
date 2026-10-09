@@ -34,14 +34,19 @@ pub struct Mark {
     pub note: Option<String>,
 }
 
-/// Where the view is, expressed in terms that survive a reload.
+/// Where the cursor is, expressed in terms that survive a reload.
 pub struct Anchor {
     path: String,
     /// (side, line number): side 0 is the old file, 1 the new file.
     line: Option<(u8, usize)>,
-    /// The view was on a hunk header, not on a line.
+    /// The cursor was on a hunk header, not on a line.
     at_hunk: bool,
+    /// How many rows below the top of the view the cursor sat.
+    offset: usize,
 }
+
+/// Rows kept visible above and below the cursor while it moves.
+pub const SCROLLOFF: usize = 3;
 
 #[derive(Default)]
 pub struct DiffView {
@@ -54,8 +59,14 @@ pub struct DiffView {
     only: Vec<usize>,
     /// The description block: a commit message or PR body, already wrapped.
     desc: Vec<Line<'static>>,
+    /// The first row shown.
     pub scroll: usize,
     pub hscroll: usize,
+    /// The row the cursor is on. It never rests on a blank row, and the
+    /// view scrolls to keep it in sight.
+    cursor: usize,
+    /// The height of the body at the last draw; what "in sight" means.
+    body_h: usize,
     /// A line to mark with ▶ in a plain file: (path, line number).
     pub target: Option<(String, usize)>,
     /// Scroll to `target` at the next draw, once the screen height is known.
@@ -125,11 +136,15 @@ impl DiffView {
         self.mark_rows.iter().any(Option::is_some)
     }
 
-    /// Jump to highlight `i` (by index): its note at the top of the view.
+    /// Jump to highlight `i` (by index): its note comes into view and the
+    /// cursor lands on its first line.
     fn go_to_mark(&mut self, i: usize) -> bool {
         match self.mark_rows.get(i).copied().flatten() {
             Some(row) => {
-                self.scroll = row;
+                self.jump_to(row);
+                if matches!(self.rows.get(row + 1), Some(Row::Line(..))) {
+                    self.cursor = row + 1;
+                }
                 self.current_mark = Some(i);
                 true
             }
@@ -264,10 +279,10 @@ impl DiffView {
         }
     }
 
-    /// Scroll so file `fi` starts at the top.
+    /// Move to the header of file `fi`.
     pub fn scroll_to_file(&mut self, fi: usize) {
         if let Some(r) = self.file_row(fi) {
-            self.scroll = r;
+            self.jump_to(r);
         }
     }
 
@@ -362,7 +377,7 @@ impl DiffView {
         }
         // With highlights, one more column so the bar never covers a digit.
         self.gutter_w = max_no.to_string().len().max(3) + usize::from(!self.marks.is_empty());
-        self.clamp();
+        self.fit();
     }
 
     // ---- position --------------------------------------------------------
@@ -370,7 +385,7 @@ impl DiffView {
     pub fn anchor(&self) -> Option<Anchor> {
         let fi = self.current_file()?;
         let path = self.files[fi].path.clone();
-        let (line, at_hunk) = match self.rows.get(self.scroll)? {
+        let (line, at_hunk) = match self.rows.get(self.cursor)? {
             Row::Line(fi, hi, li) => {
                 let l = &self.files[*fi].hunks[*hi].lines[*li];
                 (l.new_no.map(|n| (1, n)).or(l.old_no.map(|n| (0, n))), false)
@@ -390,16 +405,17 @@ impl DiffView {
             path,
             line,
             at_hunk,
+            offset: self.cursor - self.scroll,
         })
     }
 
     pub fn restore(&mut self, a: Anchor) {
         let Some(fi) = self.files.iter().position(|f| f.path == a.path) else {
-            self.clamp();
+            self.fit();
             return;
         };
         let Some(start) = self.file_row(fi) else {
-            self.clamp();
+            self.fit();
             return;
         };
         let end = self
@@ -421,21 +437,101 @@ impl DiffView {
                 }
             }
         }
-        self.scroll = match best {
-            // Step back onto the hunk header when we were on one and landed on its first line.
-            Some((_, r)) if a.at_hunk && matches!(self.rows[r], Row::Line(_, _, 0)) => r - 1,
+        self.cursor = match best {
+            // Back onto the hunk header when we were on one.
+            Some((_, r)) if a.at_hunk => self
+                .hunk_starts
+                .iter()
+                .rev()
+                .find(|&&s| s <= r)
+                .copied()
+                .unwrap_or(r),
             Some((_, r)) => r,
             None => start,
         };
-        self.clamp();
+        self.scroll = self.cursor.saturating_sub(a.offset);
+        self.fit();
     }
 
     fn max_scroll(&self) -> usize {
         self.rows.len().saturating_sub(1)
     }
 
-    pub fn clamp(&mut self) {
+    /// Rows of the body that show content below the sticky header, were
+    /// the view to start at `scroll`.
+    fn visible_at(&self, scroll: usize) -> usize {
+        let sticky =
+            self.file_at(scroll).is_some() && !matches!(self.rows.get(scroll), Some(Row::File(_)));
+        self.body_h.saturating_sub(usize::from(sticky)).max(1)
+    }
+
+    fn scrolloff(&self) -> usize {
+        SCROLLOFF.min(self.visible_at(self.scroll).saturating_sub(1) / 2)
+    }
+
+    /// Bring the cursor onto a row it may rest on, stepping in `dir`
+    /// (then the other way) past blank rows.
+    fn settle_cursor(&mut self, dir: isize) {
+        self.cursor = self.cursor.min(self.max_scroll());
+        let rests = |v: &Self, r: usize| !matches!(v.rows.get(r), Some(Row::Blank));
+        if rests(self, self.cursor) {
+            return;
+        }
+        let step = |r: usize, d: isize| r.checked_add_signed(d).filter(|&r| r < self.rows.len());
+        let mut r = self.cursor;
+        while let Some(n) = step(r, dir) {
+            r = n;
+            if rests(self, r) {
+                self.cursor = r;
+                return;
+            }
+        }
+        let mut r = self.cursor;
+        while let Some(n) = step(r, -dir) {
+            r = n;
+            if rests(self, r) {
+                self.cursor = r;
+                return;
+            }
+        }
+    }
+
+    /// Scroll just enough to keep the cursor in sight, `SCROLLOFF` rows
+    /// clear of the edges where the rows allow.
+    fn follow(&mut self) {
+        self.follow_off(self.scrolloff());
+    }
+
+    /// Scroll just enough to keep the cursor in sight, `off` rows clear of
+    /// the edges where that many rows exist.
+    fn follow_off(&mut self, off: usize) {
+        let above = off.min(self.cursor);
+        if self.cursor < self.scroll + above {
+            self.scroll = self.cursor - above;
+        }
+        let below = off.min(self.max_scroll() - self.cursor);
+        // Scrolling can bring in the sticky header, which takes a row, so
+        // the check runs again at the new position.
+        for _ in 0..2 {
+            let visible = self.visible_at(self.scroll);
+            if self.cursor + below + 1 > self.scroll + visible {
+                self.scroll = (self.cursor + below + 1).saturating_sub(visible);
+            }
+        }
         self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// Keep scroll and cursor within the rows, and the cursor in sight.
+    pub fn fit(&mut self) {
+        self.scroll = self.scroll.min(self.max_scroll());
+        self.settle_cursor(1);
+        self.follow_off(0);
+    }
+
+    /// Tell the view how tall the body is, which decides what is in sight.
+    pub fn resize(&mut self, body_h: usize) {
+        self.body_h = body_h.max(1);
+        self.fit();
     }
 
     /// First row index at which the last row lands on the bottom line,
@@ -448,16 +544,13 @@ impl DiffView {
         s.min(self.max_scroll())
     }
 
-    /// The index into `files` of the file at the top of the view.
-    pub fn current_file(&self) -> Option<usize> {
-        if self.file_starts.is_empty() {
-            return None;
-        }
-        if self.scroll < self.file_starts[0] {
+    /// The index into `files` of the file row `row` belongs to.
+    fn file_at(&self, row: usize) -> Option<usize> {
+        if self.file_starts.is_empty() || row < self.file_starts[0] {
             // In the description block, above every file.
             return None;
         }
-        let i = match self.file_starts.binary_search(&self.scroll) {
+        let i = match self.file_starts.binary_search(&row) {
             Ok(i) => i,
             Err(i) => i.saturating_sub(1),
         };
@@ -467,31 +560,123 @@ impl DiffView {
         }
     }
 
+    /// The index into `files` of the file under the cursor.
+    pub fn current_file(&self) -> Option<usize> {
+        self.file_at(self.cursor)
+    }
+
+    /// The file at the top of the view, whose header sticks.
+    fn top_file(&self) -> Option<usize> {
+        self.file_at(self.scroll)
+    }
+
+    /// Move the cursor by `delta` rows; the view scrolls to keep up.
+    pub fn move_cursor(&mut self, delta: isize) {
+        let max = self.max_scroll() as isize;
+        self.cursor = (self.cursor as isize + delta).clamp(0, max) as usize;
+        self.settle_cursor(delta.signum());
+        self.follow();
+    }
+
+    /// Move the view by `delta` rows, the cursor keeping its place on the
+    /// screen where it can.
     pub fn scroll_by(&mut self, delta: isize) {
-        self.scroll = (self.scroll as isize + delta).clamp(0, self.max_scroll() as isize) as usize;
+        let end = self.max_scroll() as isize;
+        let before = self.scroll;
+        self.scroll = (self.scroll as isize + delta).clamp(0, end) as usize;
+        let moved = self.scroll as isize - before as isize;
+        let max = self.max_scroll() as isize;
+        self.cursor = (self.cursor as isize + moved).clamp(0, max) as usize;
+        self.pull_cursor(delta.signum());
+    }
+
+    /// Bring the cursor into the rows in sight, `SCROLLOFF` clear of the
+    /// edges, without scrolling.
+    fn pull_cursor(&mut self, dir: isize) {
+        let off = self.scrolloff();
+        let visible = self.visible_at(self.scroll);
+        let last = (self.scroll + visible).saturating_sub(1);
+        let (lo, hi) = if self.scroll == 0 {
+            (0, last.saturating_sub(off))
+        } else if last >= self.max_scroll() {
+            (self.scroll + off, last)
+        } else {
+            (self.scroll + off, last.saturating_sub(off))
+        };
+        let lo = lo.min(self.max_scroll());
+        let hi = hi.min(self.max_scroll()).max(lo);
+        self.cursor = self.cursor.clamp(lo, hi);
+        self.settle_cursor(dir);
+        self.follow();
+    }
+
+    /// Put the cursor on `row`, at the top of the view.
+    pub fn jump_to(&mut self, row: usize) {
+        let row = row.min(self.max_scroll());
+        self.scroll = row;
+        self.cursor = row;
+        self.settle_cursor(1);
+        self.follow_off(0);
+    }
+
+    /// Put the cursor on `row`, about a third of the way down the view.
+    pub fn center_on(&mut self, row: usize) {
+        let row = row.min(self.max_scroll());
+        self.scroll = row.saturating_sub(self.body_h / 3);
+        self.cursor = row;
+        self.settle_cursor(1);
+        self.follow();
+    }
+
+    /// The cursor on a row the mouse points at, `y` rows below the body's
+    /// top, when that row shows content.
+    pub fn click(&mut self, y: usize) {
+        let sticky =
+            self.top_file().is_some() && !matches!(self.rows.get(self.scroll), Some(Row::File(_)));
+        let Some(y) = y.checked_sub(usize::from(sticky)) else {
+            return;
+        };
+        let row = self.scroll + y;
+        if row < self.rows.len() && !matches!(self.rows[row], Row::Blank) {
+            self.cursor = row;
+            self.follow();
+        }
+    }
+
+    pub fn go_top(&mut self) {
+        self.scroll = 0;
+        self.cursor = 0;
+        self.fit();
+    }
+
+    pub fn go_bottom(&mut self) {
+        self.scroll = self.end_scroll(self.body_h);
+        self.cursor = self.max_scroll();
+        self.settle_cursor(-1);
+        self.follow();
     }
 
     pub fn next_hunk(&mut self) {
-        if let Some(&s) = self.hunk_starts.iter().find(|&&s| s > self.scroll) {
-            self.scroll = s;
+        if let Some(&s) = self.hunk_starts.iter().find(|&&s| s > self.cursor) {
+            self.jump_to(s);
         }
     }
 
     pub fn prev_hunk(&mut self) {
-        if let Some(&s) = self.hunk_starts.iter().rev().find(|&&s| s < self.scroll) {
-            self.scroll = s;
+        if let Some(&s) = self.hunk_starts.iter().rev().find(|&&s| s < self.cursor) {
+            self.jump_to(s);
         }
     }
 
     pub fn next_file(&mut self) {
-        if let Some(&s) = self.file_starts.iter().find(|&&s| s > self.scroll) {
-            self.scroll = s;
+        if let Some(&s) = self.file_starts.iter().find(|&&s| s > self.cursor) {
+            self.jump_to(s);
         }
     }
 
     pub fn prev_file(&mut self) {
-        if let Some(&s) = self.file_starts.iter().rev().find(|&&s| s < self.scroll) {
-            self.scroll = s;
+        if let Some(&s) = self.file_starts.iter().rev().find(|&&s| s < self.cursor) {
+            self.jump_to(s);
         }
     }
 
@@ -501,7 +686,7 @@ impl DiffView {
         let mut y = area.y;
         let mut idx = self.scroll;
         // Sticky header unless the real header is the first visible row.
-        if let Some(fi) = self.current_file()
+        if let Some(fi) = self.top_file()
             && !matches!(self.rows.get(self.scroll), Some(Row::File(_)))
         {
             self.render_file_header(fi, Rect::new(area.x, y, area.width, 1), buf, p);
@@ -511,7 +696,11 @@ impl DiffView {
             let Some(&row) = self.rows.get(idx) else {
                 break;
             };
-            self.render_row(row, Rect::new(area.x, y, area.width, 1), buf, p, hl);
+            let line = Rect::new(area.x, y, area.width, 1);
+            self.render_row(row, line, buf, p, hl);
+            if idx == self.cursor {
+                self.render_cursor(row, line, buf, p);
+            }
             y += 1;
             idx += 1;
         }
@@ -573,6 +762,27 @@ impl DiffView {
                 buf.set_line(area.x, area.y, &line, area.width);
             }
             Row::Line(fi, hi, li) => self.render_line(fi, hi, li, area, buf, p, hl),
+        }
+    }
+
+    /// Restyle the cursor's row once drawn: its background shifted, its
+    /// line numbers bold.
+    fn render_cursor(&self, row: Row, area: Rect, buf: &mut Buffer, p: &Palette) {
+        let gutter = match row {
+            Row::Line(fi, ..) if self.files[fi].plain => self.gutter_w + 1,
+            Row::Line(..) => self.gutter_w * 2 + 2,
+            _ => 0,
+        } as u16;
+        for x in area.x..area.right() {
+            let Some(cell) = buf.cell_mut((x, area.y)) else {
+                continue;
+            };
+            let bg = p.cursor_over(cell.bg);
+            cell.set_bg(bg);
+            if x < area.x + gutter {
+                cell.set_fg(p.cursor_fg);
+                cell.modifier.insert(Modifier::BOLD);
+            }
         }
     }
 
