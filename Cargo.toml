@@ -2,7 +2,7 @@
 name = "codesnob"
 version = "0.1.0"
 edition = "2024"
-description = "Fast terminal diff viewer: what changed since the branch point"
+description = "Fast terminal code viewer that agents can drive: files, diffs and pull requests"
 license = "Apache-2.0"
 repository = "https://github.com/mme/codesnob"
 

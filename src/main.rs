@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-/// Fast terminal diff viewer: shows what changed since the branch point.
+/// Fast terminal code viewer that agents can drive: files, diffs and pull requests.
 #[derive(Parser)]
 #[command(version, about)]
 #[command(

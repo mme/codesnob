@@ -1,9 +1,11 @@
 # codesnob
 
-A lean, fast terminal diff viewer. Point it at a repository or worktree and it
-shows what changed since the branch point: committed work, staged and
-unstaged edits, and untracked files, in one flat view that refreshes as you
-type.
+A lean, fast terminal code viewer that agents can drive: files, diffs and pull
+requests, with highlights and notes.
+
+Point it at a repository or worktree and it shows what changed since the
+branch point: committed work, staged and unstaged edits, and untracked files,
+in one flat view that refreshes as you type.
 
 ## Installing
 
