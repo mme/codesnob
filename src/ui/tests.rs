@@ -79,15 +79,26 @@ impl Harness {
         h
     }
 
-    /// Apply messages until no load is in flight.
+    /// Apply messages until no load is in flight and the location's watcher
+    /// is live. A file written before the watcher starts is never reported:
+    /// FSEvents only reports what happens after its stream starts, and
+    /// events arriving before the worktree's directories are listed are
+    /// dropped as irrelevant.
     fn settle(&mut self) {
+        let busy = |app: &App| {
+            app.loading()
+                || app
+                    .cur()
+                    .is_some_and(|l| l._watch.is_some() && l.mode == crate::watch::Mode::Off)
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
-        while self.app.loading() && Instant::now() < deadline {
+        while busy(&self.app) && Instant::now() < deadline {
             if let Ok(m) = self.rx.recv_timeout(Duration::from_millis(50)) {
                 self.app.dispatch(m);
             }
         }
         assert!(!self.app.loading(), "load finished in time");
+        assert!(!busy(&self.app), "the watcher started in time");
     }
 
     /// Press keys: plain characters, or `<esc>`, `<enter>`, `<down>`, `<up>`,
