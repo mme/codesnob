@@ -24,14 +24,29 @@ pub enum Row {
     Blank,
 }
 
-/// A highlight as drawn: its file, its lines, its number and note.
+/// Who placed a mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Author {
+    /// A highlight an agent placed.
+    Agent,
+    /// A comment the user wrote.
+    User,
+}
+
+/// A mark as drawn: its file, its lines, its letter and text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mark {
     pub path: String,
     pub start: usize,
     pub end: usize,
-    pub number: usize,
+    /// The letter it goes by, fixed when it was made.
+    pub label: String,
+    /// Its place in the order marks were made; a later mark wins the gutter.
+    pub seq: usize,
+    pub author: Author,
     pub note: Option<String>,
+    /// Its lines no longer exist; drawn near where they were, untinted.
+    pub stale: bool,
 }
 
 /// Where the cursor is, expressed in terms that survive a reload.
@@ -104,9 +119,9 @@ impl DiffView {
         self.build_rows();
     }
 
-    /// Replace the highlights, keeping the line in view.
-    /// Highlights are numbered by where they sit: in the order the files are
-    /// shown, then by line.
+    /// Replace the marks, keeping the line in view. `<` and `>` step
+    /// through them by where they sit: in the order the files are shown,
+    /// then by line.
     pub fn set_marks(&mut self, mut marks: Vec<Mark>) {
         let at = |path: &str| {
             self.files
@@ -114,13 +129,10 @@ impl DiffView {
                 .position(|f| f.path == path)
                 .unwrap_or(usize::MAX)
         };
-        marks.sort_by_key(|m| (at(&m.path), m.start, m.end));
-        for (i, m) in marks.iter_mut().enumerate() {
-            m.number = i + 1;
-        }
+        marks.sort_by_key(|m| (at(&m.path), m.start, m.end, m.seq));
         if self.marks != marks {
             let anchor = self.anchor();
-            // The same highlights after a reload keep their place in order.
+            // The same marks after a reload keep their place in order.
             if self.marks.len() != marks.len() {
                 self.current_mark = None;
             }
@@ -152,7 +164,7 @@ impl DiffView {
         }
     }
 
-    /// Open at ①, or the first highlight shown.
+    /// Open at the first mark shown.
     pub fn first_mark(&mut self) -> bool {
         (0..self.mark_rows.len()).any(|i| self.go_to_mark(i))
     }
@@ -165,13 +177,34 @@ impl DiffView {
             .is_some_and(|i| self.go_to_mark(i))
     }
 
-    /// The number of the highlight jumped to last, if any, and how many
-    /// there are.
-    pub fn mark_position(&self) -> Option<(Option<usize>, usize)> {
+    /// The mark jumped to last, if any, as (its letter, its place among
+    /// the marks), and how many marks there are.
+    pub fn mark_position(&self) -> Option<(Option<(String, usize)>, usize)> {
         if !self.has_marks() {
             return None;
         }
-        Some((self.current_mark.map(|c| c + 1), self.marks.len()))
+        let current = self
+            .current_mark
+            .map(|c| (self.marks[c].label.clone(), c + 1));
+        Some((current, self.marks.len()))
+    }
+
+    /// The letters of the marks covering the cursor's line, newest last.
+    pub fn labels_at_cursor(&self) -> Vec<String> {
+        let Some(Row::Line(fi, hi, li)) = self.rows.get(self.cursor) else {
+            return Vec::new();
+        };
+        let f = &self.files[*fi];
+        let Some(no) = line_no(f, &f.hunks[*hi].lines[*li]) else {
+            return Vec::new();
+        };
+        let mut covering: Vec<&Mark> = self
+            .marks
+            .iter()
+            .filter(|m| !m.stale && m.path == f.path && (m.start..=m.end).contains(&no))
+            .collect();
+        covering.sort_by_key(|m| m.seq);
+        covering.into_iter().map(|m| m.label.clone()).collect()
     }
 
     /// The next highlight by number; highlights not shown are skipped.
@@ -188,13 +221,25 @@ impl DiffView {
         let _ = (0..c).rev().any(|i| self.go_to_mark(i));
     }
 
-    /// The highlight covering a line of file `fi`, if any.
-    fn mark_on(&self, fi: usize, line: &crate::diff::DiffLine) -> Option<&Mark> {
+    /// The mark covering a line of file `fi`, if any: the newest when
+    /// several do, and never a stale one.
+    fn mark_on(&self, fi: usize, line: &crate::diff::DiffLine) -> Option<(&Mark, usize)> {
         let f = &self.files[fi];
         let no = line_no(f, line)?;
         self.marks
             .iter()
-            .find(|m| m.path == f.path && (m.start..=m.end).contains(&no))
+            .filter(|m| !m.stale && m.path == f.path && (m.start..=m.end).contains(&no))
+            .max_by_key(|m| m.seq)
+            .map(|m| (m, no))
+    }
+
+    /// How wide the gutter's mark column is: the longest letter.
+    fn label_w(&self) -> usize {
+        self.marks
+            .iter()
+            .map(|m| m.label.chars().count())
+            .max()
+            .unwrap_or(0)
     }
 
     /// Show files built elsewhere, such as plain files.
@@ -354,13 +399,16 @@ impl DiffView {
                     self.rows.push(Row::Hunk(fi, hi));
                 }
                 for li in 0..h.lines.len() {
-                    // A highlight's note goes above its first line shown.
+                    // A mark's row goes above its first line shown; a stale
+                    // mark's above the first line at or past where it was.
                     if let Some(no) = line_no(f, &h.lines[li]) {
                         for (m, mark) in self.marks.iter().enumerate() {
-                            if !placed[m]
-                                && mark.path == f.path
-                                && (mark.start..=mark.end).contains(&no)
-                            {
+                            let here = if mark.stale {
+                                no >= mark.start
+                            } else {
+                                (mark.start..=mark.end).contains(&no)
+                            };
+                            if !placed[m] && mark.path == f.path && here {
                                 placed[m] = true;
                                 self.mark_rows[m] = Some(self.rows.len());
                                 self.rows.push(Row::Mark(m));
@@ -370,13 +418,21 @@ impl DiffView {
                     self.rows.push(Row::Line(fi, hi, li));
                 }
             }
+            // A stale mark past every line shown ends the file.
+            for (m, mark) in self.marks.iter().enumerate() {
+                if !placed[m] && mark.stale && mark.path == f.path {
+                    placed[m] = true;
+                    self.mark_rows[m] = Some(self.rows.len());
+                    self.rows.push(Row::Mark(m));
+                }
+            }
         }
         if self.files.is_empty() && !self.desc.is_empty() {
             self.rows.push(Row::Blank);
             self.rows.push(Row::Note("no files changed"));
         }
-        // With highlights, one more column so the bar never covers a digit.
-        self.gutter_w = max_no.to_string().len().max(3) + usize::from(!self.marks.is_empty());
+        // With marks, room for their letters so they never cover a digit.
+        self.gutter_w = max_no.to_string().len().max(3) + self.label_w();
         self.fit();
     }
 
@@ -717,14 +773,24 @@ impl DiffView {
         match row {
             Row::Mark(m) => {
                 let mark = &self.marks[m];
-                let tint = Style::default().bg(p.mark_bg);
+                let (bg, fg) = p.mark_colors(mark.author);
+                let tint = Style::default().bg(bg);
                 buf.set_style(area, tint);
                 let mut spans = vec![Span::styled(
-                    format!("  {} ", crate::proto::circled(mark.number)),
-                    tint.fg(p.mark_fg).add_modifier(Modifier::BOLD),
+                    format!("  [{}] ", mark.label),
+                    tint.fg(fg).add_modifier(Modifier::BOLD),
                 )];
+                if mark.stale {
+                    spans.push(Span::styled("stale · ", tint.fg(p.note_fg)));
+                }
+                if mark.author == Author::User {
+                    spans.push(Span::styled(
+                        "you: ",
+                        tint.fg(fg).add_modifier(Modifier::BOLD),
+                    ));
+                }
                 if let Some(note) = &mark.note {
-                    spans.push(Span::styled(note.clone(), tint.fg(p.mark_fg)));
+                    spans.push(Span::styled(note.clone(), tint.fg(fg)));
                 }
                 buf.set_line(area.x, area.y, &Line::from(spans), area.width);
             }
@@ -860,9 +926,9 @@ impl DiffView {
         };
         // Highlighted context lines take the highlight's tint; changed lines
         // keep their color and get the bar in the gutter only.
-        let marked = self.mark_on(fi, l).is_some();
+        let marked = self.mark_on(fi, l);
         let line_bg = match (line_bg, marked) {
-            (None, true) => Some(p.mark_bg),
+            (None, Some((m, _))) => Some(p.mark_colors(m.author).0),
             (bg, _) => bg,
         };
         let row_style = match line_bg {
@@ -897,11 +963,23 @@ impl DiffView {
             Kind::Context => (marker, row_style),
         };
         let mut spans = Vec::new();
-        let gutter = if marked {
-            spans.push(Span::styled("▌", row_style.fg(p.mark_fg)));
-            gutter.chars().skip(1).collect()
-        } else {
-            gutter
+        // The mark column: its letter on the mark's first line, a bar below.
+        let gutter = match marked {
+            Some((m, no)) => {
+                let w = self.label_w();
+                let fg = p.mark_colors(m.author).1;
+                let column = if no == m.start {
+                    format!("{:<w$}", m.label)
+                } else {
+                    format!("{:<w$}", "▌")
+                };
+                spans.push(Span::styled(
+                    column,
+                    row_style.fg(fg).add_modifier(Modifier::BOLD),
+                ));
+                gutter.chars().skip(w).collect()
+            }
+            None => gutter,
         };
         spans.push(Span::styled(gutter, row_style.fg(p.gutter_fg)));
         spans.push(Span::styled(

@@ -47,12 +47,12 @@ pub struct Command {
 pub const COMMANDS: &[Command] = &[
     Command {
         action: Action::NextMark,
-        name: "Next highlight",
+        name: "Next mark",
         keys: ">",
     },
     Command {
         action: Action::PrevMark,
-        name: "Previous highlight",
+        name: "Previous mark",
         keys: "<",
     },
     Command {

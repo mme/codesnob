@@ -1939,39 +1939,148 @@ fn highlights_are_numbered_tinted_and_stepped_through() {
     h.app.show_view(target(&dir), spec);
     h.settle();
     let screen = h.screen();
-    let note = screen.lines().find(|l| l.contains('①')).expect("numbered");
+    let note = screen
+        .lines()
+        .find(|l| l.contains("[A]"))
+        .expect("lettered");
     assert!(note.contains("the loop"), "{note}");
-    let row = screen.lines().position(|l| l.contains('①')).unwrap();
+    let row = screen.lines().position(|l| l.contains("[A]")).unwrap();
     assert_eq!(
         row, 1,
-        "① sits at the top, under the file header:\n{screen}"
+        "[A] sits at the top, under the file header:\n{screen}"
     );
     let marked: Vec<&str> = screen
         .lines()
-        .filter(|l| l.starts_with('▌') && l.contains("// line 2"))
+        .filter(|l| (l.starts_with('▌') || l.starts_with('A')) && l.contains("// line 2"))
         .collect();
-    assert_eq!(marked.len(), 3, "lines 20-22 carry the bar: {screen}");
+    assert_eq!(marked.len(), 3, "lines 20-22 carry the mark: {screen}");
+    assert!(
+        marked[0].starts_with("A ") && marked[1].starts_with("▌ "),
+        "the letter on the first line, the bar below: {marked:?}"
+    );
     assert!(
         marked.iter().all(|l| l.contains(" 2")),
-        "the bar sits beside the number, not on it: {marked:?}"
+        "the mark sits beside the number, not on it: {marked:?}"
     );
-    assert!(h.status().contains("highlight 1 of 2"), "{}", h.status());
+    assert!(h.status().contains("[A] 1 of 2"), "{}", h.status());
 
     h.keys(">");
     assert_eq!(
-        h.screen().lines().position(|l| l.contains('②')),
+        h.screen().lines().position(|l| l.contains("[B]")),
         Some(1),
         "every jump puts the note at the top"
     );
-    assert!(h.status().contains("highlight 2 of 2"), "{}", h.status());
+    assert!(h.status().contains("[B] 2 of 2"), "{}", h.status());
     h.keys("<");
-    assert!(h.status().contains("highlight 1 of 2"), "{}", h.status());
+    assert!(h.status().contains("[A] 1 of 2"), "{}", h.status());
     h.keys(":");
-    assert!(h.screen().contains("Next highlight [>]"), "{}", h.screen());
+    assert!(h.screen().contains("Next mark [>]"), "{}", h.screen());
     h.keys("<esc><esc>");
     assert!(
-        !h.screen().contains('①'),
-        "Esc returns and the highlights go"
+        h.status().contains("of 2") && h.screen().contains("+60"),
+        "Esc returns to the diff and the marks stay with their code: {}",
+        h.status()
+    );
+    h.keys("><");
+    assert!(h.screen().contains("[A] the loop"), "{}", h.screen());
+    cleanup(dir);
+}
+
+#[test]
+fn letters_are_fixed_and_a_new_call_continues_the_sequence() {
+    let dir = repo_with_long_file("ui-marks-letters");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![
+        hl("src/long.rs", 10, 11, Some("first")),
+        hl("src/long.rs", 30, 30, Some("second")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen.contains("[A] first") && screen.contains("[B] second"),
+        "{screen}"
+    );
+
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![hl("src/long.rs", 20, 20, Some("third"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen.contains("[C] third"),
+        "the next call goes on from where the letters were:\n{screen}"
+    );
+    assert!(
+        !screen.contains("[A]") && !screen.contains("[B]"),
+        "and replaces the agent's earlier highlights:\n{screen}"
+    );
+    assert!(h.status().contains("[C] 1 of 1"), "{}", h.status());
+
+    // Twenty-six more and the letters go on past Z.
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = (1..=20).map(|i| hl("src/long.rs", i, i, None)).collect();
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = (40..=43).map(|i| hl("src/long.rs", i, i, None)).collect();
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen.contains("[X]") && screen.contains("[AA]"),
+        "{screen}"
+    );
+    let line40 = screen.lines().find(|l| l.contains("// line 40")).unwrap();
+    assert!(
+        line40.starts_with("X  40"),
+        "a two-letter column, padded: {line40}"
+    );
+    let line43 = screen.lines().find(|l| l.contains("// line 43")).unwrap();
+    assert!(line43.starts_with("AA 43"), "{line43}");
+    cleanup(dir);
+}
+
+#[test]
+fn overlapping_marks_show_the_newest_letter_and_all_of_them_under_the_cursor() {
+    let dir = repo_with_long_file("ui-marks-overlap");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![
+        hl("src/long.rs", 10, 20, Some("outer")),
+        hl("src/long.rs", 15, 16, Some("inner")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    let screen = h.screen();
+    let line = |n: usize| {
+        screen
+            .lines()
+            .find(|l| l.contains(&format!("// line {n}")))
+            .unwrap()
+            .to_string()
+    };
+    assert!(line(10).starts_with("A "), "{}", line(10));
+    assert!(line(12).starts_with("▌ "), "{}", line(12));
+    assert!(
+        line(15).starts_with("B "),
+        "the newer mark wins the gutter: {}",
+        line(15)
+    );
+    assert!(line(16).starts_with("▌ "), "{}", line(16));
+    assert!(
+        line(17).starts_with("▌ "),
+        "back to the outer mark: {}",
+        line(17)
+    );
+    assert!(!h.status().contains("[A] [B]"), "{}", h.status());
+    // Five lines down and over [B]'s own row.
+    h.keys("jjjjjj");
+    assert!(
+        h.cursor().1.contains("// line 15") && h.status().contains("[A] [B]"),
+        "both letters under the cursor: {}",
+        h.status()
     );
     cleanup(dir);
 }
@@ -2000,7 +2109,7 @@ fn a_highlight_on_an_unchanged_line_shows_it_in_the_diff() {
         .lines()
         .find(|l| l.contains("// line 50"))
         .expect("line 50 shows");
-    assert!(line50.starts_with('▌'), "{line50}");
+    assert!(line50.starts_with('A'), "{line50}");
     cleanup(dir);
 }
 
@@ -2028,16 +2137,26 @@ fn highlights_follow_their_code_and_go_when_it_does() {
         "follows lines 30-31 to their new place"
     );
 
-    // Its text replaced: the highlight is removed, and the status bar says so.
+    // Its text replaced: the highlight goes stale, keeps its letter, and
+    // the status bar says so.
     let body: String = (1..=60).map(|i| format!("// other {i}\n")).collect();
     std::fs::write(dir.join("src/long.rs"), body).unwrap();
-    wait_until(&mut h, &|h| h.app.cur().unwrap().marks.is_empty());
-    assert!(h.app.cur().unwrap().marks.is_empty());
+    wait_until(&mut h, &|h| h.app.cur().unwrap().marks[0].stale);
     assert!(
-        h.status()
-            .contains("a highlight no longer matches its code; removed"),
+        h.status().contains("[A] no longer matches its code"),
         "{}",
         h.status()
+    );
+    let screen = h.screen();
+    assert!(
+        screen.contains("[A] stale · watch me"),
+        "the row stays, flagged:\n{screen}"
+    );
+    assert!(
+        !screen
+            .lines()
+            .any(|l| l.starts_with('▌') || l.starts_with('A')),
+        "no line is tinted or barred:\n{screen}"
     );
     cleanup(dir);
 }
@@ -2064,7 +2183,7 @@ fn angle_brackets_move_between_hunks_without_highlights() {
         "> goes to the next hunk"
     );
     h.keys("<");
-    assert!(!h.status().contains("highlight"));
+    assert!(!h.status().contains("mark"));
     cleanup(dir);
 }
 
@@ -2083,23 +2202,23 @@ fn highlights_are_numbered_by_where_they_sit_not_the_order_given() {
     h.settle();
     let at_top = |h: &mut Harness| h.screen().lines().nth(1).unwrap_or("").to_string();
     assert!(
-        at_top(&mut h).contains("① highest"),
-        "opens at ①: {}",
+        at_top(&mut h).contains("[A] highest"),
+        "opens at [A]: {}",
         at_top(&mut h)
     );
     h.keys(">");
-    assert!(at_top(&mut h).contains("② middle"), "{}", at_top(&mut h));
+    assert!(at_top(&mut h).contains("[B] middle"), "{}", at_top(&mut h));
     h.keys(">");
-    assert!(at_top(&mut h).contains("③ lowest"), "{}", at_top(&mut h));
+    assert!(at_top(&mut h).contains("[C] lowest"), "{}", at_top(&mut h));
     h.keys(">");
-    assert!(at_top(&mut h).contains("③ lowest"), "stays on the last");
+    assert!(at_top(&mut h).contains("[C] lowest"), "stays on the last");
     h.keys("jjj<");
     assert!(
-        at_top(&mut h).contains("② middle"),
+        at_top(&mut h).contains("[B] middle"),
         "scrolling does not change the order: {}",
         at_top(&mut h)
     );
-    assert!(h.status().contains("highlight 2 of 3"), "{}", h.status());
+    assert!(h.status().contains("[B] 2 of 3"), "{}", h.status());
     cleanup(dir);
 }
 
@@ -2124,10 +2243,10 @@ fn highlights_across_files_go_in_the_order_the_files_are_shown() {
             .position(|l| l.contains(want))
             .unwrap_or_else(|| panic!("{want} on screen:\n{screen}"))
     };
-    assert!(row("① long high") < row("② long low"), "{screen}");
-    assert!(row("② long low") < row("③ in one"), "{screen}");
+    assert!(row("[A] long high") < row("[B] long low"), "{screen}");
+    assert!(row("[B] long low") < row("[C] in one"), "{screen}");
     h.keys(">>");
-    assert!(h.status().contains("highlight 3 of 3"), "{}", h.status());
+    assert!(h.status().contains("[C] 3 of 3"), "{}", h.status());
     cleanup(dir);
 }
 
@@ -2147,7 +2266,11 @@ fn a_line_inside_a_highlight_opens_at_that_highlight() {
     h.settle();
     let screen = h.screen();
     assert!(
-        screen.lines().nth(1).unwrap_or("").contains("③ the point"),
+        screen
+            .lines()
+            .nth(1)
+            .unwrap_or("")
+            .contains("[C] the point"),
         "its note at the top:\n{screen}"
     );
     assert!(
@@ -2156,11 +2279,11 @@ fn a_line_inside_a_highlight_opens_at_that_highlight() {
             .any(|l| l.contains('▶') && l.contains("// line 40")),
         "the line is marked:\n{screen}"
     );
-    assert!(h.status().contains("highlight 3 of 4"), "{}", h.status());
+    assert!(h.status().contains("[C] 3 of 4"), "{}", h.status());
     h.keys(">");
-    assert!(h.status().contains("highlight 4 of 4"), "{}", h.status());
+    assert!(h.status().contains("[D] 4 of 4"), "{}", h.status());
     h.keys("<<");
-    assert!(h.status().contains("highlight 2 of 4"), "{}", h.status());
+    assert!(h.status().contains("[B] 2 of 4"), "{}", h.status());
     cleanup(dir);
 }
 
@@ -2183,16 +2306,16 @@ fn a_line_outside_the_highlights_opens_at_the_line() {
         "{screen}"
     );
     assert!(
-        h.status().contains("2 highlights") && !h.status().contains(" of 2"),
+        h.status().contains("2 marks") && !h.status().contains(" of 2"),
         "no highlight is current yet: {}",
         h.status()
     );
     h.keys(">");
     assert_eq!(
-        h.screen().lines().position(|l| l.contains("① early")),
+        h.screen().lines().position(|l| l.contains("[A] early")),
         Some(1)
     );
-    assert!(h.status().contains("highlight 1 of 2"), "{}", h.status());
+    assert!(h.status().contains("[A] 1 of 2"), "{}", h.status());
     cleanup(dir);
 }
 

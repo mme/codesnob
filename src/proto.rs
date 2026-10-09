@@ -99,17 +99,24 @@ pub struct ViewSpec {
     pub highlights: Vec<HighlightSpec>,
 }
 
-/// The most highlights one call can place: ① to ⑳.
+/// The most highlights one call can place.
 pub const MAX_HIGHLIGHTS: usize = 20;
 
-/// A highlight's number as the viewer shows it: ① to ⑳.
-pub fn circled(n: usize) -> String {
-    match n {
-        1..=MAX_HIGHLIGHTS => char::from_u32(0x2460 + n as u32 - 1)
-            .map(String::from)
-            .unwrap_or_else(|| format!("({n})")),
-        _ => format!("({n})"),
+/// The letter of the `n`th mark made on a location, counting from 0:
+/// A to Z, then AA, AB and on, as spreadsheet columns go.
+pub fn letter(n: usize) -> String {
+    let mut n = n;
+    let mut out = Vec::new();
+    loop {
+        out.push(b'A' + (n % 26) as u8);
+        n /= 26;
+        if n == 0 {
+            break;
+        }
+        n -= 1;
     }
+    out.reverse();
+    String::from_utf8(out).expect("ASCII letters")
 }
 
 /// A highlighted line range, 1-based and inclusive, with an optional note.
@@ -379,5 +386,19 @@ impl Client {
             version: VERSION.to_string(),
         })?;
         serde_json::from_value(v).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::letter;
+
+    #[test]
+    fn letters_go_on_like_spreadsheet_columns() {
+        let got: Vec<String> = [0, 1, 25, 26, 27, 51, 52, 701, 702]
+            .into_iter()
+            .map(letter)
+            .collect();
+        assert_eq!(got, ["A", "B", "Z", "AA", "AB", "AZ", "BA", "ZZ", "AAA"]);
     }
 }

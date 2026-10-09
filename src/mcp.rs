@@ -102,7 +102,7 @@ fn tools() -> Value {
                             "excerpts": { "type": "boolean", "description": "true shows only this file's line and highlights, each with a few lines around it, like a diff; false shows the whole file." },
                             "highlights": {
                                 "type": "array",
-                                "description": "Line ranges to highlight in this file. The viewer numbers all of a call's highlights by where they sit, not by the order you list them: by file in the order of files, then by line, so the first file's highlights come first. At most 20 per call, ① to ⑳. The user steps through them with < and >; the result lists each number with its file and lines, so refer to them by those numbers.",
+                                "description": "Line ranges to highlight in this file. The viewer letters marks as [A], [B] and so on, in the order they are made, by file in the order of files, then by line; the letters are fixed and never reused, and a new call replaces your earlier highlights but keeps the user's comments and continues the sequence. At most 20 per call. The user steps through them with < and >; the result lists them in that order, so refer to them by their letters.",
                                 "items": {
                                     "type": "object",
                                     "properties": {
@@ -120,7 +120,7 @@ fn tools() -> Value {
                 "repo": { "type": "string", "description": "A directory in the repository. Defaults to your working directory." }
             },
             "required": ["files"],
-            // With highlights the view opens at ①, so no file takes a line.
+            // With highlights the view opens at the first, so no file takes a line.
             "if": { "properties": { "files": { "contains": { "required": ["highlights"] } } } },
             "then": { "properties": { "files": { "items": { "not": { "required": ["line"] } } } } }
         }
@@ -134,7 +134,7 @@ fn tools() -> Value {
                 "files": { "type": "array", "items": { "type": "string" }, "description": "Show only these files. Paths are relative to your working directory." },
                 "highlights": {
                     "type": "array",
-                    "description": "Line ranges to highlight. Lines are the new side's, or the old side's in a deleted file; unchanged lines are shown too. The viewer numbers them by where they sit, not by the order you list them: by file in path order, as the diff lists its files, then by line. At most 20 per call, ① to ⑳. The user steps through them with < and >; the result lists each number with its file and lines, so refer to them by those numbers.",
+                    "description": "Line ranges to highlight. Lines are the new side's, or the old side's in a deleted file; unchanged lines are shown too. The viewer letters marks as [A], [B] and so on, in the order they are made, by file in path order, as the diff lists its files, then by line; the letters are fixed and never reused, and a new call replaces your earlier highlights but keeps the user's comments and continues the sequence. At most 20 per call. The user steps through them with < and >; the result lists them in that order, so refer to them by their letters.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -358,24 +358,26 @@ fn check_count(n: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// The highlights with the numbers the user sees, in order.
+/// The highlights in the order the viewer letters them.
 fn list_highlights(highlights: &[crate::proto::HighlightSpec]) -> String {
     if highlights.is_empty() {
         return String::new();
     }
     let each: Vec<String> = highlights
         .iter()
-        .enumerate()
-        .map(|(i, h)| {
+        .map(|h| {
             let lines = if h.start == h.end {
                 h.start.to_string()
             } else {
                 format!("{}-{}", h.start, h.end)
             };
-            format!("{} {} {lines}", crate::proto::circled(i + 1), h.path)
+            format!("{} {lines}", h.path)
         })
         .collect();
-    format!("; highlights {}", each.join(", "))
+    format!(
+        "; highlights, lettered in this order in the viewer: {}",
+        each.join(", ")
+    )
 }
 
 fn no_viewer(e: String) -> String {
@@ -579,7 +581,10 @@ mod tests {
                 note: Some("here".into()),
             }]
         );
-        assert_eq!(what, "a.txt; highlights ① a.txt 1");
+        assert_eq!(
+            what,
+            "a.txt; highlights, lettered in this order in the viewer: a.txt 1"
+        );
         let err = prepare_code(
             &json!({ "files": [{ "path": "a.txt", "highlights": [{ "lines": "1-5" }] }] }),
             &dir,
@@ -595,7 +600,9 @@ mod tests {
         assert_eq!(view.highlights.len(), 2);
         assert_eq!((view.highlights[1].start, view.highlights[1].end), (2, 3));
         assert!(
-            what.ends_with("; highlights ① a.txt 1, ② src/deep/one.rs 2-3"),
+            what.ends_with(
+                "; highlights, lettered in this order in the viewer: a.txt 1, src/deep/one.rs 2-3"
+            ),
             "{what}"
         );
         for bad in ["0-2", "5-3", "x"] {
@@ -625,7 +632,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             what,
-            "b.txt, a.txt as of HEAD~2; highlights ① b.txt 1, ② a.txt 1"
+            "b.txt, a.txt as of HEAD~2; highlights, lettered in this order in the viewer: b.txt 1, a.txt 1"
         );
         let notes: Vec<_> = view.highlights.iter().map(|h| h.note.as_deref()).collect();
         assert_eq!(notes, [Some("b"), Some("a")]);
@@ -643,7 +650,7 @@ mod tests {
         .unwrap();
         assert!(
             what.ends_with(
-                "; highlights ① a.txt 5, ② b.txt 7-8, ③ src/deep/one.rs 3, ④ src/deep/one.rs 9"
+                "; highlights, lettered in this order in the viewer: a.txt 5, b.txt 7-8, src/deep/one.rs 3, src/deep/one.rs 9"
             ),
             "{what}"
         );
@@ -662,7 +669,7 @@ mod tests {
         };
         let (_, view, what) = prepare_diff(&json!({ "highlights": many(20) }), &dir).unwrap();
         assert_eq!(view.highlights.len(), 20);
-        assert!(what.contains("⑳ a.txt 1"), "{what}");
+        assert_eq!(what.matches("a.txt 1").count(), 20, "{what}");
         let err = prepare_diff(&json!({ "highlights": many(21) }), &dir).unwrap_err();
         assert_eq!(
             err,

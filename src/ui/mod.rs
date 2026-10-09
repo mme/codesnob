@@ -47,9 +47,12 @@ const LOADING_DELAY: Duration = Duration::from_millis(150);
 pub struct Palette {
     /// Shortcuts in the palette.
     pub key_fg: Color,
-    /// Highlights: their tint and their numbers and notes.
+    /// An agent's highlights: their tint and their letters and notes.
     pub mark_bg: Color,
     pub mark_fg: Color,
+    /// The user's comments, likewise.
+    pub comment_bg: Color,
+    pub comment_fg: Color,
     pub add_bg: Color,
     pub add_emph: Color,
     pub del_bg: Color,
@@ -67,6 +70,14 @@ pub struct Palette {
 }
 
 impl Palette {
+    /// The tint and text color of marks by `author`.
+    pub fn mark_colors(&self, author: diffview::Author) -> (Color, Color) {
+        match author {
+            diffview::Author::Agent => (self.mark_bg, self.mark_fg),
+            diffview::Author::User => (self.comment_bg, self.comment_fg),
+        }
+    }
+
     /// The background the cursor's row gets over `bg`.
     pub fn cursor_over(&self, bg: Color) -> Color {
         let Color::Rgb(r, g, b) = bg else {
@@ -81,6 +92,8 @@ impl Palette {
             key_fg: Color::Cyan,
             mark_bg: Color::Rgb(0x2d, 0x2a, 0x50),
             mark_fg: Color::Rgb(0xc4, 0xa7, 0xff),
+            comment_bg: Color::Rgb(0x3d, 0x2f, 0x12),
+            comment_fg: Color::Rgb(0xff, 0xcc, 0x66),
             add_bg: Color::Rgb(0x12, 0x33, 0x1c),
             add_emph: Color::Rgb(0x1f, 0x6b, 0x2f),
             del_bg: Color::Rgb(0x3b, 0x12, 0x19),
@@ -100,6 +113,8 @@ impl Palette {
             key_fg: Color::Blue,
             mark_bg: Color::Rgb(0xec, 0xe6, 0xff),
             mark_fg: Color::Rgb(0x6a, 0x3d, 0xd1),
+            comment_bg: Color::Rgb(0xff, 0xf3, 0xd6),
+            comment_fg: Color::Rgb(0x8a, 0x5a, 0x00),
             add_bg: Color::Rgb(0xe2, 0xf5, 0xe6),
             add_emph: Color::Rgb(0xa8, 0xe8, 0xb5),
             del_bg: Color::Rgb(0xff, 0xe3, 0xe6),
@@ -197,14 +212,23 @@ enum AgentReturn {
     Switch(u64),
 }
 
-/// A highlight, with the text it was placed on so it can follow that text.
+/// A mark on a location's code: an agent's highlight or the user's
+/// comment, with the text it was placed on so it can follow that text.
 struct LocMark {
+    /// Its letter, fixed when it was made: A to Z, then AA on.
+    label: String,
+    /// Its place in the order marks were made on this location.
+    seq: usize,
+    author: diffview::Author,
     path: String,
     start: usize,
     end: usize,
+    /// An agent's note, or the user's comment.
     note: Option<String>,
-    /// The highlighted lines as first seen; `None` until then.
+    /// The marked lines as first seen; `None` until then.
     text: Option<Vec<String>>,
+    /// Its lines are nowhere to be found since the last load.
+    stale: bool,
 }
 
 impl LocMark {
@@ -213,9 +237,11 @@ impl LocMark {
             path: self.path.clone(),
             start: self.start,
             end: self.end,
-            // Numbered by the view, by where it sits.
-            number: 0,
+            label: self.label.clone(),
+            seq: self.seq,
+            author: self.author,
             note: self.note.clone(),
+            stale: self.stale,
         }
     }
 }
@@ -253,20 +279,33 @@ fn anchor_mark(m: &mut LocMark, lines: &[String]) -> bool {
     }
 }
 
-/// Follow every highlight to its text; returns how many are gone.
-/// Highlights on files `lines_of` does not know stay as they are.
-fn reanchor(marks: &mut Vec<LocMark>, lines_of: &dyn Fn(&str) -> Option<Vec<String>>) -> usize {
-    let before = marks.len();
-    marks.retain_mut(|m| lines_of(&m.path).is_none_or(|lines| anchor_mark(m, &lines)));
-    before - marks.len()
+/// Follow every mark to its text; returns the letters of those that just
+/// went stale. Marks on files `lines_of` does not know stay as they are.
+fn reanchor(marks: &mut [LocMark], lines_of: &dyn Fn(&str) -> Option<Vec<String>>) -> Vec<String> {
+    let mut gone = Vec::new();
+    for m in marks.iter_mut() {
+        let Some(lines) = lines_of(&m.path) else {
+            continue;
+        };
+        let was = m.stale;
+        m.stale = !anchor_mark(m, &lines);
+        if m.stale && !was {
+            gone.push(m.label.clone());
+        }
+    }
+    gone
 }
 
-fn gone_message(gone: usize) -> Option<String> {
-    match gone {
-        0 => None,
-        1 => Some("a highlight no longer matches its code; removed".to_string()),
-        n => Some(format!(
-            "{n} highlights no longer match their code; removed"
+fn gone_message(gone: Vec<String>) -> Option<String> {
+    match gone.as_slice() {
+        [] => None,
+        [one] => Some(format!("[{one}] no longer matches its code")),
+        many => Some(format!(
+            "{} no longer match their code",
+            many.iter()
+                .map(|l| format!("[{l}]"))
+                .collect::<Vec<_>>()
+                .join(" ")
         )),
     }
 }
@@ -289,6 +328,31 @@ struct Origin {
 }
 
 impl Location {
+    /// Make a mark with the next letter.
+    fn add_mark(
+        &mut self,
+        author: diffview::Author,
+        path: String,
+        start: usize,
+        end: usize,
+        note: Option<String>,
+    ) -> &LocMark {
+        let seq = self.marks_made;
+        self.marks_made += 1;
+        self.marks.push(LocMark {
+            label: crate::proto::letter(seq),
+            seq,
+            author,
+            path,
+            start,
+            end,
+            note,
+            text: None,
+            stale: false,
+        });
+        self.marks.last().expect("just pushed")
+    }
+
     /// Has only ever shown a message: not a repository, a pull request
     /// that could not be fetched, or a first load that failed.
     fn invalid(&self) -> bool {
@@ -325,8 +389,10 @@ struct Location {
     /// The revision the code on screen was read at, as a short id.
     code_rev: Option<String>,
     code_fp: u64,
-    /// Highlights an agent asked for, following their text through edits.
+    /// Marks on this location's code, following their text through edits.
     marks: Vec<LocMark>,
+    /// How many marks were ever made here; the next one's letter.
+    marks_made: usize,
     /// Open at the target line or first highlight once the view has loaded.
     place_pending: bool,
     focus: Focus,
@@ -448,6 +514,7 @@ impl App {
             code_rev: None,
             code_fp: 0,
             marks: Vec::new(),
+            marks_made: 0,
             place_pending: false,
             focus: Focus::All,
             view: DiffView::default(),
@@ -590,6 +657,7 @@ impl App {
             code_rev: None,
             code_fp: 0,
             marks: Vec::new(),
+            marks_made: 0,
             place_pending: false,
             focus: Focus::All,
             view: DiffView::default(),
@@ -1048,7 +1116,6 @@ impl App {
 
     fn set_range(&mut self, range: Range) {
         let Some(loc) = self.cur_mut() else { return };
-        clear_marks(loc);
         if loc.range == range {
             return;
         }
@@ -1535,7 +1602,6 @@ impl App {
         if let Some(loc) = self.cur_mut()
             && loc.code.take().is_some()
         {
-            clear_marks(loc);
             self.settle_view(None);
         }
     }
@@ -1582,7 +1648,6 @@ impl App {
     /// Show a comparison typed in the Open prompt in the current location.
     fn apply_spec(&mut self, spec: git::Spec) {
         let Some(loc) = self.cur_mut() else { return };
-        clear_marks(loc);
         loc.code = None;
         match spec {
             git::Spec::Range(range, label) => {
@@ -1625,29 +1690,36 @@ impl App {
     /// An agent's view: update the location for that checkout in place, or
     /// open one, remembering what was on screen so Esc can go back to it.
     pub fn show_view(&mut self, target: Target, view: crate::proto::ViewSpec) {
-        let marks: Vec<LocMark> = view
+        let mut fresh: Vec<crate::proto::HighlightSpec> = view
             .highlights
             .iter()
             .take(crate::proto::MAX_HIGHLIGHTS)
-            .map(|h| LocMark {
-                path: h.path.clone(),
-                start: h.start,
-                end: h.end,
-                note: h.note.clone(),
-                text: None,
-            })
+            .cloned()
             .collect();
-        let placed = !marks.is_empty()
+        // Lettered by where they sit: by file as the call lists them, then
+        // by line.
+        let order = |path: &str| {
+            view.code
+                .as_ref()
+                .and_then(|c| c.files.iter().position(|f| f.path == path))
+                .unwrap_or(usize::MAX)
+        };
+        fresh.sort_by_key(|h| (order(&h.path), h.path.clone(), h.start, h.end));
+        let placed = !fresh.is_empty()
             || view
                 .code
                 .as_ref()
                 .is_some_and(|c| c.files.iter().any(|f| f.line.is_some()));
         self.show_view_inner(target, view);
         if let Some(loc) = self.cur_mut() {
+            // A new call replaces the agent's own marks; the user's stay.
+            loc.marks.retain(|m| m.author == diffview::Author::User);
+            for h in fresh {
+                loc.add_mark(diffview::Author::Agent, h.path, h.start, h.end, h.note);
+            }
             loc.view.set_marks(Vec::new());
-            loc.marks = marks;
             loc.place_pending = placed;
-            // Rebuild even if the content is unchanged: highlights need lines.
+            // Rebuild even if the content is unchanged: marks need lines.
             loc.fingerprint = 0;
             loc.code_fp = 0;
         }
@@ -1763,7 +1835,6 @@ impl App {
                     code,
                 } = *saved;
                 let Some(loc) = self.cur_mut() else { return };
-                clear_marks(loc);
                 loc.range = range;
                 loc.base = base;
                 loc.range_label = label;
@@ -2746,10 +2817,19 @@ impl App {
             };
         }
         match self.cur().and_then(|l| l.view.mark_position()) {
-            Some((Some(i), n)) => right.insert_str(0, &format!(" highlight {i} of {n}  ·")),
-            Some((None, 1)) => right.insert_str(0, " 1 highlight  ·"),
-            Some((None, n)) => right.insert_str(0, &format!(" {n} highlights  ·")),
+            Some((Some((label, i)), n)) => {
+                right.insert_str(0, &format!(" [{label}] {i} of {n}  ·"))
+            }
+            Some((None, 1)) => right.insert_str(0, " 1 mark  ·"),
+            Some((None, n)) => right.insert_str(0, &format!(" {n} marks  ·")),
             None => {}
+        }
+        // Several marks under the cursor: all their letters, newest last.
+        if let Some(labels) = self.cur().map(|l| l.view.labels_at_cursor())
+            && labels.len() > 1
+        {
+            let all: Vec<String> = labels.iter().map(|l| format!("[{l}]")).collect();
+            right.insert_str(0, &format!(" {}  ·", all.join(" ")));
         }
         right.push_str(" : commands ");
         let rw = right.chars().count() as u16;
@@ -2783,15 +2863,6 @@ fn focus_lost(focus: &Focus) -> String {
 }
 
 /// Drop a location's highlights, and the lines shown only for them.
-fn clear_marks(loc: &mut Location) {
-    if !loc.marks.is_empty() {
-        loc.marks.clear();
-        loc.view.set_marks(Vec::new());
-        loc.fingerprint = 0;
-        loc.code_fp = 0;
-    }
-}
-
 /// The root of the checkout `dir` is in, so every way of naming a
 /// repository lands on the same location.
 fn checkout_root(dir: &std::path::Path) -> PathBuf {

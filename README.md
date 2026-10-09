@@ -67,7 +67,7 @@ need to start:
 | `o` | open a directory or a file, a file as of a revision (`main:src/diff.rs`), a PR (`#123`, `owner/repo#123`, a URL), or a comparison (`main...feature`, `HEAD~3`, `staged`) |
 | `c` | the branch's commits; moving through the list previews each one |
 | Alt-↑ Alt-↓ | older and newer commit, directly |
-| `<` `>` | previous and next highlight an agent placed, or hunk when there are none |
+| `<` `>` | previous and next mark, or hunk when there are none. Marks are lettered `[A]`, `[B]`… in the order they were made and keep their letters, so you and the agent mean the same thing by "B". A mark whose lines are gone stays, flagged stale |
 | `u` | only the uncommitted changes, and back |
 | `f` | the changed files; `z` narrows the view to one |
 | `d` | show or hide the commit message or PR description |
