@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/codesnob-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset="assets/codesnob-transparent.svg">
-    <img src="assets/codesnob.svg" alt="codesnob" width="640">
+    <img src="assets/codesnob-transparent.svg" alt="codesnob" width="640">
   </picture>
 </h1>
 
