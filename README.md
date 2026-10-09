@@ -6,55 +6,118 @@
   </picture>
 </h1>
 
-A lean, fast terminal code viewer that agents can drive: files, diffs and pull
-requests, with highlights and notes.
+A lean, fast terminal code viewer that agents can drive: files, diffs and
+pull requests, with highlights and notes. You comment directly in the code,
+and the agent reads your comments.
 
 Point it at a repository or worktree and it shows what changed since the
 branch point: committed work, staged and unstaged edits, and untracked files,
-in one flat view that refreshes as you type.
+in one flat view that refreshes as you type. From there, step through the
+branch's commits, or open any file, revision, comparison or pull request
+beside it.
 
-## Installing
+- [Install](#install)
+- [A first session](#a-first-session)
+- [Using it with an agent](#using-it-with-an-agent)
+- [How the viewer works](#how-the-viewer-works)
+- [Keys](#keys)
+- [Command line](#command-line)
+- [Files it keeps](#files-it-keeps)
+- [Building from source](#building-from-source)
 
-Linux x86_64 and Apple Silicon Macs. The repository is private, so the
-installer downloads through `gh` (run `gh auth login` once):
+## Install
 
-```
-gh api repos/mme/codesnob/contents/install.sh -H 'Accept: application/vnd.github.raw' | sh
-```
+Linux x86_64 and Apple Silicon Macs:
 
-From a checkout, `sh install.sh` does the same. It puts the binary in
-`~/.local/bin`, verifies it against its published sha256, and running it again
-upgrades in place. `CODESNOB_VERSION=v0.1.0` pins a version.
-
-## Using
-
-```
-codesnob [PATH]        open the viewer (default: current directory)
-codesnob show PATH     show PATH in the viewer on your workspace
-  --range R             what to compare: main...feature, HEAD~3..HEAD, a commit,
-                        worktree, staged, unstaged, or a PR
-codesnob status        list connected viewers and their workspaces
-codesnob review        the marks on the location shown: highlights and your comments
-  --location L3         another location, by the id the status bar shows
-codesnob clear [C D…]  remove marks: the letters given, or --which mine|user|all
-codesnob mcp           MCP server over stdio, for agents
-codesnob prune         remove PR checkouts no viewer has open
+```sh
+curl -fsSL https://raw.githubusercontent.com/mme/codesnob/main/install.sh | sh
 ```
 
-Give your coding agent the `show_code` and `show_diff` tools, so "show me the
-code" or "what changed" lands in your viewer, and `get_review` and
-`clear_marks`, so the comments you write in the viewer reach it. Every reply
-names the location (`L3`) and the letters of the marks it placed, and says when
-you have comments it has not read. `codesnob mcp` is a standard
-MCP server over stdio, so any agent that speaks MCP can use it:
+It puts the binary in `~/.local/bin`, no root needed, verifies it against its
+published sha256, and running it again upgrades in place. If `~/.local/bin`
+is not on your `PATH`, the installer says so. `CODESNOB_VERSION=v0.1.0` pins
+a version, `CODESNOB_PREFIX` picks another directory.
 
+codesnob needs `git` on your `PATH`, and for pull requests the GitHub CLI,
+[`gh`](https://cli.github.com), logged in with `gh auth login`. On other
+platforms, see [Building from source](#building-from-source).
+
+## A first session
+
+You need an agent that speaks MCP, and a repository with some work on a
+branch, committed or not.
+
+**1. Connect your agent.** Once, for Claude Code:
+
+```sh
+claude mcp add codesnob --scope user -- codesnob mcp
 ```
+
+Codex, pi and other agents are under
+[Using it with an agent](#using-it-with-an-agent).
+
+**2. Open the viewer.** In a terminal next to your agent, in the same
+repository:
+
+```sh
+codesnob
+```
+
+The status bar at the bottom says what you are looking at, for example
+`feature · 2 commits and uncommitted work since main`. codesnob found `main`
+by itself; [What is compared](#what-is-compared) explains how.
+
+**3. Ask the agent to show you something.** Start the agent in the
+repository and ask "show me where the config file is parsed", or "what
+changed on this branch?". The viewer switches to that code or diff and
+highlights the lines the agent means, lettered `[A]`, `[B]`, and so on. `<`
+and `>` step through them. Esc takes you back to what you had before.
+
+**4. Answer it.** Put the cursor on one of its highlights, press Enter, type,
+and press Enter again to save. Enter on any other line comments on that
+line; for several lines, press `v` on the first, move to the last and press
+Enter. Your comments are marks too, drawn in amber and lettered after the
+agent's.
+
+Then tell the agent "I left comments". It reads them, answers by letter, and
+can clear the ones it has dealt with. Until it has read them, it can't pull
+you to another location: the request waits behind a banner at the top, and
+`y` goes there anyway.
+
+**5. Look around yourself.** `j` and `k` (or the arrow keys) move the cursor
+line, `n` and `p` jump between hunks, `N` and `P` between files. `f` lists
+the changed files and `z` narrows the view to the one under the cursor.
+Change a file in your editor and save: the view updates and stays on the
+line you were reading.
+
+**6. Step through commits.** `c` lists the branch's commits. Moving through
+the list previews each one, and Enter keeps it. `Alt-↑` and `Alt-↓` step to
+the older and newer commit without the list. `u` shows only the uncommitted
+changes. Esc goes back to everything since the branch point.
+
+**7. Open something else.** Press `o` and type one of these:
+
+- `src/main.rs`: a file as it is now
+- `main:src/main.rs`: the same file as of `main`
+- `HEAD~3..HEAD`, `main...feature`, or a commit hash: a comparison
+- `#123`: pull request 123 of this repository's GitHub remote
+
+Each one opens as a new location. `Alt-←` takes you back, and `L` lists
+everything you have open.
+
+**8. Quit** with `q`. `:` or `Ctrl-K` lists every command with its key.
+
+## Using it with an agent
+
+`codesnob mcp` is an MCP server over stdio. Add it to your agent:
+
+```sh
 claude mcp add codesnob --scope user -- codesnob mcp   # Claude Code
 codex mcp add codesnob -- codesnob mcp                  # Codex
 pi mcp add codesnob -- codesnob mcp                     # pi 1.0 or later
 ```
 
-Other agents take it in their MCP configuration, most in this form:
+Most other agents take a JSON configuration in this form:
 
 ```json
 {
@@ -64,48 +127,233 @@ Other agents take it in their MCP configuration, most in this form:
 }
 ```
 
-In the viewer, `:` or Ctrl-K lists every command with its key. The ones you
-need to start:
+The server gives the agent four tools:
+
+| Tool | Does |
+|---|---|
+| `show_code` | show whole files or excerpts, as they are or as of a revision, with highlighted lines and optional notes |
+| `show_diff` | show any comparison from [the range table](#what-is-compared), optionally limited to some files, with highlighted lines |
+| `get_review` | read every mark on a location: the agent's highlights and your comments, with the code they are on and which comments are new |
+| `clear_marks` | remove marks by letter, or all of the agent's, all of yours, or all of them |
+
+Every reply tells the agent the location id and the letters of the marks it
+placed, and whether you have comments it has not read yet. The tool
+descriptions tell the agent when to use them, so you don't need to mention
+codesnob in your prompts: "show me", "what changed on this branch" and "I
+left some comments" are enough.
+
+The viewer must already be running; the agent does not start one. If you
+have more than one viewer open, the agent's requests go to the one on the
+same Hyprland workspace as the agent's terminal, or the nearest numbered
+workspace. On other desktops they go to the viewer that was opened first.
+
+## How the viewer works
+
+### What is compared
+
+By default codesnob shows everything on your branch that is not on the
+branch it came from: commits, staged changes, unstaged changes and untracked
+files, as one diff. It looks for that base branch in this order:
+
+1. the branch your branch was created from, as recorded in its reflog
+2. the upstream it tracks
+3. `origin/HEAD`, then `main`, `master`, `develop` and `trunk`, locally and
+   on `origin`
+
+Of these, it uses the one that shares the most recent commit with your
+branch. On `main` itself, that is usually `origin/main`, so you see what
+you have not pushed. With a detached HEAD, or when no base is found, only
+uncommitted changes are shown. `codesnob --stat` prints the base it picked
+and why.
+
+You can always ask for something else, from the Open prompt (`o`), with
+`codesnob show --range`, or from an agent. Ranges use git's syntax:
+
+| Range | Shows |
+|---|---|
+| `main...feature` | what `feature` changed since it diverged from `main` |
+| `main..feature` | `main` against `feature` |
+| `main` (a branch or tag alone) | everything since the branch point with it |
+| `a1b2c3d`, `HEAD~3` (any other revision) | that commit against its parent |
+| `worktree` | the working tree against `HEAD` |
+| `staged` | the index against `HEAD` |
+| `unstaged` | the working tree against the index |
+| `#123`, `owner/repo#123`, a PR URL | a GitHub pull request |
+
+### Locations
+
+Everything you open stays open in the viewer as a location, with an id like
+`L3` shown in the status bar. A location holds its own range, cursor and
+marks. `Alt-←` and `Alt-→` (or `-`) move between them, and `L` lists them.
+
+When an agent shows you something in a repository you already have open, it
+replaces what that repository's location was showing. Esc brings back what
+you had before.
+
+### Marks and comments
+
+Marks are highlighted line ranges, lettered `[A]`, `[B]`, … in the order
+they were made. A mark keeps its letter, so you and the agent can both say
+"B" and mean the same lines. The agent's highlights can carry a short note;
+your comments are drawn in amber.
+
+Marks follow their code as you edit. If the lines a mark pointed at are
+deleted, the mark stays and is flagged stale.
+
+### When the agent shows something while you are busy
+
+If the agent asks to take you to a different location while you are typing
+a comment, marking lines, or have comments it has not read yet, the request
+waits behind a banner at the top of the view. `y` switches to it, Esc drops
+it, and it goes through by itself once the agent reads your comments.
+Updates to the location you are on apply at once.
+
+### Pull requests
+
+Opening `#123` asks `gh` for the pull request and checks it out as a
+detached worktree under `~/.cache/codesnob`. If the viewer already has a
+clone of that repository open, the PR's commits are fetched into it.
+Otherwise codesnob keeps a blobless clone in the cache. The diff is taken
+from the merge-base with the PR's base branch, so it matches the Files tab
+on GitHub.
+
+`d` shows the PR description and `r` fetches the PR again. Checkouts that
+have not been used for a week are removed on the next start;
+`codesnob prune` removes the ones no viewer has open right away.
+
+### Outside a repository
+
+`codesnob` in a directory that is not inside a git repository opens with a
+message saying so. Press `o` to open a repository or a file from there.
+
+## Keys
+
+Every command is also in the command list, `:` or `Ctrl-K`. The viewer
+accepts vi-style, emacs-style and arrow keys for movement. Clicking a line
+moves the cursor to it, and the mouse wheel scrolls.
+
+**Moving**
 
 | Key | Does |
 |---|---|
-| `j` `k` ↑ ↓ | move the cursor line; the view scrolls once the cursor reaches an edge. A click moves it too |
-| `o` | open a directory or a file, a file as of a revision (`main:src/diff.rs`), a PR (`#123`, `owner/repo#123`, a URL), or a comparison (`main...feature`, `HEAD~3`, `staged`) |
-| `c` | the branch's commits; moving through the list previews each one |
-| Alt-↑ Alt-↓ | older and newer commit, directly |
-| Enter | comment on the cursor's line; on a comment's own row, edit it; on an agent's highlight, answer it |
-| Ctrl-Space or `v` | start marking lines for a comment; move to extend, Enter or Ctrl-Space again to write it, Esc to stop |
-| `e` `x` | edit or delete the comment under the cursor; `X` clears all of yours here, after asking |
-| `y` | switch to what the agent asked to show while you were reviewing: a request that would take you away from unread comments or a comment you are typing waits behind a banner until you press `y`, the agent reads your comments, or Esc drops it |
-| `<` `>` | previous and next mark, or hunk when there are none. Marks are lettered `[A]`, `[B]`… in the order they were made and keep their letters, so you and the agent mean the same thing by "B". A mark whose lines are gone stays, flagged stale |
+| `j` `k`, `↓` `↑`, `Ctrl-N` `Ctrl-P` | move the cursor line |
+| `Space` `Backspace`, `PgDn` `PgUp`, `Ctrl-V` `Alt-V` | page down, page up |
+| `Ctrl-D` `Ctrl-U` | half a page down, up |
+| `g` `G`, `Home` `End`, `Alt-<` `Alt->` | top, bottom |
+| `n` `p`, `]` `[` | next, previous hunk |
+| `N` `P`, `}` `{`, `Tab` `Shift-Tab` | next, previous file |
+| `l` `h`, `→` `←`, `Ctrl-F` `Ctrl-B` | scroll right, left |
+| `0`, `Ctrl-A` | scroll back to the first column |
+
+**What is shown**
+
+| Key | Does |
+|---|---|
+| `o` | open a directory, file, revision, range or pull request; Tab completes directory and branch names |
+| `c` | list the branch's commits, previewing each |
+| `Alt-↑` `Alt-↓` | older, newer commit |
 | `u` | only the uncommitted changes, and back |
-| `f` | the changed files; `z` narrows the view to one |
+| `f` | list the changed files |
+| `z` | narrow to the file under the cursor, and back |
 | `d` | show or hide the commit message or PR description |
-| Alt-← Alt-→ | previous and next location; `-` also goes back |
-| `L` | all locations open in this viewer |
-| Esc | back out one level |
+| `r`, `F5` | reload; on a pull request, fetch it again |
+| Esc | back out one step: return from what the agent showed, leave a file, widen a narrowed view, return to the full range. Esc never quits |
 
-PRs are checked out with `gh` into `~/.cache/codesnob`, next to your own
-clone when one is open. Checkouts unused for a week are removed, and `codesnob prune` clears
-the ones no viewer has open right away.
+**Locations**
 
-## Building
+| Key | Does |
+|---|---|
+| `Alt-←`, `-` | previous location |
+| `Alt-→` | next location |
+| `L` | list the open locations |
+
+**Marks and comments**
+
+| Key | Does |
+|---|---|
+| Enter | comment on the cursor's line; on your comment, edit it; on an agent's highlight, answer it |
+| `v`, `Ctrl-Space` | start marking lines; move to extend, then Enter to write the comment, Esc to cancel |
+| `e` | edit the comment under the cursor |
+| `x` | delete the comment under the cursor |
+| `X` | delete all your comments in this location, after asking |
+| `<` `>` | previous, next mark (or hunk, when there are no marks) |
+| `y` | switch to what the agent is waiting to show |
+
+**Other**
+
+| Key | Does |
+|---|---|
+| `:`, `Ctrl-K` | command list |
+| `q`, `Ctrl-C` | quit |
+
+## Command line
 
 ```
-just install            release build into ~/.local/bin
+codesnob [OPTIONS] [PATH]
+```
+
+Opens the viewer on the repository containing `PATH` (default: the current
+directory).
+
+| Option | Does |
+|---|---|
+| `--base REV` | compare against the merge-base with `REV` instead of detecting the base branch |
+| `-U N`, `--context N` | lines of context around each change (default 3) |
+| `--theme NAME` | syntax theme, by bat theme name. The default, `base16`, uses your terminal's colors |
+| `--list-themes` | print the available themes |
+| `--light` | colors for a light terminal background |
+| `--stat` | print the detected base and a per-file summary instead of opening the viewer |
+
+The subcommands talk to viewers that are already running:
+
+| Command | Does |
+|---|---|
+| `codesnob show PATH [--range R]` | show the repository at `PATH` in the viewer, optionally a specific range |
+| `codesnob review [--location L3] [--json]` | print the marks on a location (default: the one on screen); the comments count as read afterwards |
+| `codesnob clear [LETTERS…] [--which mine\|user\|all] [--location L3]` | remove marks by letter, or by owner: `mine` is the agent's highlights (the default), `user` is your comments |
+| `codesnob status [--json]` | list the connected viewers, with their workspace and directory |
+| `codesnob mcp` | run the MCP server on stdin and stdout |
+| `codesnob prune` | remove PR checkouts that no viewer has open |
+| `codesnob daemon` | run the daemon in the foreground |
+
+Viewers and agents talk through a small per-user daemon over a Unix socket.
+It starts when it is first needed and you don't have to manage it.
+
+## Files it keeps
+
+| Path | Holds |
+|---|---|
+| `~/.cache/codesnob` | pull request checkouts and clones (`$XDG_CACHE_HOME` if set) |
+| `~/.local/state/codesnob` | recently opened locations, offered by `o` (`$XDG_STATE_HOME` if set) |
+| `$XDG_RUNTIME_DIR/codesnob` | the daemon's socket (`codesnob-<uid>` in the temp directory if that variable is unset, as on macOS) |
+
+To uninstall, delete `~/.local/bin/codesnob`, `~/.local/share/codesnob` and
+the directories above.
+
+## Building from source
+
+With a recent stable Rust toolchain:
+
+```sh
+cargo install --git https://github.com/mme/codesnob
+```
+
+Or from a checkout, with [just](https://github.com/casey/just):
+
+```
+just install    # release build into ~/.local/bin
 just test
 just lint
 ```
 
-## Releasing
+### Releasing
 
-1. Run `just release minor` (or `patch`, `major`), or start
-   **release / create-pr** from the Actions tab. It bumps the version, drafts
-   the notes into CHANGELOG.md and opens a PR.
-2. Edit the notes on that PR if needed.
-3. Merge it. **release / publish** tags the merge, builds and tests on Linux
-   and Apple Silicon, and attaches both tarballs with checksums to a GitHub
-   Release.
+`just release minor` (or `patch`, `major`) opens a release PR that bumps the
+version and drafts the notes in `CHANGELOG.md`. Edit the notes on the PR if
+needed and merge it: CI tags the merge, builds and tests on Linux and Apple
+Silicon, and publishes both tarballs with checksums as a GitHub release.
+Closing the PR instead cancels the release.
 
-Closing the PR instead cancels the release; nothing is published until the
-merge.
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
