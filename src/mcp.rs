@@ -211,6 +211,14 @@ fn show_code(args: &Value) -> Result<String, String> {
 /// Words for a show reply: where it went, what it was, and what the viewer
 /// made of it when it answered.
 fn shown(r: &crate::proto::ShowResult, what: &str) -> String {
+    // With the viewer's answer, the letters say it all; without, the
+    // order the highlights were sent in is the best there is.
+    let what = match &r.ack {
+        Some(ack) if !ack.marks.is_empty() => {
+            what.split("; highlights, lettered").next().unwrap_or(what)
+        }
+        _ => what,
+    };
     let mut text = format!("{}: {what}", link::describe(r));
     match &r.ack {
         Some(ack) => {
@@ -864,7 +872,10 @@ mod tests {
             }),
         };
         assert_eq!(
-            shown(&r, "a.txt, b.txt"),
+            shown(
+                &r,
+                "a.txt, b.txt; highlights, lettered in this order in the viewer: a.txt 5, b.txt 7-8"
+            ),
             "shown in viewer v1: a.txt, b.txt; marks [C] a.txt 5, [D] b.txt old 7-8; location L2 (/r); the user has 2 unread comments on L2, call get_review; the user gets back to their previous view with Esc"
         );
         r.ack.as_mut().unwrap().applied = false;

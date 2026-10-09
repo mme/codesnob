@@ -1684,19 +1684,28 @@ fn the_cursor_moves_within_the_view_and_the_view_follows_near_the_edge() {
         "the cursor row's line number is bold"
     );
 
-    h.keys(&"j".repeat(6));
+    h.keys(&"j".repeat(8));
     let (row, text) = h.cursor();
-    assert!(text.contains("// line 26"), "{text}");
+    assert!(text.contains("// line 28"), "{text}");
+    assert_eq!(
+        row, 28,
+        "the cursor reaches the bottom row before anything scrolls"
+    );
+    assert!(h.screen().contains("// line 1\n"), "{}", h.screen());
+
+    h.keys("jj");
+    let (row, text) = h.cursor();
+    assert!(text.contains("// line 30"), "{text}");
     let screen = h.screen();
     assert!(
-        !screen.contains("// line 1\n") && screen.contains("// line 29"),
-        "three rows stay in sight below the cursor:\n{screen}"
+        !screen.contains("// line 1\n") && screen.contains("// line 30"),
+        "then the view follows:\n{screen}"
     );
     assert!(
         screen.lines().next().unwrap().contains("src/long.rs"),
         "the header sticks once scrolled:\n{screen}"
     );
-    assert_eq!(row, 29 - 4, "{screen}");
+    assert_eq!(row, 28, "the cursor stays on the bottom row:\n{screen}");
 
     h.keys("G");
     let (_, text) = h.cursor();
@@ -1713,9 +1722,8 @@ fn the_cursor_moves_within_the_view_and_the_view_follows_near_the_edge() {
     let (row, text) = h.cursor();
     assert!(text.contains("// line 29"), "{text}");
     assert_eq!(
-        row,
-        1 + 3,
-        "the view scrolls up once the cursor is within three rows of the top"
+        row, 1,
+        "the view scrolls up once the cursor would leave it at the top"
     );
 
     h.keys("g");
@@ -1738,14 +1746,14 @@ fn paging_moves_the_view_and_keeps_the_cursor_in_sight() {
         "a page down moves the view:\n{screen}"
     );
     assert!(
-        text.contains("// line 3"),
-        "the cursor is pulled along, clear of the top: {text}"
+        text.contains("// line 27"),
+        "the cursor keeps its place on screen, now the top row: {text}"
     );
     h.keys("<c-u>");
-    let (row, _) = h.cursor();
+    let (row, text) = h.cursor();
     assert!(
-        row >= 3,
-        "half a page up keeps the cursor clear of the top: {row}"
+        row == 1 && text.contains("// line 13"),
+        "half a page up moves view and cursor alike: {row} {text}"
     );
     cleanup(dir);
 }
@@ -2215,7 +2223,6 @@ fn a_switch_waits_behind_a_banner_while_comments_are_unread() {
         screen.contains("[A] you: look"),
         "the review stays on screen:\n{screen}"
     );
-    assert_eq!(h.app.cur().unwrap().view.scroll, 0);
     h.keys("j");
     assert!(
         h.screen().contains("the agent wants"),
@@ -2375,6 +2382,76 @@ fn without_a_review_in_progress_a_switch_is_immediate() {
     assert_eq!(h.app.cur().unwrap().dir, b);
     cleanup(a);
     cleanup(b);
+}
+
+#[test]
+fn deleting_a_comment_from_its_own_row_leaves_the_cursor_on_its_line() {
+    let dir = repo_with_long_file("ui-comment-row-delete");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    h.keys(&"j".repeat(40));
+    h.keys("<enter>gone soon<enter>");
+    h.keys("k");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("[A] you: gone soon"),
+        "on the comment's row: {text}"
+    );
+    h.keys("e<c-u>still here<enter>");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("[A] you: still here"),
+        "an edit keeps the cursor on the row: {text}"
+    );
+    h.keys("x");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("// line 40"),
+        "the cursor lands on the line it was about: {text}"
+    );
+    assert!(
+        h.screen().contains("// line 39"),
+        "and the view stays put: {}",
+        h.screen()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn enter_on_an_agents_highlight_answers_it() {
+    let dir = repo_with_long_file("ui-comment-reply");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![hl("src/long.rs", 20, 22, Some("the loop"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    h.keys("k");
+    let (_, text) = h.cursor();
+    assert!(text.contains("[A] the loop"), "{text}");
+    h.keys("<enter>");
+    assert!(
+        h.screen().contains("re [A] src/long.rs 20-22"),
+        "{}",
+        h.screen()
+    );
+    h.keys("not a loop<enter>");
+    let screen = h.screen();
+    assert!(screen.contains("[B] you re [A]: not a loop"), "{screen}");
+    let m = &h.app.cur().unwrap().marks[1];
+    assert_eq!((m.start, m.end, m.re.as_deref()), (20, 22, Some("A")));
+    assert_eq!(m.text.as_deref().map(|t| t.len()), Some(3));
+    let r = h.app.review(None).unwrap();
+    assert!(
+        r.render()
+            .contains("[B] comment src/long.rs 20-22 (new, re [A]): not a loop"),
+        "{}",
+        r.render()
+    );
+    cleanup(dir);
 }
 
 fn repo_with_long_file(name: &str) -> PathBuf {

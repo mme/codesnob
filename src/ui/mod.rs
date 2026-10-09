@@ -250,6 +250,8 @@ struct LocMark {
     /// An agent has read it since it was made or last edited. Highlights
     /// are the agent's own, so they start read.
     seen: bool,
+    /// The letter of the mark this comment answers.
+    re: Option<String>,
 }
 
 impl LocMark {
@@ -266,6 +268,7 @@ impl LocMark {
             with_deletions: self.with_deletions,
             stale: self.stale,
             new: user && !self.seen,
+            re: self.re.clone(),
             text: self.note.clone(),
             lines: if user {
                 self.text.clone().unwrap_or_default()
@@ -286,6 +289,7 @@ impl LocMark {
             note: self.note.clone(),
             stale: self.stale,
             old_side: self.old_side,
+            re: self.re.clone(),
         }
     }
 }
@@ -399,6 +403,7 @@ impl Location {
             old_side: false,
             with_deletions: false,
             seen: author == diffview::Author::Agent,
+            re: None,
         });
         self.marks.last_mut().expect("just pushed")
     }
@@ -2751,6 +2756,11 @@ impl App {
             self.edit(seq);
             return;
         }
+        // On an agent's highlight, the comment answers it on its lines.
+        if let Some(region) = loc.view.highlight_at_cursor() {
+            self.compose(region, None);
+            return;
+        }
         match loc.view.region(cursor, cursor) {
             Some(region) => self.compose(region, None),
             None => self.message = Some("move onto a line first".to_string()),
@@ -2790,9 +2800,10 @@ impl App {
             (true, true) => format!("{} old {}", region.path, region.start),
             (false, true) => format!("{} old {}-{}", region.path, region.start, region.end),
         };
-        let note = match existing {
-            Some(m) => format!("[{}] {where_}", m.label),
-            None => where_,
+        let note = match (existing, &region.re) {
+            (Some(m), _) => format!("[{}] {where_}", m.label),
+            (None, Some(re)) => format!("re [{re}] {where_}"),
+            (None, None) => where_,
         };
         let mut panel = Panel::new(panel::Kind::Comment, Vec::new(), Vec::new(), None);
         panel.set_input(text);
@@ -2813,6 +2824,7 @@ impl App {
             old_side: m.old_side,
             with_deletions: m.with_deletions,
             text: m.text.clone().unwrap_or_default(),
+            re: m.re.clone(),
         };
         self.compose(region, Some(seq));
     }
@@ -2848,6 +2860,7 @@ impl App {
                 m.old_side = region.old_side;
                 m.with_deletions = region.with_deletions;
                 m.text = Some(region.text);
+                m.re = region.re;
                 m.label.clone()
             }
         };

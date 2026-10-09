@@ -49,6 +49,8 @@ pub struct Mark {
     pub stale: bool,
     /// Its lines are the old side's: deleted lines in a diff.
     pub old_side: bool,
+    /// The letter of the mark this one answers.
+    pub re: Option<String>,
 }
 
 /// Lines the user marked for a comment, in the terms marks are kept in.
@@ -63,6 +65,8 @@ pub struct Region {
     pub with_deletions: bool,
     /// The marked lines as they are now.
     pub text: Vec<String>,
+    /// The letter of the mark this comment answers, when made on its row.
+    pub re: Option<String>,
 }
 
 /// Where the cursor is, expressed in terms that survive a reload.
@@ -72,12 +76,12 @@ pub struct Anchor {
     line: Option<(u8, usize)>,
     /// The cursor was on a hunk header, not on a line.
     at_hunk: bool,
+    /// The cursor was on a mark's own row: the mark, by its place in the
+    /// order marks were made.
+    at_mark: Option<usize>,
     /// How many rows below the top of the view the cursor sat.
     offset: usize,
 }
-
-/// Rows kept visible above and below the cursor while it moves.
-pub const SCROLLOFF: usize = 3;
 
 #[derive(Default)]
 pub struct DiffView {
@@ -280,6 +284,33 @@ impl DiffView {
         }
     }
 
+    /// The agent's highlight whose row the cursor is on, as a region to
+    /// comment on: the same lines, answering that letter.
+    pub fn highlight_at_cursor(&self) -> Option<Region> {
+        let Row::Mark(m) = *self.rows.get(self.cursor)? else {
+            return None;
+        };
+        let mark = &self.marks[m];
+        if mark.author != Author::Agent {
+            return None;
+        }
+        let f = self.files.iter().find(|f| f.path == mark.path)?;
+        let old = mark.old_side || f.status == Status::Deleted;
+        let lines = if old { &f.old_lines } else { &f.new_lines };
+        Some(Region {
+            path: mark.path.clone(),
+            start: mark.start,
+            end: mark.end,
+            old_side: mark.old_side,
+            with_deletions: false,
+            text: lines
+                .get(mark.start - 1..mark.end)
+                .map(<[String]>::to_vec)
+                .unwrap_or_default(),
+            re: Some(mark.label.clone()),
+        })
+    }
+
     /// The lines between rows `a` and `b` (either order) as a region to
     /// comment on: the lines of the file `a` is in, up to its end. `None`
     /// when `a` is not on a line.
@@ -326,6 +357,7 @@ impl DiffView {
             old_side,
             with_deletions: deletions && !old_side,
             text,
+            re: None,
         })
     }
 
@@ -539,6 +571,7 @@ impl DiffView {
     pub fn anchor(&self) -> Option<Anchor> {
         let fi = self.current_file()?;
         let path = self.files[fi].path.clone();
+        let mut at_mark = None;
         let (line, at_hunk) = match self.rows.get(self.cursor)? {
             Row::Line(fi, hi, li) => {
                 let l = &self.files[*fi].hunks[*hi].lines[*li];
@@ -553,12 +586,20 @@ impl DiffView {
                 };
                 (Some(at), true)
             }
+            // A mark's row: its first line, and the row itself if it stays.
+            Row::Mark(m) => {
+                let mark = &self.marks[*m];
+                at_mark = Some(mark.seq);
+                let old = mark.old_side || self.files[fi].status == Status::Deleted;
+                (Some((if old { 0 } else { 1 }, mark.start)), false)
+            }
             _ => (None, false),
         };
         Some(Anchor {
             path,
             line,
             at_hunk,
+            at_mark,
             offset: self.cursor - self.scroll,
         })
     }
@@ -603,6 +644,20 @@ impl DiffView {
             Some((_, r)) => r,
             None => start,
         };
+        // Back onto the mark's row when we were on one and it is still
+        // there, among the rows of the marks above the line.
+        if let Some(seq) = a.at_mark {
+            let mut r = self.cursor;
+            while r > 0
+                && let Some(Row::Mark(m)) = self.rows.get(r - 1)
+            {
+                r -= 1;
+                if self.marks[*m].seq == seq {
+                    self.cursor = r;
+                    break;
+                }
+            }
+        }
         self.scroll = self.cursor.saturating_sub(a.offset);
         self.fit();
     }
@@ -617,10 +672,6 @@ impl DiffView {
         let sticky =
             self.file_at(scroll).is_some() && !matches!(self.rows.get(scroll), Some(Row::File(_)));
         self.body_h.saturating_sub(usize::from(sticky)).max(1)
-    }
-
-    fn scrolloff(&self) -> usize {
-        SCROLLOFF.min(self.visible_at(self.scroll).saturating_sub(1) / 2)
     }
 
     /// Bring the cursor onto a row it may rest on, stepping in `dir`
@@ -650,26 +701,18 @@ impl DiffView {
         }
     }
 
-    /// Scroll just enough to keep the cursor in sight, `SCROLLOFF` rows
-    /// clear of the edges where the rows allow.
+    /// Scroll just enough to keep the cursor in sight: the view moves only
+    /// once the cursor would leave it at an edge.
     fn follow(&mut self) {
-        self.follow_off(self.scrolloff());
-    }
-
-    /// Scroll just enough to keep the cursor in sight, `off` rows clear of
-    /// the edges where that many rows exist.
-    fn follow_off(&mut self, off: usize) {
-        let above = off.min(self.cursor);
-        if self.cursor < self.scroll + above {
-            self.scroll = self.cursor - above;
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
         }
-        let below = off.min(self.max_scroll() - self.cursor);
         // Scrolling can bring in the sticky header, which takes a row, so
         // the check runs again at the new position.
         for _ in 0..2 {
             let visible = self.visible_at(self.scroll);
-            if self.cursor + below + 1 > self.scroll + visible {
-                self.scroll = (self.cursor + below + 1).saturating_sub(visible);
+            if self.cursor + 1 > self.scroll + visible {
+                self.scroll = (self.cursor + 1).saturating_sub(visible);
             }
         }
         self.scroll = self.scroll.min(self.max_scroll());
@@ -679,7 +722,7 @@ impl DiffView {
     pub fn fit(&mut self) {
         self.scroll = self.scroll.min(self.max_scroll());
         self.settle_cursor(1);
-        self.follow_off(0);
+        self.follow();
     }
 
     /// Tell the view how tall the body is, which decides what is in sight.
@@ -744,21 +787,12 @@ impl DiffView {
         self.pull_cursor(delta.signum());
     }
 
-    /// Bring the cursor into the rows in sight, `SCROLLOFF` clear of the
-    /// edges, without scrolling.
+    /// Bring the cursor into the rows in sight without scrolling.
     fn pull_cursor(&mut self, dir: isize) {
-        let off = self.scrolloff();
         let visible = self.visible_at(self.scroll);
         let last = (self.scroll + visible).saturating_sub(1);
-        let (lo, hi) = if self.scroll == 0 {
-            (0, last.saturating_sub(off))
-        } else if last >= self.max_scroll() {
-            (self.scroll + off, last)
-        } else {
-            (self.scroll + off, last.saturating_sub(off))
-        };
-        let lo = lo.min(self.max_scroll());
-        let hi = hi.min(self.max_scroll()).max(lo);
+        let lo = self.scroll.min(self.max_scroll());
+        let hi = last.min(self.max_scroll()).max(lo);
         self.cursor = self.cursor.clamp(lo, hi);
         self.settle_cursor(dir);
         self.follow();
@@ -770,7 +804,7 @@ impl DiffView {
         self.scroll = row;
         self.cursor = row;
         self.settle_cursor(1);
-        self.follow_off(0);
+        self.follow();
     }
 
     /// Put the cursor on `row`, about a third of the way down the view.
@@ -884,10 +918,11 @@ impl DiffView {
                     spans.push(Span::styled("stale · ", tint.fg(p.note_fg)));
                 }
                 if mark.author == Author::User {
-                    spans.push(Span::styled(
-                        "you: ",
-                        tint.fg(fg).add_modifier(Modifier::BOLD),
-                    ));
+                    let who = match &mark.re {
+                        Some(re) => format!("you re [{re}]: "),
+                        None => "you: ".to_string(),
+                    };
+                    spans.push(Span::styled(who, tint.fg(fg).add_modifier(Modifier::BOLD)));
                 }
                 if let Some(note) = &mark.note {
                     spans.push(Span::styled(note.clone(), tint.fg(fg)));

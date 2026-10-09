@@ -69,11 +69,11 @@ need to start:
 
 | Key | Does |
 |---|---|
-| `j` `k` ↑ ↓ | move the cursor line; the view follows, keeping three rows in sight around it. A click moves it too |
+| `j` `k` ↑ ↓ | move the cursor line; the view scrolls once the cursor reaches an edge. A click moves it too |
 | `o` | open a directory or a file, a file as of a revision (`main:src/diff.rs`), a PR (`#123`, `owner/repo#123`, a URL), or a comparison (`main...feature`, `HEAD~3`, `staged`) |
 | `c` | the branch's commits; moving through the list previews each one |
 | Alt-↑ Alt-↓ | older and newer commit, directly |
-| Enter | comment on the cursor's line; on a comment's own row, edit it |
+| Enter | comment on the cursor's line; on a comment's own row, edit it; on an agent's highlight, answer it |
 | Ctrl-Space or `v` | start marking lines for a comment; move to extend, Enter or Ctrl-Space again to write it, Esc to stop |
 | `e` `x` | edit or delete the comment under the cursor; `X` clears all of yours here, after asking |
 | `y` | switch to what the agent asked to show while you were reviewing: a request that would take you away from unread comments or a comment you are typing waits behind a banner until you press `y`, the agent reads your comments, or Esc drops it |

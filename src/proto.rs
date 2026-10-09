@@ -145,6 +145,9 @@ pub struct MarkInfo {
     /// A comment the agent has not read yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub new: bool,
+    /// The letter of the mark this comment answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub re: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     /// The marked code, as it was when the mark was made.
@@ -174,13 +177,16 @@ impl MarkInfo {
         };
         let mut flags = Vec::new();
         if self.new {
-            flags.push("new");
+            flags.push("new".to_string());
+        }
+        if let Some(re) = &self.re {
+            flags.push(format!("re [{re}]"));
         }
         if self.stale {
-            flags.push("stale");
+            flags.push("stale".to_string());
         }
         if self.with_deletions {
-            flags.push("includes deleted lines");
+            flags.push("includes deleted lines".to_string());
         }
         let flags = if flags.is_empty() {
             String::new()
