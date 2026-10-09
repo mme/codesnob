@@ -38,11 +38,24 @@ codesnob mcp           MCP server over stdio, for agents
 codesnob prune         remove PR checkouts no viewer has open
 ```
 
-Give Claude Code the `show_code` and `show_diff` tools, so "show me the
-code" or "what changed" lands in your viewer:
+Give your coding agent the `show_code` and `show_diff` tools, so "show me the
+code" or "what changed" lands in your viewer. `codesnob mcp` is a standard
+MCP server over stdio, so any agent that speaks MCP can use it:
 
 ```
-claude mcp add codesnob --scope user -- codesnob mcp
+claude mcp add codesnob --scope user -- codesnob mcp   # Claude Code
+codex mcp add codesnob -- codesnob mcp                  # Codex
+pi mcp add codesnob -- codesnob mcp                     # pi 1.0 or later
+```
+
+Other agents take it in their MCP configuration, most in this form:
+
+```json
+{
+  "mcpServers": {
+    "codesnob": { "command": "codesnob", "args": ["mcp"] }
+  }
+}
 ```
 
 In the viewer, `:` or Ctrl-K lists every command with its key. The ones you
