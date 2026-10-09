@@ -12,12 +12,17 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 gix = { version = "0.88", default-features = false, features = ["sha1", "max-performance-safe", "status", "revision", "blob-diff", "excludes"] }
 imara-diff = "0.2"
+# Decodes the sticker drawn on the empty screen.
+image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2.190"
 # FSEvents on macOS; without it notify falls back to 30-second polling there.
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 nucleo-matcher = "0.3.1"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "layout-cache", "underline-color"] }
+# The sticker as a terminal image: Sixel, kitty or iTerm2, whichever the
+# terminal answers to.
+ratatui-image = { version = "11.1", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }

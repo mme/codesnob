@@ -299,6 +299,50 @@ fn esc_never_quits_and_q_does() {
 }
 
 #[test]
+fn the_empty_screen_shows_the_sticker_above_one_line() {
+    let dir = fresh_dir("ui-sticker");
+    let mut h = Harness::open(&dir);
+    let text_row = |screen: &str| {
+        screen
+            .lines()
+            .position(|l| l.contains("not inside a git repository · "))
+            .unwrap_or_else(|| panic!("{screen}"))
+    };
+    // Without images: the line alone, in the middle of the 29 rows above
+    // the status bar.
+    let screen = h.screen();
+    assert_eq!(text_row(&screen), 14, "{screen}");
+    let used = screen.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(used, 2, "one line, and the status bar:\n{screen}");
+
+    // With images: the sticker, a blank row, the line, together in the
+    // middle.
+    let picker = ratatui_image::picker::Picker::halfblocks();
+    h.app.logo = Some(logo::Logo::new(picker, false));
+    let screen = h.screen();
+    let row = text_row(&screen);
+    let lines: Vec<&str> = screen.lines().collect();
+    let drawn: Vec<usize> = (0..row)
+        .filter(|&i| lines[i].contains(['▀', '▄', '█']))
+        .collect();
+    assert!(drawn.len() >= 3, "the sticker is drawn:\n{screen}");
+    assert_eq!(drawn.last().copied(), Some(row - 2), "{screen}");
+    assert!(lines[row - 1].trim().is_empty(), "{screen}");
+    let (first, height) = (drawn[0], row + 1 - drawn[0]);
+    assert!(
+        first.abs_diff((29 - height) / 2) <= 1,
+        "centered as a whole, from row {first} over {height} rows:\n{screen}"
+    );
+
+    // Too small a screen for it: the line alone again.
+    h.term.backend_mut().resize(24, 10);
+    let screen = h.screen();
+    assert!(!screen.contains(['▀', '▄', '█']), "{screen}");
+    assert!(screen.contains("not inside a git"), "{screen}");
+    cleanup(dir);
+}
+
+#[test]
 fn a_directory_outside_any_repository_says_so() {
     let dir = fresh_dir("ui-norepo");
     let mut h = Harness::open(&dir);
