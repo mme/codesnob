@@ -2126,26 +2126,292 @@ fn clear_marks_takes_letters_or_an_author() {
     h.screen();
     h.keys("jj<enter>one<enter>");
     h.keys("jjjjj<enter>two<enter>");
-    let r = h.app.clear_marks(None, "mine", &["c".to_string()]).unwrap();
-    assert_eq!(r.cleared, ["C"]);
-    assert_eq!((r.remaining, r.unread), (3, 1));
-    assert!(h.status().contains("agent cleared [C]"), "{}", h.status());
-    assert!(!h.screen().contains("[C] you"), "{}", h.screen());
+    let r = h
+        .app
+        .clear_marks(None, "mine", &["a".to_string()], false)
+        .unwrap();
+    assert_eq!(r.cleared, ["A"]);
+    assert_eq!((r.remaining, r.unread), (3, 2));
+    assert!(h.status().contains("agent cleared [A]"), "{}", h.status());
+    assert!(!h.screen().contains("[A] a"), "{}", h.screen());
     let err = h
         .app
-        .clear_marks(None, "mine", &["Z".to_string()])
+        .clear_marks(None, "mine", &["Z".to_string()], false)
         .unwrap_err();
     assert_eq!(err, "no mark [Z] on L1");
-    let r = h.app.clear_marks(None, "mine", &[]).unwrap();
-    assert_eq!(r.cleared, ["A", "B"]);
-    assert!(h.screen().contains("[D] you: two") && !h.screen().contains("[A] a"));
-    let r = h.app.clear_marks(Some("L1"), "user", &[]).unwrap();
+    let r = h.app.clear_marks(None, "mine", &[], false).unwrap();
+    assert_eq!(r.cleared, ["B"]);
+    assert!(h.screen().contains("[D] you: two") && !h.screen().contains("[B] b"));
+    let r = h.app.clear_marks(Some("L1"), "user", &[], true).unwrap();
     assert_eq!(
         (r.cleared.as_slice(), r.remaining),
-        (["D".to_string()].as_slice(), 0)
+        (["C".to_string(), "D".to_string()].as_slice(), 0)
     );
-    let r = h.app.clear_marks(None, "all", &[]).unwrap();
+    let r = h.app.clear_marks(None, "all", &[], false).unwrap();
     assert!(r.cleared.is_empty());
+    cleanup(dir);
+}
+
+#[test]
+fn the_users_comments_go_only_when_the_user_asked() {
+    let dir = repo_with_long_file("ui-clear-user");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![hl("src/long.rs", 10, 10, Some("a"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    h.keys("jj<enter>one<enter>");
+    h.keys("jjjjj<enter>two<enter>");
+    h.app.reply_to(None, "B", "noted").unwrap();
+
+    // By letter, by author, or along with everything: refused, and nothing
+    // goes, not even the agent's own marks named with them.
+    let err = h
+        .app
+        .clear_marks(None, "mine", &["A".to_string(), "b".to_string()], false)
+        .unwrap_err();
+    assert!(
+        err.starts_with("[B] is the user's: it goes only when the user explicitly asks for that")
+            && err.contains("user_explicitly_asked_to_delete_comments")
+            && err.ends_with("reply to it"),
+        "{err}"
+    );
+    let err = h.app.clear_marks(None, "user", &[], false).unwrap_err();
+    assert!(err.starts_with("[B] [C] are the user's"), "{err}");
+    assert!(h.app.clear_marks(None, "all", &[], false).is_err());
+    let left: Vec<String> = h
+        .app
+        .cur()
+        .unwrap()
+        .marks
+        .iter()
+        .map(|m| format!("{}{}", m.label, m.replies.len()))
+        .collect();
+    assert_eq!(left, ["A0", "B1", "C0"], "nothing went");
+
+    // The agent's own reply under the user's comment is the agent's.
+    let r = h
+        .app
+        .clear_marks(None, "mine", &["B1".to_string()], false)
+        .unwrap();
+    assert_eq!(r.cleared, ["B1"]);
+    let screen = h.screen();
+    assert!(
+        screen.contains("[B] you: one") && !screen.contains("[B1] noted"),
+        "{screen}"
+    );
+
+    // When the user asked, they go.
+    let r = h
+        .app
+        .clear_marks(None, "mine", &["B".to_string()], true)
+        .unwrap();
+    assert_eq!(
+        (r.cleared.as_slice(), r.remaining),
+        (["B".to_string()].as_slice(), 2)
+    );
+    assert!(!h.screen().contains("[B] you"), "{}", h.screen());
+    cleanup(dir);
+}
+
+#[test]
+fn the_agent_answers_a_comment_under_its_letter() {
+    let dir = repo_with_long_file("ui-reply");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![hl("src/long.rs", 10, 10, Some("look"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    h.keys("jj<enter>why<enter>");
+    let r = h.app.reply_to(None, "b", "  because  ").unwrap();
+    assert_eq!((r.location.as_str(), r.label.as_str()), ("L1", "B1"));
+    assert_eq!(r.render(), "replied [B1] on L1");
+    assert!(h.status().contains("agent replied [B1]"), "{}", h.status());
+    let screen = h.screen();
+    let lines: Vec<&str> = screen.lines().collect();
+    let b = lines
+        .iter()
+        .position(|l| l.contains("[B] you: why"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    assert!(
+        lines[b + 1].contains("[B1] because") && lines[b + 2].contains("// line 12"),
+        "the reply sits under its comment, above the code:\n{screen}"
+    );
+
+    // A reply's label answers its comment; the numbers go on.
+    let r = h.app.reply_to(Some("L1"), "B1", "and more").unwrap();
+    assert_eq!(r.label, "B2");
+    let err = h.app.reply_to(None, "A", "x").unwrap_err();
+    assert!(err.contains("your own highlight"), "{err}");
+    assert_eq!(
+        h.app.reply_to(None, "B", " ").unwrap_err(),
+        "a reply needs text"
+    );
+    assert_eq!(
+        h.app.reply_to(None, "Q", "x").unwrap_err(),
+        "no mark [Q] on L1"
+    );
+    assert_eq!(
+        h.app.reply_to(None, "B9", "x").unwrap_err(),
+        "no mark [B9] on L1"
+    );
+
+    // The review carries them under the comment.
+    let r = h.app.review(None).unwrap();
+    let b = &r.marks[1];
+    let labels: Vec<&str> = b.replies.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["B1", "B2"]);
+    assert_eq!(b.replies[0].author, "agent");
+    assert!(
+        !b.replies[0].new,
+        "the agent's own reply is never new to it"
+    );
+    let text = r.render();
+    assert!(
+        text.contains("1 comment by the user, 2 replies")
+            && text.contains("\n    [B1] agent reply: because\n    [B2] agent reply: and more"),
+        "{text}"
+    );
+
+    // < and > step from mark to mark, over the replies: from [B]'s line
+    // back to [A], and on to [B]'s line again.
+    h.keys("<");
+    let (_, line) = h.cursor();
+    assert!(line.contains("// line 10"), "{line}");
+    h.keys(">");
+    let (_, line) = h.cursor();
+    assert!(line.contains("// line 12"), "{line}");
+    cleanup(dir);
+}
+
+#[test]
+fn the_user_answers_the_agent_in_the_same_thread() {
+    let dir = repo_with_long_file("ui-reply-user");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    h.keys("jjjjj<enter>hm<enter>");
+    h.app.review(None).unwrap();
+    h.app.reply_to(None, "A", "fixed").unwrap();
+
+    // Enter on the agent's reply answers it, under the same letter.
+    h.keys("k");
+    let (_, line) = h.cursor();
+    assert!(line.contains("[A1] fixed"), "{line}");
+    h.keys("<enter>");
+    assert!(h.screen().contains("reply under [A]"), "{}", h.screen());
+    h.keys("thanks<enter>");
+    assert!(h.status().contains("[A2] saved"), "{}", h.status());
+    assert!(h.screen().contains("[A2] you: thanks"), "{}", h.screen());
+    let loc = h.app.cur().unwrap();
+    assert_eq!((loc.comments(), loc.unread()), (2, 1));
+    let r = h.app.review(None).unwrap();
+    assert!(r.marks[0].replies[1].new && r.unread == 1, "{r:?}");
+    assert!(
+        r.render().contains("[A2] user reply (new): thanks"),
+        "{}",
+        r.render()
+    );
+
+    // Enter or e on the user's own reply edits it, and it is new again.
+    h.keys("j");
+    let (_, line) = h.cursor();
+    assert!(line.contains("[A2] you: thanks"), "{line}");
+    h.keys("e");
+    assert!(h.screen().contains("[A2] under [A]"), "{}", h.screen());
+    h.keys("<c-u>thanks!<enter>");
+    assert!(h.screen().contains("[A2] you: thanks!"), "{}", h.screen());
+    assert_eq!(h.app.cur().unwrap().unread(), 1);
+    let (_, line) = h.cursor();
+    assert!(
+        line.contains("[A2]"),
+        "the cursor stays on the reply: {line}"
+    );
+
+    // x removes the user's own reply, never the agent's.
+    h.keys("x");
+    assert!(h.status().contains("[A2] removed"), "{}", h.status());
+    let (_, line) = h.cursor();
+    assert!(line.contains("[A1] fixed"), "{line}");
+    h.keys("x");
+    assert!(
+        h.status().contains("no comment of yours here"),
+        "{}",
+        h.status()
+    );
+    h.keys("e");
+    assert!(h.status().contains("Enter answers it"), "{}", h.status());
+
+    // Numbers are not reused.
+    h.keys("<enter>again<enter>");
+    assert!(h.status().contains("[A3] saved"), "{}", h.status());
+    cleanup(dir);
+}
+
+#[test]
+fn the_agent_moves_a_comment_to_the_code_it_is_about() {
+    let dir = repo_with_long_file("ui-move");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.highlights = vec![hl("src/long.rs", 30, 30, Some("mine"))];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    h.keys("gjjjjj<enter>here<enter>");
+    assert_eq!(h.app.cur().unwrap().marks[1].start, 5);
+    h.app.reply_to(None, "B", "moving it").unwrap();
+
+    let r = h.app.move_comment(None, "b", None, 40, 41).unwrap();
+    assert_eq!(r.render(), "moved [B] to src/long.rs 40-41 on L1");
+    assert!(
+        h.status().contains("agent moved [B] to src/long.rs 40-41"),
+        "{}",
+        h.status()
+    );
+    h.settle();
+    let (_, line) = h.cursor();
+    assert!(
+        line.contains("// line 5"),
+        "the user's cursor stays: {line}"
+    );
+    let m = &h.app.cur().unwrap().marks[1];
+    assert_eq!((m.label.as_str(), m.start, m.end), ("B", 40, 41));
+    assert_eq!(
+        m.text.as_deref(),
+        Some(&["// line 40".to_string(), "// line 41".to_string()][..]),
+        "it takes the text of its new lines"
+    );
+    h.keys("G");
+    let screen = h.screen();
+    let lines: Vec<&str> = screen.lines().collect();
+    let b = lines
+        .iter()
+        .position(|l| l.contains("[B] you: here"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    assert!(
+        lines[b + 1].contains("[B1] moving it") && lines[b + 2].contains("// line 40"),
+        "{screen}"
+    );
+
+    // Only the user's comments, by their letter.
+    let err = h.app.move_comment(None, "A", None, 1, 1).unwrap_err();
+    assert!(err.contains("your own highlight"), "{err}");
+    let err = h.app.move_comment(None, "B1", None, 1, 1).unwrap_err();
+    assert_eq!(err, "[B1] is a reply; it moves with its comment, [B]");
+    let err = h.app.move_comment(None, "B", None, 5, 4).unwrap_err();
+    assert!(err.contains("run forward"), "{err}");
+
+    // It follows its new lines through an edit, as any comment does.
+    let body: String = std::iter::once("// new\n".to_string())
+        .chain((1..=60).map(|i| format!("// line {i}\n")))
+        .collect();
+    std::fs::write(dir.join("src/long.rs"), body).unwrap();
+    wait_until(&mut h, &|h| h.app.cur().unwrap().marks[1].start == 41);
+    assert_eq!(h.app.cur().unwrap().marks[1].end, 42);
     cleanup(dir);
 }
 
@@ -2244,6 +2510,64 @@ fn a_switch_waits_behind_a_banner_while_comments_are_unread() {
         1,
         "the comment is still there"
     );
+    cleanup(a);
+    cleanup(b);
+}
+
+#[test]
+fn the_locations_are_listed_with_their_unread_comments() {
+    let a = repo_with_long_file("ui-locations-a");
+    let b = small_repo("ui-locations-b");
+    let mut h = Harness::open(&a);
+    h.keys("jj<enter>look<enter>k");
+    h.app.dispatch(Msg::View(
+        target(&b),
+        Box::new(view(None, &["readme.md"])),
+        None,
+    ));
+    h.settle();
+    h.keys("y");
+    h.settle();
+    let r = h.app.locations_info();
+    assert_eq!(r.viewer, format!("v{}", std::process::id()));
+    let each: Vec<(&str, bool, usize, usize, usize)> = r
+        .locations
+        .iter()
+        .map(|l| {
+            (
+                l.location.as_str(),
+                l.on_screen,
+                l.marks,
+                l.comments,
+                l.unread,
+            )
+        })
+        .collect();
+    assert_eq!(
+        each,
+        [("L2", true, 0, 0, 0), ("L1", false, 1, 1, 1)],
+        "the one on screen first; the comment left behind is still unread"
+    );
+    assert_eq!((&r.locations[0].dir, &r.locations[1].dir), (&b, &a));
+    assert!(
+        r.locations[0].showing.starts_with("readme.md only · "),
+        "{}",
+        r.locations[0].showing
+    );
+    assert!(
+        !r.locations[1].showing.is_empty(),
+        "described off screen too"
+    );
+    let text = r.render();
+    assert!(
+        text.contains("1 mark, 1 by the user, 1 unread")
+            && text.ends_with("read unread comments with get_review and the location's id"),
+        "{text}"
+    );
+
+    // Read by its id, it is read in the list too.
+    h.app.review(Some("L1")).unwrap();
+    assert_eq!(h.app.locations_info().locations[1].unread, 0);
     cleanup(a);
     cleanup(b);
 }

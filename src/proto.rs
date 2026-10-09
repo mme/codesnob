@@ -107,20 +107,44 @@ pub struct ViewSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ViewerQuery {
+    /// The locations open in the viewer, the one on screen first.
+    Locations,
     /// Every mark on a location, with the user's comments; the comments
     /// count as read afterwards.
     Review {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         location: Option<String>,
     },
-    /// Remove marks: `letters` names them, else `which` of "mine" (the
-    /// agent's highlights), "user" or "all".
+    /// Remove marks: `letters` names them, replies too ("C2"), else
+    /// `which` of "mine" (the agent's highlights and replies), "user" or
+    /// "all". The user's comments and replies go only with `user_asked`:
+    /// the user explicitly asked for that.
     ClearMarks {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         location: Option<String>,
         which: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         letters: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        user_asked: bool,
+    },
+    /// Answer one of the user's comments, under it: C1, C2…
+    Reply {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<String>,
+        letter: String,
+        text: String,
+    },
+    /// Move one of the user's comments to other lines, of `path` or of its
+    /// own file, keeping its letter, text and replies.
+    MoveComment {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<String>,
+        letter: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        start: usize,
+        end: usize,
     },
 }
 
@@ -153,6 +177,22 @@ pub struct MarkInfo {
     /// The marked code, as it was when the mark was made.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lines: Vec<String>,
+    /// The answers under a comment, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replies: Vec<ReplyInfo>,
+}
+
+/// A reply under a comment, as reported to an agent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyInfo {
+    /// The comment's letter and the reply's number: "C2".
+    pub label: String,
+    /// "agent" or "user".
+    pub author: String,
+    pub text: String,
+    /// The user's, and the agent has not read it yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub new: bool,
 }
 
 /// The most code lines a mark is reported with.
@@ -218,6 +258,85 @@ impl MarkInfo {
                 ));
             }
         }
+        for r in &self.replies {
+            let new = if r.new { " (new)" } else { "" };
+            out.push_str(&format!(
+                "\n    [{}] {} reply{new}: {}",
+                r.label, r.author, r.text
+            ));
+        }
+        out
+    }
+}
+
+/// A location as listed for an agent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationInfo {
+    /// "L3": its id in that viewer.
+    pub location: String,
+    /// "#142 Fix the parser" for a pull request, else the directory's name.
+    pub name: String,
+    pub dir: PathBuf,
+    /// What it shows, in words.
+    pub showing: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_screen: bool,
+    pub marks: usize,
+    /// The user's comments and replies.
+    pub comments: usize,
+    /// Those the agent has not read.
+    pub unread: usize,
+}
+
+impl LocationInfo {
+    pub fn render(&self) -> String {
+        let mut out = format!("{} {} · {}", self.location, self.name, self.dir.display());
+        if self.on_screen {
+            out.push_str(" · on screen");
+        }
+        if !self.showing.is_empty() {
+            out.push_str(&format!(" · {}", self.showing));
+        }
+        out.push_str(&match self.marks {
+            0 => " · no marks".to_string(),
+            1 => " · 1 mark".to_string(),
+            n => format!(" · {n} marks"),
+        });
+        if self.comments > 0 {
+            out.push_str(&format!(", {} by the user", self.comments));
+        }
+        if self.unread > 0 {
+            out.push_str(&format!(", {} unread", self.unread));
+        }
+        out
+    }
+}
+
+/// What a viewer answers a request for its locations with.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationsResult {
+    /// The viewer's id, as `codesnob status` lists it: "v1234".
+    pub viewer: String,
+    /// The one on screen first, then the most recently visited.
+    pub locations: Vec<LocationInfo>,
+}
+
+impl LocationsResult {
+    pub fn render(&self) -> String {
+        let n = self.locations.len();
+        let mut out = format!(
+            "viewer {}: {n} location{}, the one on screen first",
+            self.viewer,
+            if n == 1 { "" } else { "s" }
+        );
+        for l in &self.locations {
+            out.push('\n');
+            out.push_str(&l.render());
+        }
+        let unread: usize = self.locations.iter().map(|l| l.unread).sum();
+        if unread > 0 {
+            out.push_str("\nread unread comments with get_review and the location's id");
+        }
         out
     }
 }
@@ -248,11 +367,17 @@ impl ReviewResult {
             return out;
         }
         let comments = self.marks.iter().filter(|m| m.author == "user").count();
+        let replies: usize = self.marks.iter().map(|m| m.replies.len()).sum();
         out.push_str(&format!(
-            "\n{} mark{}, {comments} comment{} by the user{}",
+            "\n{} mark{}, {comments} comment{} by the user{}{}",
             self.marks.len(),
             if self.marks.len() == 1 { "" } else { "s" },
             if comments == 1 { "" } else { "s" },
+            match replies {
+                0 => String::new(),
+                1 => ", 1 reply".to_string(),
+                n => format!(", {n} replies"),
+            },
             match self.unread {
                 0 => String::new(),
                 n => format!(", {n} new"),
@@ -308,6 +433,52 @@ impl ClearResult {
             self.remaining,
             if self.remaining == 1 { "" } else { "s" },
             if self.remaining == 1 { "s" } else { "" }
+        )
+    }
+}
+
+/// What a viewer answers a reply with.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyResult {
+    pub location: String,
+    /// The reply's own label: "C1".
+    pub label: String,
+    pub unread: usize,
+}
+
+impl ReplyResult {
+    pub fn render(&self) -> String {
+        format!("replied [{}] on {}", self.label, self.location)
+    }
+}
+
+/// What a viewer answers moving a comment with.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveResult {
+    pub location: String,
+    pub label: String,
+    pub path: String,
+    pub start: usize,
+    pub end: usize,
+    pub unread: usize,
+}
+
+impl MoveResult {
+    pub fn lines_word(&self) -> String {
+        if self.start == self.end {
+            self.start.to_string()
+        } else {
+            format!("{}-{}", self.start, self.end)
+        }
+    }
+
+    pub fn render(&self) -> String {
+        format!(
+            "moved [{}] to {} {} on {}",
+            self.label,
+            self.path,
+            self.lines_word(),
+            self.location
         )
     }
 }
@@ -638,6 +809,50 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locations_render_one_line_each_the_one_on_screen_first() {
+        let mut r = LocationsResult {
+            viewer: "v7".to_string(),
+            locations: vec![
+                LocationInfo {
+                    location: "L2".to_string(),
+                    name: "#142 Fix the parser".to_string(),
+                    dir: PathBuf::from("/c/pr/142"),
+                    showing: "#142 Fix the parser · into main".to_string(),
+                    on_screen: true,
+                    ..Default::default()
+                },
+                LocationInfo {
+                    location: "L1".to_string(),
+                    name: "repo".to_string(),
+                    dir: PathBuf::from("/work/repo"),
+                    showing: "feature · 2 commits since main".to_string(),
+                    marks: 3,
+                    comments: 2,
+                    unread: 1,
+                    ..Default::default()
+                },
+            ],
+        };
+        assert_eq!(
+            r.render(),
+            "viewer v7: 2 locations, the one on screen first\n\
+             L2 #142 Fix the parser · /c/pr/142 · on screen · #142 Fix the parser · into main · no marks\n\
+             L1 repo · /work/repo · feature · 2 commits since main · 3 marks, 2 by the user, 1 unread\n\
+             read unread comments with get_review and the location's id"
+        );
+        r.locations.truncate(1);
+        assert!(
+            r.render().starts_with("viewer v7: 1 location,"),
+            "{}",
+            r.render()
+        );
+        assert!(
+            !r.render().contains("get_review"),
+            "nothing unread, no nudge"
+        );
+    }
 
     #[test]
     fn a_review_renders_one_line_per_mark_with_the_commented_code() {

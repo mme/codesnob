@@ -252,9 +252,37 @@ struct LocMark {
     seen: bool,
     /// The letter of the mark this comment answers.
     re: Option<String>,
+    /// The answers under a comment, oldest first: the agent's, and the
+    /// user's to those.
+    replies: Vec<Reply>,
+    /// How many replies were ever made under it: numbers are not reused.
+    replies_made: usize,
+}
+
+/// An answer under a comment, numbered after its letter: A1, A2…
+struct Reply {
+    /// Its number under the comment, fixed when it was made.
+    n: usize,
+    author: diffview::Author,
+    text: String,
+    /// An agent has read it since it was made or last edited. The agent's
+    /// own start read.
+    seen: bool,
 }
 
 impl LocMark {
+    /// Answer it, with the next number under its letter, which is returned.
+    fn add_reply(&mut self, author: diffview::Author, text: String) -> String {
+        self.replies_made += 1;
+        self.replies.push(Reply {
+            n: self.replies_made,
+            author,
+            text,
+            seen: author == diffview::Author::Agent,
+        });
+        format!("{}{}", self.label, self.replies_made)
+    }
+
     /// As reported to an agent.
     fn info(&self) -> crate::proto::MarkInfo {
         let user = self.author == diffview::Author::User;
@@ -275,6 +303,19 @@ impl LocMark {
             } else {
                 Vec::new()
             },
+            replies: self
+                .replies
+                .iter()
+                .map(|r| {
+                    let user = r.author == diffview::Author::User;
+                    crate::proto::ReplyInfo {
+                        label: format!("{}{}", self.label, r.n),
+                        author: if user { "user" } else { "agent" }.to_string(),
+                        text: r.text.clone(),
+                        new: user && !r.seen,
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -290,6 +331,15 @@ impl LocMark {
             stale: self.stale,
             old_side: self.old_side,
             re: self.re.clone(),
+            replies: self
+                .replies
+                .iter()
+                .map(|r| diffview::Reply {
+                    label: format!("{}{}", self.label, r.n),
+                    author: r.author,
+                    text: r.text.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -347,6 +397,15 @@ fn reanchor(
     gone
 }
 
+/// The number of reply `index` under the comment `seq` names.
+fn reply_number(loc: &Location, seq: usize, index: usize) -> Option<usize> {
+    loc.marks
+        .iter()
+        .find(|m| m.seq == seq)
+        .and_then(|m| m.replies.get(index))
+        .map(|r| r.n)
+}
+
 fn gone_message(gone: Vec<String>) -> Option<String> {
     match gone.as_slice() {
         [] => None,
@@ -359,6 +418,16 @@ fn gone_message(gone: Vec<String>) -> Option<String> {
                 .join(" ")
         )),
     }
+}
+
+/// What the comment prompt is for.
+enum Compose {
+    /// A comment on these lines: a new one, or the one being edited, by
+    /// its place in the order marks were made.
+    Comment(diffview::Region, Option<usize>),
+    /// A reply under the comment `seq` names: a new one, or the user's
+    /// reply being edited, by its number.
+    Reply { seq: usize, editing: Option<usize> },
 }
 
 /// A location's view, kept to return to.
@@ -404,8 +473,150 @@ impl Location {
             with_deletions: false,
             seen: author == diffview::Author::Agent,
             re: None,
+            replies: Vec::new(),
+            replies_made: 0,
         });
         self.marks.last_mut().expect("just pushed")
+    }
+
+    /// The mark a letter names, "C", by its place in the order marks were
+    /// made, and the reply under it when the letter names one, "C2", by
+    /// its number. Either case, with or without brackets.
+    fn find_label(&self, label: &str) -> Option<(usize, Option<usize>)> {
+        let label = label
+            .trim()
+            .trim_matches(['[', ']'])
+            .trim()
+            .to_ascii_uppercase();
+        let digits = label.trim_start_matches(|c: char| c.is_ascii_uppercase());
+        let letter = &label[..label.len() - digits.len()];
+        let m = self.marks.iter().find(|m| m.label == letter)?;
+        if digits.is_empty() {
+            return Some((m.seq, None));
+        }
+        let n: usize = digits.parse().ok()?;
+        m.replies
+            .iter()
+            .any(|r| r.n == n)
+            .then_some((m.seq, Some(n)))
+    }
+
+    /// What it shows, in words, without key hints: the files it is
+    /// narrowed to, then its range.
+    fn scope_words(&self) -> String {
+        let scope = self.range_words();
+        match &self.focus {
+            Focus::File(path) => format!("{path} only · {scope}"),
+            Focus::Files(paths) => format!("{} files only · {scope}", paths.len()),
+            Focus::All => scope,
+        }
+    }
+
+    /// What its range shows, in words: "feature · 2 commits since main".
+    fn range_words(&self) -> String {
+        let loc = self;
+        if let Some(code) = &loc.code {
+            let what = match code.files.as_slice() {
+                [one] => one.path.clone(),
+                many => format!("{} files", many.len()),
+            };
+            return match (&loc.code_rev, &code.rev) {
+                (Some(r), _) | (None, Some(r)) => format!("{what} @ {r}"),
+                (None, None) => format!("{what} · working tree"),
+            };
+        }
+        if let Some(p) = &loc.pr {
+            let n = p.spec.number;
+            let doing = if p.fetching {
+                "fetching"
+            } else {
+                "could not be opened"
+            };
+            let Some(info) = &p.info else {
+                return format!("#{n} · {doing}");
+            };
+            if !p.ready {
+                return format!("#{n} {} · {doing}", info.title);
+            }
+            match loc.range {
+                Range::Everything => {
+                    let mut s = format!("#{n} {} · into {}", info.title, info.base_ref_name);
+                    if info.is_draft {
+                        s.push_str(" · draft");
+                    }
+                    match info.state.as_str() {
+                        "MERGED" => s.push_str(" · merged"),
+                        "CLOSED" => s.push_str(" · closed"),
+                        _ => {}
+                    }
+                    return s;
+                }
+                Range::Uncommitted => return format!("#{n} · local edits"),
+                Range::Commit(_) | Range::Compare(..) => {}
+            }
+        }
+        if !loc.repo {
+            return format!("no repository · {}", loc.dir.display());
+        }
+        let Some(info) = &loc.info else {
+            return loc.dir.display().to_string();
+        };
+        let head = &info.head_label;
+        if info.unborn {
+            return format!("{head} · no commits yet");
+        }
+        match &loc.range {
+            Range::Everything => match &info.base.name {
+                None if info.dirty => format!("{head} · uncommitted changes"),
+                None => format!("{head} · no changes"),
+                Some(base) => {
+                    let n = info.commits.len();
+                    let mut parts = Vec::new();
+                    if n > 0 {
+                        let more = if info.commits_truncated { "+" } else { "" };
+                        let noun = if n == 1 && more.is_empty() {
+                            "commit"
+                        } else {
+                            "commits"
+                        };
+                        parts.push(format!("{n}{more} {noun}"));
+                    }
+                    if info.dirty {
+                        parts.push("uncommitted work".to_string());
+                    }
+                    if parts.is_empty() {
+                        format!("{head} · no changes since {base}")
+                    } else {
+                        format!("{head} · {} since {base}", parts.join(" and "))
+                    }
+                }
+            },
+            Range::Uncommitted => format!("{head} · uncommitted changes"),
+            Range::Compare(..) => format!(
+                "{head} · {}",
+                loc.range_label.as_deref().unwrap_or("comparison")
+            ),
+            Range::Commit(id) => {
+                let n = info.commits.len();
+                match info.commits.iter().position(|c| c.id == *id) {
+                    Some(i) => {
+                        let c = &info.commits[i];
+                        format!(
+                            "{COMMIT_ICON} commit {} of {n} · {} {}",
+                            i + 1,
+                            c.short,
+                            c.subject
+                        )
+                    }
+                    None => match &info.commit {
+                        Some(c) if c.id == *id => {
+                            format!("{COMMIT_ICON} {} {}", c.short, c.subject)
+                        }
+                        _ => format!("{head} · commit"),
+                    },
+                }
+            }
+        }
     }
 
     /// "L3": how agents name this location.
@@ -413,20 +624,30 @@ impl Location {
         format!("L{}", self.id)
     }
 
-    /// Comments no agent has read.
+    /// Comments and replies of the user's that no agent has read.
     fn unread(&self) -> usize {
+        let user = diffview::Author::User;
         self.marks
             .iter()
-            .filter(|m| m.author == diffview::Author::User && !m.seen)
-            .count()
+            .filter(|m| m.author == user)
+            .map(|m| {
+                usize::from(!m.seen)
+                    + m.replies
+                        .iter()
+                        .filter(|r| r.author == user && !r.seen)
+                        .count()
+            })
+            .sum()
     }
 
-    /// The user's comments here.
+    /// The user's comments here, and their replies under them.
     fn comments(&self) -> usize {
+        let user = diffview::Author::User;
         self.marks
             .iter()
-            .filter(|m| m.author == diffview::Author::User)
-            .count()
+            .filter(|m| m.author == user)
+            .map(|m| 1 + m.replies.iter().filter(|r| r.author == user).count())
+            .sum()
     }
 
     /// Has only ever shown a message: not a repository, a pull request
@@ -507,9 +728,8 @@ pub struct App {
     panel: Option<Panel>,
     /// Lines being marked for a comment: the row the marking started on.
     marking: Option<usize>,
-    /// The comment the prompt is for: its lines, and the comment being
-    /// edited, by its place in the order marks were made, if not new.
-    composing: Option<(diffview::Region, Option<usize>)>,
+    /// What the comment prompt is for.
+    composing: Option<Compose>,
     /// A question on the status bar, answered with y or n.
     confirm: Option<Confirm>,
     /// An agent's request to show something else, held while the user is
@@ -1987,6 +2207,7 @@ impl App {
     /// Answer an agent's query.
     fn answer(&mut self, query: crate::proto::ViewerQuery) -> Result<serde_json::Value, String> {
         match query {
+            crate::proto::ViewerQuery::Locations => Ok(serde_json::json!(self.locations_info())),
             crate::proto::ViewerQuery::Review { location } => {
                 let r = self.review(location.as_deref())?;
                 Ok(serde_json::json!(r))
@@ -1995,10 +2216,55 @@ impl App {
                 location,
                 which,
                 letters,
+                user_asked,
             } => {
-                let r = self.clear_marks(location.as_deref(), &which, &letters)?;
+                let r = self.clear_marks(location.as_deref(), &which, &letters, user_asked)?;
                 Ok(serde_json::json!(r))
             }
+            crate::proto::ViewerQuery::Reply {
+                location,
+                letter,
+                text,
+            } => {
+                let r = self.reply_to(location.as_deref(), &letter, &text)?;
+                Ok(serde_json::json!(r))
+            }
+            crate::proto::ViewerQuery::MoveComment {
+                location,
+                letter,
+                path,
+                start,
+                end,
+            } => {
+                let r = self.move_comment(location.as_deref(), &letter, path, start, end)?;
+                Ok(serde_json::json!(r))
+            }
+        }
+    }
+
+    /// Every location open here for an agent, the one on screen first.
+    fn locations_info(&self) -> crate::proto::LocationsResult {
+        let locations = self
+            .locations
+            .iter()
+            .enumerate()
+            .map(|(i, l)| crate::proto::LocationInfo {
+                location: l.label(),
+                name: match l.pr.as_ref().and_then(|p| p.info.as_ref()) {
+                    Some(info) => format!("{} {}", l.name(), info.title),
+                    None => l.name(),
+                },
+                dir: l.dir.clone(),
+                showing: l.scope_words(),
+                on_screen: i == 0,
+                marks: l.marks.len(),
+                comments: l.comments(),
+                unread: l.unread(),
+            })
+            .collect();
+        crate::proto::LocationsResult {
+            viewer: format!("v{}", std::process::id()),
+            locations,
         }
     }
 
@@ -2021,6 +2287,9 @@ impl App {
             .map(|m| {
                 let info = m.info();
                 m.seen = true;
+                for r in &mut m.replies {
+                    r.seen = true;
+                }
                 info
             })
             .collect();
@@ -2038,41 +2307,93 @@ impl App {
         Ok(result)
     }
 
+    /// Remove marks for an agent: the ones `letters` names, a reply alone
+    /// by its number, else `which` of the agent's highlights and replies
+    /// (mine), the user's comments (user) or all of them. The user's words
+    /// go only when `user_asked` says the user asked for that.
     fn clear_marks(
         &mut self,
         location: Option<&str>,
         which: &str,
         letters: &[String],
+        user_asked: bool,
     ) -> Result<crate::proto::ClearResult, String> {
         let current = self.cur().map(|l| l.id);
         let loc = self.location_by(location)?;
-        let goes = |m: &LocMark| {
-            if !letters.is_empty() {
-                return letters.iter().any(|l| l.eq_ignore_ascii_case(&m.label));
+        let user = diffview::Author::User;
+        // Whole marks, with the replies under them, by their place in the
+        // order marks were made; single replies as (that place, number).
+        let mut marks: Vec<usize> = Vec::new();
+        let mut replies: Vec<(usize, usize)> = Vec::new();
+        if letters.is_empty() {
+            for m in &loc.marks {
+                match which {
+                    "user" if m.author == user => marks.push(m.seq),
+                    "user" => {}
+                    "all" => marks.push(m.seq),
+                    _ if m.author == user => replies.extend(
+                        m.replies
+                            .iter()
+                            .filter(|r| r.author != user)
+                            .map(|r| (m.seq, r.n)),
+                    ),
+                    _ => marks.push(m.seq),
+                }
             }
-            match which {
-                "user" => m.author == diffview::Author::User,
-                "all" => true,
-                _ => m.author == diffview::Author::Agent,
+        } else {
+            for l in letters {
+                match loc.find_label(l) {
+                    Some((seq, None)) => marks.push(seq),
+                    Some((seq, Some(n))) => replies.push((seq, n)),
+                    None => {
+                        return Err(format!(
+                            "no mark [{}] on {}",
+                            l.trim().to_uppercase(),
+                            loc.label()
+                        ));
+                    }
+                }
             }
-        };
-        let cleared: Vec<String> = loc
-            .marks
-            .iter()
-            .filter(|m| goes(m))
-            .map(|m| m.label.clone())
-            .collect();
-        if let Some(missing) = letters
-            .iter()
-            .find(|l| !loc.marks.iter().any(|m| m.label.eq_ignore_ascii_case(l)))
-        {
+        }
+        let goes = |m: &LocMark| marks.contains(&m.seq);
+        let reply_goes = |m: &LocMark, r: &Reply| replies.contains(&(m.seq, r.n));
+        let mut cleared = Vec::new();
+        let mut theirs = Vec::new();
+        for m in &loc.marks {
+            if goes(m) {
+                cleared.push(m.label.clone());
+                if m.author == user {
+                    theirs.push(m.label.clone());
+                }
+                continue;
+            }
+            for r in m.replies.iter().filter(|r| reply_goes(m, r)) {
+                let label = format!("{}{}", m.label, r.n);
+                cleared.push(label.clone());
+                if r.author == user {
+                    theirs.push(label);
+                }
+            }
+        }
+        if !user_asked && !theirs.is_empty() {
+            let named: Vec<String> = theirs.iter().map(|l| format!("[{l}]")).collect();
+            let (are, they, go) = if theirs.len() == 1 {
+                ("is", "it", "goes")
+            } else {
+                ("are", "they", "go")
+            };
             return Err(format!(
-                "no mark [{}] on {}",
-                missing.to_uppercase(),
-                loc.label()
+                "{} {are} the user's: {they} {go} only when the user explicitly asks for \
+                 that (user_explicitly_asked_to_delete_comments). To say a comment is dealt \
+                 with, reply to it",
+                named.join(" ")
             ));
         }
         loc.marks.retain(|m| !goes(m));
+        for m in &mut loc.marks {
+            let seq = m.seq;
+            m.replies.retain(|r| !replies.contains(&(seq, r.n)));
+        }
         loc.view
             .set_marks(loc.marks.iter().map(LocMark::drawn).collect());
         let result = crate::proto::ClearResult {
@@ -2091,6 +2412,130 @@ impl App {
                     .collect::<Vec<_>>()
                     .join(" ")
             ));
+        }
+        Ok(result)
+    }
+
+    /// An agent's answer under one of the user's comments, numbered after
+    /// its letter. A letter naming a reply answers that reply's comment.
+    fn reply_to(
+        &mut self,
+        location: Option<&str>,
+        letter: &str,
+        text: &str,
+    ) -> Result<crate::proto::ReplyResult, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("a reply needs text".to_string());
+        }
+        let current = self.cur().map(|l| l.id);
+        let loc = self.location_by(location)?;
+        let Some((seq, _)) = loc.find_label(letter) else {
+            return Err(format!(
+                "no mark [{}] on {}",
+                letter.trim().to_uppercase(),
+                loc.label()
+            ));
+        };
+        let m = loc
+            .marks
+            .iter_mut()
+            .find(|m| m.seq == seq)
+            .expect("just found");
+        if m.author != diffview::Author::User {
+            return Err(format!(
+                "[{}] is your own highlight; replies go under the user's comments",
+                m.label
+            ));
+        }
+        let label = m.add_reply(diffview::Author::Agent, text.to_string());
+        loc.view
+            .set_marks(loc.marks.iter().map(LocMark::drawn).collect());
+        let result = crate::proto::ReplyResult {
+            location: loc.label(),
+            label,
+            unread: loc.unread(),
+        };
+        if Some(loc.id) == current {
+            self.message = Some(format!("agent replied [{}]", result.label));
+        }
+        Ok(result)
+    }
+
+    /// Move one of the user's comments to other lines, for an agent that
+    /// changed the code under it: to `start`-`end` of `path`, or of its own
+    /// file. It keeps its letter, its text and its replies.
+    fn move_comment(
+        &mut self,
+        location: Option<&str>,
+        letter: &str,
+        path: Option<String>,
+        start: usize,
+        end: usize,
+    ) -> Result<crate::proto::MoveResult, String> {
+        if start == 0 || end < start {
+            return Err(format!(
+                "lines {start}-{end}: lines start at 1 and run forward"
+            ));
+        }
+        let current = self.cur().map(|l| l.id);
+        let loc = self.location_by(location)?;
+        let found = loc.find_label(letter);
+        let Some((seq, None)) = found else {
+            let letter = letter.trim().to_uppercase();
+            return Err(match found {
+                Some((seq, Some(_))) => {
+                    let m = loc.marks.iter().find(|m| m.seq == seq).expect("found");
+                    format!(
+                        "[{letter}] is a reply; it moves with its comment, [{}]",
+                        m.label
+                    )
+                }
+                _ => format!("no mark [{letter}] on {}", loc.label()),
+            });
+        };
+        let m = loc
+            .marks
+            .iter_mut()
+            .find(|m| m.seq == seq)
+            .expect("just found");
+        if m.author != diffview::Author::User {
+            return Err(format!(
+                "[{}] is your own highlight; show it again to put it elsewhere",
+                m.label
+            ));
+        }
+        if let Some(path) = path {
+            m.path = path;
+        }
+        m.start = start;
+        m.end = end;
+        // Taken afresh from its new lines at the next load, which follows.
+        m.text = None;
+        m.stale = false;
+        m.old_side = false;
+        m.with_deletions = false;
+        let (label, path) = (m.label.clone(), m.path.clone());
+        let result = crate::proto::MoveResult {
+            location: loc.label(),
+            label,
+            path,
+            start,
+            end,
+            unread: loc.unread(),
+        };
+        loc.view
+            .set_marks(loc.marks.iter().map(LocMark::drawn).collect());
+        loc.fingerprint = 0;
+        loc.code_fp = 0;
+        if Some(loc.id) == current {
+            self.message = Some(format!(
+                "agent moved [{}] to {} {}",
+                result.label,
+                result.path,
+                result.lines_word()
+            ));
+            self.request();
         }
         Ok(result)
     }
@@ -2650,7 +3095,13 @@ impl App {
             Action::Commits => has_info,
             Action::NextMark | Action::PrevMark => loc.view.has_marks(),
             Action::Comment | Action::MarkRegion => has_rows,
-            Action::EditComment | Action::DeleteComment => loc.view.comment_at_cursor().is_some(),
+            Action::EditComment | Action::DeleteComment => {
+                loc.view.comment_at_cursor().is_some()
+                    || loc
+                        .view
+                        .reply_at_cursor()
+                        .is_some_and(|(_, _, r)| r.author == diffview::Author::User)
+            }
             Action::ClearComments => loc.comments() > 0,
             Action::OlderCommit | Action::NewerCommit => loc
                 .info
@@ -2749,6 +3200,14 @@ impl App {
     /// the cursor is on.
     fn comment_here(&mut self) {
         let Some(loc) = self.cur() else { return };
+        // On a reply: the user's own is edited, the agent's answered.
+        if let Some((seq, r, reply)) = loc.view.reply_at_cursor() {
+            let editing = (reply.author == diffview::Author::User)
+                .then(|| reply_number(loc, seq, r))
+                .flatten();
+            self.compose_reply(seq, editing);
+            return;
+        }
         let cursor = loc.view.cursor();
         if let Some(seq) = loc.view.comment_at_cursor()
             && loc.view.region(cursor, cursor).is_none()
@@ -2809,7 +3268,30 @@ impl App {
         panel.set_input(text);
         panel.note = Some(note);
         self.panel = Some(panel);
-        self.composing = Some((region, editing));
+        self.composing = Some(Compose::Comment(region, editing));
+    }
+
+    /// Open the prompt for a reply under comment `seq`: a new one, or the
+    /// user's reply numbered `editing`, whose text is put up to change.
+    fn compose_reply(&mut self, seq: usize, editing: Option<usize>) {
+        let Some(m) = self
+            .cur()
+            .and_then(|l| l.marks.iter().find(|m| m.seq == seq))
+        else {
+            return;
+        };
+        let (text, note) = match editing.and_then(|n| m.replies.iter().find(|r| r.n == n)) {
+            Some(r) => (
+                r.text.clone(),
+                format!("[{}{}] under [{}]", m.label, r.n, m.label),
+            ),
+            None => (String::new(), format!("reply under [{}]", m.label)),
+        };
+        let mut panel = Panel::new(panel::Kind::Comment, Vec::new(), Vec::new(), None);
+        panel.set_input(text);
+        panel.note = Some(note);
+        self.panel = Some(panel);
+        self.composing = Some(Compose::Reply { seq, editing });
     }
 
     fn edit(&mut self, seq: usize) {
@@ -2830,18 +3312,49 @@ impl App {
     }
 
     fn edit_comment(&mut self) {
+        if let Some(loc) = self.cur()
+            && let Some((seq, r, reply)) = loc.view.reply_at_cursor()
+        {
+            if reply.author == diffview::Author::User {
+                let n = reply_number(loc, seq, r);
+                self.compose_reply(seq, n);
+            } else {
+                self.message = Some("the agent's reply; Enter answers it".to_string());
+            }
+            return;
+        }
         match self.cur().and_then(|l| l.view.comment_at_cursor()) {
             Some(seq) => self.edit(seq),
             None => self.message = Some("no comment of yours here".to_string()),
         }
     }
 
-    /// The prompt was answered: a new comment, or new text for one.
+    /// The prompt was answered: a new comment or reply, or new text for one.
     fn save_comment(&mut self, text: String) {
-        let Some((region, editing)) = self.composing.take() else {
+        let Some(compose) = self.composing.take() else {
             return;
         };
         let Some(loc) = self.cur_mut() else { return };
+        let (region, editing) = match compose {
+            Compose::Comment(region, editing) => (region, editing),
+            Compose::Reply { seq, editing } => {
+                let Some(m) = loc.marks.iter_mut().find(|m| m.seq == seq) else {
+                    return;
+                };
+                let label = match editing.and_then(|n| m.replies.iter_mut().find(|r| r.n == n)) {
+                    Some(r) => {
+                        r.text = text;
+                        r.seen = false;
+                        format!("{}{}", m.label, r.n)
+                    }
+                    None => m.add_reply(diffview::Author::User, text),
+                };
+                loc.view
+                    .set_marks(loc.marks.iter().map(LocMark::drawn).collect());
+                self.message = Some(format!("[{label}] saved"));
+                return;
+            }
+        };
         let note = Some(text);
         let label = match editing.and_then(|seq| loc.marks.iter_mut().find(|m| m.seq == seq)) {
             Some(m) => {
@@ -2871,6 +3384,22 @@ impl App {
 
     fn delete_comment(&mut self) {
         let Some(loc) = self.cur_mut() else { return };
+        if let Some((seq, r, reply)) = loc.view.reply_at_cursor() {
+            if reply.author != diffview::Author::User {
+                self.message = Some("no comment of yours here".to_string());
+                return;
+            }
+            let label = reply.label.clone();
+            if let Some(m) = loc.marks.iter_mut().find(|m| m.seq == seq)
+                && r < m.replies.len()
+            {
+                m.replies.remove(r);
+            }
+            loc.view
+                .set_marks(loc.marks.iter().map(LocMark::drawn).collect());
+            self.message = Some(format!("[{label}] removed"));
+            return;
+        }
         let Some(seq) = loc.view.comment_at_cursor() else {
             self.message = Some("no comment of yours here".to_string());
             return;
@@ -3091,123 +3620,11 @@ impl App {
 
     /// What the screen shows, for an agent: the scope without key hints.
     fn scope_words(&self) -> String {
-        let scope = self.range_scope();
-        let Some(loc) = self.cur() else {
-            return scope;
-        };
-        match &loc.focus {
-            Focus::File(path) => format!("{path} only · {scope}"),
-            Focus::Files(paths) => format!("{} files only · {scope}", paths.len()),
-            Focus::All => scope,
-        }
+        self.cur().map(Location::scope_words).unwrap_or_default()
     }
 
     fn range_scope(&self) -> String {
-        let Some(loc) = self.cur() else {
-            return String::new();
-        };
-        if let Some(code) = &loc.code {
-            let what = match code.files.as_slice() {
-                [one] => one.path.clone(),
-                many => format!("{} files", many.len()),
-            };
-            return match (&loc.code_rev, &code.rev) {
-                (Some(r), _) | (None, Some(r)) => format!("{what} @ {r}"),
-                (None, None) => format!("{what} · working tree"),
-            };
-        }
-        if let Some(p) = &loc.pr {
-            let n = p.spec.number;
-            let doing = if p.fetching {
-                "fetching"
-            } else {
-                "could not be opened"
-            };
-            let Some(info) = &p.info else {
-                return format!("#{n} · {doing}");
-            };
-            if !p.ready {
-                return format!("#{n} {} · {doing}", info.title);
-            }
-            match loc.range {
-                Range::Everything => {
-                    let mut s = format!("#{n} {} · into {}", info.title, info.base_ref_name);
-                    if info.is_draft {
-                        s.push_str(" · draft");
-                    }
-                    match info.state.as_str() {
-                        "MERGED" => s.push_str(" · merged"),
-                        "CLOSED" => s.push_str(" · closed"),
-                        _ => {}
-                    }
-                    return s;
-                }
-                Range::Uncommitted => return format!("#{n} · local edits"),
-                Range::Commit(_) | Range::Compare(..) => {}
-            }
-        }
-        if !loc.repo {
-            return format!("no repository · {}", loc.dir.display());
-        }
-        let Some(info) = &loc.info else {
-            return loc.dir.display().to_string();
-        };
-        let head = &info.head_label;
-        if info.unborn {
-            return format!("{head} · no commits yet");
-        }
-        match &loc.range {
-            Range::Everything => match &info.base.name {
-                None if info.dirty => format!("{head} · uncommitted changes"),
-                None => format!("{head} · no changes"),
-                Some(base) => {
-                    let n = info.commits.len();
-                    let mut parts = Vec::new();
-                    if n > 0 {
-                        let more = if info.commits_truncated { "+" } else { "" };
-                        let noun = if n == 1 && more.is_empty() {
-                            "commit"
-                        } else {
-                            "commits"
-                        };
-                        parts.push(format!("{n}{more} {noun}"));
-                    }
-                    if info.dirty {
-                        parts.push("uncommitted work".to_string());
-                    }
-                    if parts.is_empty() {
-                        format!("{head} · no changes since {base}")
-                    } else {
-                        format!("{head} · {} since {base}", parts.join(" and "))
-                    }
-                }
-            },
-            Range::Uncommitted => format!("{head} · uncommitted changes"),
-            Range::Compare(..) => format!(
-                "{head} · {}",
-                loc.range_label.as_deref().unwrap_or("comparison")
-            ),
-            Range::Commit(id) => {
-                let n = info.commits.len();
-                match info.commits.iter().position(|c| c.id == *id) {
-                    Some(i) => {
-                        let c = &info.commits[i];
-                        format!(
-                            "{COMMIT_ICON} commit {} of {n} · {} {}",
-                            i + 1,
-                            c.short,
-                            c.subject
-                        )
-                    }
-                    None => match &info.commit {
-                        Some(c) if c.id == *id => {
-                            format!("{COMMIT_ICON} {} {}", c.short, c.subject)
-                        }
-                        _ => format!("{head} · commit"),
-                    },
-                }
-            }
-        }
+        self.cur().map(Location::range_words).unwrap_or_default()
     }
 
     /// The centered text shown instead of a diff, if any.
