@@ -14,9 +14,9 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
 
 /// Light lettering on a paper-white sticker, for dark terminals.
-const ON_DARK: &[u8] = include_bytes!("../../assets/codesnob-dark.png");
+pub(super) const ON_DARK: &[u8] = include_bytes!("../../assets/codesnob-dark.png");
 /// Black lettering, for light terminals.
-const ON_LIGHT: &[u8] = include_bytes!("../../assets/codesnob-transparent.png");
+pub(super) const ON_LIGHT: &[u8] = include_bytes!("../../assets/codesnob-transparent.png");
 
 /// How long a terminal gets to answer what it can show.
 const QUERY_TIMEOUT: Duration = Duration::from_millis(500);

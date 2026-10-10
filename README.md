@@ -244,6 +244,45 @@ fetched, no repository), the viewer says so in one line in the middle of the
 screen. In terminals that can show images (Sixel, kitty or iTerm2, such as
 foot, kitty, WezTerm or Ghostty), the codesnob sticker sits above that line.
 
+### In a window of its own
+
+`codesnob --gui` opens the same viewer as a desktop app: every key,
+command, location, mark and agent request works as described here, drawn
+with native views instead of a terminal's grid.
+
+- **The view**: file headers and hunks are bars, line numbers sit in columns
+  and marks in coloured badges beside them. Highlights and comments are
+  cards whose text wraps, with their replies under them; hovering a card
+  offers Reply, or Edit and Delete for yours. The view scrolls by the pixel
+  and has scroll bars that show while scrolling, the right one with where
+  the marks are.
+- **Touchpads**: a swipe flings on when the fingers lift, slowing as in
+  Chrome, and stops when they touch the pad again. That takes Wayland's
+  hold gesture; on X11, which has none, a fling is a short glide instead.
+- **Comments**: Enter (or clicking left of a line's number) opens an editor
+  under the lines, where the comment wraps as you type; Shift-Enter starts a
+  new line, Enter saves, Esc cancels. Prompts and lists float above the
+  status bar and take clicks.
+- **Fonts**: code in your terminal's font at its size, read from the default
+  terminal's configuration (foot, Ghostty, kitty or Alacritty), and the rest
+  in the desktop's sans-serif. `--font`, `--font-size` and `--ui-font` pick
+  others.
+- **Colors**: on [Omarchy](https://omarchy.org) the window takes the current
+  theme's colors, light or dark, and follows when you switch themes; the
+  default `base16` syntax theme is drawn in them, as in a themed terminal.
+  Elsewhere it uses Tomorrow Night, or Tomorrow with `--light`.
+- **Selecting and copying**: drag to select, double-click for a word,
+  triple-click for a line. Copying lines of code leaves their numbers
+  behind. What you select is the primary selection, which middle-click
+  pastes. `Ctrl-C` (or `Ctrl-Shift-C`, `Ctrl-Insert`) copies and `Ctrl-V`
+  (or `Ctrl-Shift-V`, `Shift-Insert`) pastes into a prompt, so Omarchy's
+  `Super-C` and `Super-V` work too. In the window these keys no longer quit or
+  page down; `q` quits.
+
+The window needs a codesnob built with it, see
+[Building from source](#building-from-source). Its window class is
+`codesnob`, for window rules.
+
 ## Keys
 
 Every command is also in the command list, `:` or `Ctrl-K`. The viewer
@@ -302,7 +341,7 @@ moves the cursor to it, and the mouse wheel scrolls.
 | Key | Does |
 |---|---|
 | `:`, `Ctrl-K` | command list |
-| `q`, `Ctrl-C` | quit |
+| `q`, `Ctrl-C` | quit (`q` alone in the window, where `Ctrl-C` copies) |
 
 ## Command line
 
@@ -321,6 +360,9 @@ directory).
 | `--list-themes` | print the available themes |
 | `--light` | colors for a light terminal background |
 | `--stat` | print the detected base and a per-file summary instead of opening the viewer |
+| `--gui` | open the viewer [in a window of its own](#in-a-window-of-its-own) |
+| `--font NAME`, `--font-size PX` | the window's font for code (default: your terminal's) |
+| `--ui-font NAME` | the window's font around the code (default: the desktop's sans-serif) |
 
 The subcommands talk to viewers that are already running:
 
@@ -359,13 +401,23 @@ With a recent stable Rust toolchain:
 cargo install --git https://github.com/mme/codesnob
 ```
 
+The window (`--gui`) is a build feature for Linux, off by default because it
+links the desktop's libraries (xkbcommon, fontconfig, Vulkan, Wayland and
+X11), which headless machines and the release binaries do without:
+
+```sh
+cargo install --git https://github.com/mme/codesnob --features gui
+```
+
 Or from a checkout, with [just](https://github.com/casey/just):
 
 ```
-just install    # release build into ~/.local/bin
+just install    # release build into ~/.local/bin, with the window on Linux
 just test
 just lint
 ```
+
+`just gui= install` leaves the window out, for a machine without a desktop.
 
 ### Releasing
 

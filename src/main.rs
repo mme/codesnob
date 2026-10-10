@@ -56,6 +56,24 @@ struct Args {
     /// Print the detected base and a per-file summary instead of opening the viewer.
     #[arg(long)]
     stat: bool,
+
+    /// Open the viewer in a window of its own instead of the terminal.
+    #[arg(long)]
+    gui: bool,
+
+    /// The window's font for code (with --gui); default: your terminal's.
+    #[arg(long)]
+    font: Option<String>,
+
+    /// The window's code font size in pixels (with --gui); default: your
+    /// terminal's.
+    #[arg(long)]
+    font_size: Option<f32>,
+
+    /// The window's font around the code (with --gui); default: the
+    /// desktop's sans-serif.
+    #[arg(long)]
+    ui_font: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -232,8 +250,19 @@ fn main() -> Result<()> {
         };
     }
 
+    if args.gui && !cfg!(feature = "gui") {
+        anyhow::bail!("this codesnob was built without the window; build it with --features gui");
+    }
+    #[cfg(feature = "gui")]
+    let theme = args.gui.then(|| ui::gui::theme::Theme::detect(args.light));
+
     let hl = highlight::Highlighter::new(&args.theme).map_err(anyhow::Error::msg)?;
-    let palette = if args.light {
+    // In the window, a light desktop theme asks for light colors too.
+    #[cfg(feature = "gui")]
+    let light = args.light || theme.as_ref().is_some_and(|t| t.light);
+    #[cfg(not(feature = "gui"))]
+    let light = args.light;
+    let palette = if light {
         ui::Palette::light()
     } else {
         ui::Palette::dark()
@@ -262,6 +291,16 @@ fn main() -> Result<()> {
         repo,
     });
     link::spawn(tx.clone(), link);
+    #[cfg(feature = "gui")]
+    if let Some(theme) = theme {
+        let opts = ui::gui::Options {
+            font: args.font,
+            font_size: args.font_size,
+            ui_font: args.ui_font,
+            light: args.light,
+        };
+        return ui::gui::run(app, rx, theme, opts);
+    }
     ui::run(app, rx, tx)
 }
 

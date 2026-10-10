@@ -1,14 +1,18 @@
+# The window (`--gui`), built on Linux; `just gui= install` leaves it out,
+# for machines without a desktop.
+gui := if os() == "linux" { "--features gui" } else { "" }
+
 default:
     @just --list
 
 build:
     cargo build
 
-# Build a release codesnob into ~/.local/bin (override with CODESNOB_PREFIX)
+# Build a release codesnob, with the window on Linux, into ~/.local/bin (override with CODESNOB_PREFIX)
 install:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build --release
+    cargo build --release {{gui}}
     prefix="${CODESNOB_PREFIX:-$HOME/.local/bin}"
     mkdir -p "$prefix"
     # to a temp name first, then rename: installing over a running viewer or
@@ -32,9 +36,11 @@ uninstall:
 
 test:
     cargo test
+    if [ -n "{{gui}}" ]; then cargo test {{gui}}; fi
 
 lint:
     cargo clippy --all-targets -- -D warnings
+    if [ -n "{{gui}}" ]; then cargo clippy --all-targets {{gui}} -- -D warnings; fi
     cargo fmt --all --check
 
 fmt:

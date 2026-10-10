@@ -237,6 +237,41 @@ impl Panel {
         Outcome::Stay
     }
 
+    /// The rows in sight in a list `rows` tall, top to bottom, with whether
+    /// each is the highlighted one; the list scrolls to keep it in sight.
+    pub fn visible(&mut self, rows: usize) -> Vec<(&Item, bool)> {
+        if self.selected < self.offset {
+            self.offset = self.selected;
+        } else if self.selected >= self.offset + rows {
+            self.offset = (self.selected + 1).saturating_sub(rows);
+        }
+        self.shown
+            .iter()
+            .enumerate()
+            .skip(self.offset)
+            .take(rows)
+            .map(|(n, &i)| (&self.items[i], n == self.selected))
+            .collect()
+    }
+
+    /// Highlight the row `n` places below the top of those in sight.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn select_visible(&mut self, n: usize) {
+        if self.offset + n < self.shown.len() {
+            self.selected = self.offset + n;
+        }
+    }
+
+    /// What an empty list says instead.
+    pub fn empty_hint(&self) -> &'static str {
+        match self.kind {
+            Kind::Open if self.items.is_empty() => "  type a path, Tab completes",
+            Kind::Open => "  Enter opens the path",
+            Kind::Comment => "  Enter saves, Esc cancels",
+            _ => "  no matches",
+        }
+    }
+
     /// Rows the panel wants for an area of `height` lines above the status bar.
     pub fn height_for(height: u16) -> u16 {
         let want = (height / 3).clamp(6, 14);
@@ -272,24 +307,14 @@ impl Panel {
 
         // The list.
         let rows = area.height.saturating_sub(1) as usize;
-        if self.selected < self.offset {
-            self.offset = self.selected;
-        } else if self.selected >= self.offset + rows {
-            self.offset = self.selected + 1 - rows;
+        let (kind, empty) = (self.kind, self.empty_hint());
+        let shown = self.visible(rows);
+        if shown.is_empty() {
+            buf.set_span(area.x, area.y + 1, &Span::styled(empty, dim), area.width);
         }
-        if self.shown.is_empty() {
-            let text = match self.kind {
-                Kind::Open if self.items.is_empty() => "  type a path, Tab completes",
-                Kind::Open => "  Enter opens the path",
-                Kind::Comment => "  Enter saves, Esc cancels",
-                _ => "  no matches",
-            };
-            buf.set_span(area.x, area.y + 1, &Span::styled(text, dim), area.width);
-        }
-        for (n, &i) in self.shown.iter().skip(self.offset).take(rows).enumerate() {
+        for (n, (item, selected)) in shown.into_iter().enumerate() {
             let y = area.y + 1 + n as u16;
             let row = Rect::new(area.x, y, area.width, 1);
-            let selected = self.offset + n == self.selected;
             let style = if selected {
                 Style::default()
                     .bg(p.header_bg)
@@ -299,14 +324,13 @@ impl Panel {
             };
             buf.set_style(row, style);
             let marker = if selected { "› " } else { "  " };
-            let item = &self.items[i];
             let mut spans = vec![Span::styled(marker, style.fg(p.hunk_fg))];
             if let Some((tag, color)) = &item.tag {
                 spans.push(Span::styled(format!("{tag} "), style.fg(*color)));
             }
             spans.push(Span::styled(item.text.clone(), style));
             // Commands show their shortcut right after the name: "Open… [o]".
-            if self.kind == Kind::Commands && !item.hint.is_empty() {
+            if kind == Kind::Commands && !item.hint.is_empty() {
                 spans.push(Span::styled(
                     format!(" [{}]", item.hint),
                     style.fg(p.key_fg).add_modifier(Modifier::BOLD),
@@ -314,7 +338,7 @@ impl Panel {
             }
             buf.set_line(area.x, y, &Line::from(spans), area.width);
             // Other lists show details such as counts and ages on the right.
-            if self.kind != Kind::Commands && !item.hint.is_empty() {
+            if kind != Kind::Commands && !item.hint.is_empty() {
                 let hw = item.hint.chars().count() as u16;
                 if area.width > hw + 12 {
                     buf.set_span(

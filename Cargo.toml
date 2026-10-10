@@ -14,7 +14,10 @@ gix = { version = "0.88", default-features = false, features = ["sha1", "max-per
 imara-diff = "0.2"
 # Decodes the sticker drawn on the empty screen.
 image = { version = "0.25", default-features = false, features = ["png"] }
-libc = "0.2.190"
+# Pinned: 0.2.190 dropped ENOATTR, which GPUI's tar dependency (xattr 0.2)
+# needs, and `cargo install` would otherwise resolve past it. Unpin when GPUI
+# moves on.
+libc = "=0.2.189"
 # FSEvents on macOS; without it notify falls back to 30-second polling there.
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 nucleo-matcher = "0.3.1"
@@ -27,3 +30,19 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-default-fancy"] }
+# The windowed viewer behind `--gui`, and the channel that brings the
+# viewer's messages onto its thread.
+futures = { version = "0.3", optional = true }
+gpui = { version = "0.2.2", optional = true }
+
+[features]
+# The windowed viewer, `codesnob --gui`. Off by default: GPUI links the
+# desktop's libraries, which headless machines and release binaries lack.
+gui = ["dep:gpui", "dep:futures"]
+
+# GPUI 0.2.2 with a Wayland patch: it hears the touchpad's "fingers lifted"
+# (axis_stop) and "fingers resting" (the hold gesture), so a fling starts
+# and stops when the fingers say. The patch is marked `codesnob:` in
+# vendor/gpui/src/platform/linux/wayland/client.rs.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }

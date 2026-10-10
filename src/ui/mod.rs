@@ -6,6 +6,8 @@
 
 mod commands;
 mod diffview;
+#[cfg(feature = "gui")]
+pub mod gui;
 mod logo;
 mod markdown;
 mod panel;
@@ -747,6 +749,11 @@ pub struct App {
     marking: Option<usize>,
     /// What the comment prompt is for.
     composing: Option<Compose>,
+    /// How many rows a windowed front end's open list shows, which a page
+    /// in it moves by; the terminal's own count when `None`.
+    pub list_rows: Option<usize>,
+    /// How tall a windowed front end draws rows; `None` in the terminal.
+    pub measure: Option<std::rc::Rc<dyn diffview::Measure>>,
     /// A question on the status bar, answered with y or n.
     confirm: Option<Confirm>,
     /// An agent's request to show something else, held while the user is
@@ -795,6 +802,8 @@ impl App {
             panel: None,
             marking: None,
             composing: None,
+            list_rows: None,
+            measure: None,
             confirm: None,
             pending_show: None,
             origin: None,
@@ -845,7 +854,7 @@ impl App {
             marks_made: 0,
             place_pending: false,
             focus: Focus::All,
-            view: DiffView::default(),
+            view: DiffView::new(self.measure.clone()),
             info: None,
             _watch: None,
             mode: Mode::Off,
@@ -988,7 +997,7 @@ impl App {
             marks_made: 0,
             place_pending: false,
             focus: Focus::All,
-            view: DiffView::default(),
+            view: DiffView::new(self.measure.clone()),
             info: None,
             _watch: None,
             mode: Mode::Off,
@@ -1739,40 +1748,65 @@ impl App {
                     p.paste(&text);
                 }
             }
-            Event::Mouse(m) => {
-                let delta: isize = match m.kind {
-                    MouseEventKind::ScrollDown => 3,
-                    MouseEventKind::ScrollUp => -3,
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        if self.panel.is_none()
-                            && let Some(y) = m.row.checked_sub(self.body_y)
-                            && let Some(loc) = self.cur_mut()
-                        {
-                            loc.view.click(y as usize);
-                        }
-                        return;
-                    }
-                    _ => return,
-                };
-                match self.panel.as_mut() {
-                    Some(p) => {
-                        let before = p.selected_key();
-                        p.move_by(delta.signum());
-                        self.preview(before);
-                    }
-                    None => {
-                        if let Some(loc) = self.cur_mut() {
-                            loc.view.scroll_by(delta);
-                        }
+            Event::Mouse(m) => match m.kind {
+                MouseEventKind::ScrollDown => self.wheel(3),
+                MouseEventKind::ScrollUp => self.wheel(-3),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(y) = m.row.checked_sub(self.body_y) {
+                        self.click(y as usize);
                     }
                 }
-            }
+                _ => {}
+            },
             _ => {}
         }
     }
 
+    /// Put `text` in the open panel's input, as typing it would: the list
+    /// filters, and moving its highlight previews.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn set_panel_input(&mut self, text: String) {
+        let Some(p) = self.panel.as_mut().filter(|p| p.input() != text) else {
+            return;
+        };
+        let before = p.selected_key();
+        p.set_input(text);
+        self.preview(before);
+    }
+
+    /// The mouse wheel, `delta` rows down: the open panel's highlight moves
+    /// one row, or else the view scrolls.
+    pub fn wheel(&mut self, delta: isize) {
+        match self.panel.as_mut() {
+            Some(p) => {
+                let before = p.selected_key();
+                p.move_by(delta.signum());
+                self.preview(before);
+            }
+            None => {
+                if let Some(loc) = self.cur_mut() {
+                    loc.view.scroll_by(delta);
+                }
+            }
+        }
+    }
+
+    /// A click on the row `y` rows below the top of the body moves the
+    /// cursor there, unless a panel is open.
+    pub fn click(&mut self, y: usize) {
+        if self.panel.is_none()
+            && let Some(loc) = self.cur_mut()
+        {
+            loc.view.click(y);
+        }
+    }
+
     fn panel_rows(&self) -> usize {
-        Panel::height_for(self.body_h as u16).saturating_sub(1) as usize
+        if let Some(rows) = self.list_rows {
+            return rows;
+        }
+        let lines = self.cur().map_or(self.body_h, |l| l.view.lines());
+        Panel::height_for(lines as u16).saturating_sub(1) as usize
     }
 
     fn key(&mut self, k: KeyEvent) {
@@ -1878,11 +1912,9 @@ impl App {
                 _ => {}
             }
         }
-        let page = self.body_h.saturating_sub(2).max(1) as isize;
-        let half = (self.body_h / 2).max(1) as isize;
-        let scroll = |app: &mut App, d: isize| {
+        let page = |app: &mut App, down: bool, half: bool| {
             if let Some(loc) = app.cur_mut() {
-                loc.view.scroll_by(d);
+                loc.view.page(down, half);
             }
         };
         let step = |app: &mut App, d: isize| {
@@ -1940,12 +1972,12 @@ impl App {
             | (KeyCode::Char('p'), true, false) => step(self, -1),
             (KeyCode::PageDown, _, _)
             | (KeyCode::Char(' '), false, false)
-            | (KeyCode::Char('v'), true, false) => scroll(self, page),
+            | (KeyCode::Char('v'), true, false) => page(self, true, false),
             (KeyCode::PageUp, _, _)
             | (KeyCode::Backspace, _, _)
-            | (KeyCode::Char('v'), false, true) => scroll(self, -page),
-            (KeyCode::Char('d'), true, false) => scroll(self, half),
-            (KeyCode::Char('u'), true, false) => scroll(self, -half),
+            | (KeyCode::Char('v'), false, true) => page(self, false, false),
+            (KeyCode::Char('d'), true, false) => page(self, true, true),
+            (KeyCode::Char('u'), true, false) => page(self, false, true),
 
             (KeyCode::Home, _, _)
             | (KeyCode::Char('g'), false, false)
@@ -3726,38 +3758,20 @@ impl App {
 
     // ---- rendering -----------------------------------------------------------
 
-    pub fn draw(&mut self, frame: &mut Frame) {
-        let area = frame.area();
-        if area.height < 2 || area.width < 4 {
-            return;
-        }
-        let status = Rect::new(area.x, area.bottom() - 1, area.width, 1);
-        let mut body = Rect::new(area.x, area.y, area.width, area.height - 1);
-        let panel_h = if self.panel.is_some() {
-            Panel::height_for(body.height)
-        } else {
-            0
-        };
-        let panel_area = Rect::new(body.x, body.bottom() - panel_h, body.width, panel_h);
-        body.height -= panel_h;
-        // The banner for a held request takes the top line of the body.
-        let banner = self.pending_show.as_ref().map(|p| {
-            let banner = Rect::new(body.x, body.y, body.width, 1);
-            body.y += 1;
-            body.height = body.height.saturating_sub(1);
-            (banner, p.words.clone())
-        });
-        self.body_h = body.height as usize;
-        self.body_y = body.y;
+    /// Lay out for a body `width` cells wide and `height` rows tall, before
+    /// it is drawn: the description wrapped to fit, and the view told what
+    /// is in sight.
+    pub fn prepare(&mut self, width: u16, height: usize) {
+        self.body_h = height;
         let rebuild = self
             .cur()
-            .is_some_and(|l| l.desc_dirty || l.desc_width != body.width);
+            .is_some_and(|l| l.desc_dirty || l.desc_width != width);
         if rebuild {
-            let lines = self.description(body.width);
+            let lines = self.description(width);
             if let Some(loc) = self.locations.first_mut() {
                 loc.view.set_description(lines);
                 loc.desc_dirty = false;
-                loc.desc_width = body.width;
+                loc.desc_width = width;
             }
         }
         let marking = self.marking;
@@ -3783,6 +3797,31 @@ impl App {
                 }
             }
         }
+    }
+
+    pub fn draw(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        if area.height < 2 || area.width < 4 {
+            return;
+        }
+        let status = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+        let mut body = Rect::new(area.x, area.y, area.width, area.height - 1);
+        let panel_h = if self.panel.is_some() {
+            Panel::height_for(body.height)
+        } else {
+            0
+        };
+        let panel_area = Rect::new(body.x, body.bottom() - panel_h, body.width, panel_h);
+        body.height -= panel_h;
+        // The banner for a held request takes the top line of the body.
+        let banner = self.pending_show.as_ref().map(|p| {
+            let banner = Rect::new(body.x, body.y, body.width, 1);
+            body.y += 1;
+            body.height = body.height.saturating_sub(1);
+            (banner, p.words.clone())
+        });
+        self.body_y = body.y;
+        self.prepare(body.width, body.height as usize);
 
         let info = self.mode_label();
         let buf = frame.buffer_mut();
@@ -3854,29 +3893,58 @@ impl App {
     fn render_status(&self, area: Rect, buf: &mut Buffer) {
         let style = Style::default().add_modifier(Modifier::REVERSED);
         buf.set_style(area, style);
+        match self.status() {
+            Status::Strip(names) => {
+                let mut spans = vec![Span::styled(" ", style)];
+                for (n, (name, here)) in names.iter().enumerate() {
+                    let Some(name) = name else { continue };
+                    if n > 0 {
+                        spans.push(Span::styled(" · ", style));
+                    }
+                    let name = format!(" {name} ");
+                    spans.push(if *here {
+                        Span::styled(name, Style::default().add_modifier(Modifier::BOLD))
+                    } else {
+                        Span::styled(name, style)
+                    });
+                }
+                buf.set_line(area.x, area.y, &Line::from(spans), area.width);
+            }
+            Status::Whole(text) => {
+                buf.set_span(area.x, area.y, &Span::styled(text, style), area.width);
+            }
+            Status::Parts(parts) => {
+                let left = format!(" {}", parts.scope);
+                let right = parts.right();
+                let rw = right.chars().count() as u16;
+                let lw = area.width.saturating_sub(rw);
+                buf.set_span(area.x, area.y, &Span::styled(left, style), lw);
+                if area.width > rw {
+                    buf.set_span(area.right() - rw, area.y, &Span::styled(right, style), rw);
+                }
+            }
+        }
+    }
+
+    /// What the status bar says.
+    fn status(&self) -> Status {
         if let Some(flip) = self.flip.as_ref().filter(|_| self.flipping()) {
             // The location strip: where `-` has taken you, among the others.
             let target = flip.order[flip.depth % flip.order.len()];
-            let mut spans = vec![Span::styled(" ", style)];
-            for (n, id) in flip.order.iter().enumerate() {
-                let Some(l) = self.locations.iter().find(|l| l.id == *id) else {
-                    continue;
-                };
-                if n > 0 {
-                    spans.push(Span::styled(" · ", style));
-                }
-                let name = format!(" {} ", l.name());
-                spans.push(if *id == target {
-                    Span::styled(name, Style::default().add_modifier(Modifier::BOLD))
-                } else {
-                    Span::styled(name, style)
-                });
-            }
-            buf.set_line(area.x, area.y, &Line::from(spans), area.width);
-            return;
+            let names = flip
+                .order
+                .iter()
+                .map(|id| {
+                    let name = self
+                        .locations
+                        .iter()
+                        .find(|l| l.id == *id)
+                        .map(Location::name);
+                    (name, *id == target)
+                })
+                .collect();
+            return Status::Strip(names);
         }
-        let left = format!(" {}", self.scope());
-        let mut right = String::new();
         if let Some(from) = self.marking
             && let Some(loc) = self.cur()
         {
@@ -3885,94 +3953,181 @@ impl App {
                 Some(r) => format!("lines {}-{}", r.start, r.end),
                 None => "nothing yet".to_string(),
             };
-            let text = format!(" marking {lines} · Enter or Ctrl-Space to comment · Esc cancels");
-            buf.set_span(area.x, area.y, &Span::styled(text, style), area.width);
-            return;
+            return Status::Whole(format!(
+                " marking {lines} · Enter or Ctrl-Space to comment · Esc cancels"
+            ));
         }
         if let Some(m) = &self.message {
             // A message gets the whole line.
-            buf.set_span(
-                area.x,
-                area.y,
-                &Span::styled(format!(" {m}"), style),
-                area.width,
-            );
-            return;
+            return Status::Whole(format!(" {m}"));
         }
-        if let Some(loc) = self.cur()
-            && loc.code_shown.is_some()
-            && loc.view.has_files()
-        {
+        let cur = self.cur();
+        let files = match cur {
             // Files as they are: no changes to count.
-            let n = loc.view.files.len();
-            if n > 1 {
-                let pos = loc.view.current_file().map_or(0, |i| i + 1);
-                right = format!(" file {pos} of {n}  ·");
-            }
-        } else if let Some(loc) = self.cur()
-            && loc.view.has_files()
-        {
-            let n = loc.view.files.len();
-            let cur = loc.view.current_file();
-            let pos = cur.map(|i| i + 1).unwrap_or(0);
-            right = match (loc.view.narrowed(), cur) {
-                (Some(_), Some(fi)) => {
-                    let f = &loc.view.files[fi];
-                    format!(" file {pos} of {n}  +{} −{}  ·", f.added, f.removed)
+            Some(loc) if loc.code_shown.is_some() && loc.view.has_files() => {
+                let n = loc.view.files.len();
+                let at = loc.view.current_file().map_or(0, |i| i + 1);
+                if n > 1 {
+                    Files::Plain { at, of: n }
+                } else {
+                    Files::None
                 }
-                (_, cur) => {
-                    let (added, removed) = loc.view.totals();
-                    let shown = loc.view.shown();
-                    let k = shown.len();
-                    let noun = if n == 1 { "file" } else { "files" };
-                    // Several files of the diff, as an agent asked for.
-                    let count = if k < n {
-                        format!("{k} of {n} {noun}")
-                    } else {
-                        format!("{n} {noun}")
-                    };
-                    let at = cur.and_then(|fi| shown.iter().position(|&s| s == fi));
-                    match at {
-                        Some(i) => format!(" {count}  +{added} −{removed}  ·  {}/{k}  ·", i + 1),
-                        // Above the first file, in the description.
-                        None => format!(" {count}  +{added} −{removed}  ·"),
+            }
+            Some(loc) if loc.view.has_files() => {
+                let n = loc.view.files.len();
+                let cur = loc.view.current_file();
+                match (loc.view.narrowed(), cur) {
+                    (Some(_), Some(fi)) => {
+                        let f = &loc.view.files[fi];
+                        Files::One {
+                            at: fi + 1,
+                            of: n,
+                            added: f.added,
+                            removed: f.removed,
+                        }
+                    }
+                    (_, cur) => {
+                        let (added, removed) = loc.view.totals();
+                        let shown = loc.view.shown();
+                        Files::Diff {
+                            shown: shown.len(),
+                            of: n,
+                            added,
+                            removed,
+                            // Above the first file, in the description: none.
+                            at: cur.and_then(|fi| shown.iter().position(|&s| s == fi)),
+                        }
                     }
                 }
-            };
-        }
-        match self.cur().and_then(|l| l.view.mark_position()) {
-            Some((Some((label, i)), n)) => {
-                right.insert_str(0, &format!(" [{label}] {i} of {n}  ·"))
             }
-            Some((None, 1)) => right.insert_str(0, " 1 mark  ·"),
-            Some((None, n)) => right.insert_str(0, &format!(" {n} marks  ·")),
-            None => {}
+            _ => Files::None,
+        };
+        Status::Parts(Parts {
+            scope: self.scope(),
+            labels: cur
+                .map(|l| l.view.labels_at_cursor())
+                .filter(|labels| labels.len() > 1)
+                .unwrap_or_default(),
+            location: cur.filter(|l| l.repo).map(Location::label),
+            comments: cur
+                .filter(|l| l.comments() > 0)
+                .map(|l| (l.comments(), l.unread())),
+            marks: cur.and_then(|l| l.view.mark_position()),
+            files,
+        })
+    }
+}
+
+/// What the status bar shows beside a message-free line: the scope on the
+/// left, and on the right each part that applies.
+struct Parts {
+    scope: String,
+    /// The letters of the marks under the cursor, when there are several,
+    /// newest last.
+    labels: Vec<String>,
+    /// The location's id, in a repository.
+    location: Option<String>,
+    /// The user's comments here, and how many of them no agent has read.
+    comments: Option<(usize, usize)>,
+    /// The mark jumped to last (its letter and place), and how many there
+    /// are.
+    marks: Option<(Option<(String, usize)>, usize)>,
+    files: Files,
+}
+
+/// Where in the files the cursor is.
+enum Files {
+    None,
+    /// Several files as they are: the one under the cursor (0 above them).
+    Plain {
+        at: usize,
+        of: usize,
+    },
+    /// A diff narrowed to one file, with its changes.
+    One {
+        at: usize,
+        of: usize,
+        added: usize,
+        removed: usize,
+    },
+    /// A diff showing `shown` of its files, their changes, and which of
+    /// those the cursor is in.
+    Diff {
+        shown: usize,
+        of: usize,
+        added: usize,
+        removed: usize,
+        at: Option<usize>,
+    },
+}
+
+impl Parts {
+    /// The terminal's right-hand side, segments joined by dots.
+    fn right(&self) -> String {
+        let mut right = String::new();
+        if self.labels.len() > 1 {
+            let all: Vec<String> = self.labels.iter().map(|l| format!("[{l}]")).collect();
+            right.push_str(&format!(" {}  ·", all.join(" ")));
         }
-        if let Some(loc) = self.cur().filter(|l| l.comments() > 0) {
-            let unread = match loc.unread() {
+        if let Some(label) = &self.location {
+            right.push_str(&format!(" {label}  ·"));
+        }
+        if let Some((n, unread)) = self.comments {
+            let unread = match unread {
                 0 => String::new(),
                 n => format!(" ({n} unread)"),
             };
-            right.insert_str(0, &format!(" {} yours{unread}  ·", loc.comments()));
+            right.push_str(&format!(" {n} yours{unread}  ·"));
         }
-        if let Some(loc) = self.cur().filter(|l| l.repo) {
-            right.insert_str(0, &format!(" {}  ·", loc.label()));
+        match &self.marks {
+            Some((Some((label, i)), n)) => right.push_str(&format!(" [{label}] {i} of {n}  ·")),
+            Some((None, 1)) => right.push_str(" 1 mark  ·"),
+            Some((None, n)) => right.push_str(&format!(" {n} marks  ·")),
+            None => {}
         }
-        // Several marks under the cursor: all their letters, newest last.
-        if let Some(labels) = self.cur().map(|l| l.view.labels_at_cursor())
-            && labels.len() > 1
-        {
-            let all: Vec<String> = labels.iter().map(|l| format!("[{l}]")).collect();
-            right.insert_str(0, &format!(" {}  ·", all.join(" ")));
+        match self.files {
+            Files::None => {}
+            Files::Plain { at, of } => right.push_str(&format!(" file {at} of {of}  ·")),
+            Files::One {
+                at,
+                of,
+                added,
+                removed,
+            } => right.push_str(&format!(" file {at} of {of}  +{added} −{removed}  ·")),
+            Files::Diff {
+                shown,
+                of,
+                added,
+                removed,
+                at,
+            } => {
+                let noun = if of == 1 { "file" } else { "files" };
+                // Several files of the diff, as an agent asked for.
+                let count = if shown < of {
+                    format!("{shown} of {of} {noun}")
+                } else {
+                    format!("{of} {noun}")
+                };
+                right.push_str(&match at {
+                    Some(i) => format!(" {count}  +{added} −{removed}  ·  {}/{shown}  ·", i + 1),
+                    None => format!(" {count}  +{added} −{removed}  ·"),
+                });
+            }
         }
         right.push_str(" : commands ");
-        let rw = right.chars().count() as u16;
-        let lw = area.width.saturating_sub(rw);
-        buf.set_span(area.x, area.y, &Span::styled(left, style), lw);
-        if area.width > rw {
-            buf.set_span(area.right() - rw, area.y, &Span::styled(right, style), rw);
-        }
+        right
     }
+}
+
+/// The status bar's content, for either front end to draw.
+enum Status {
+    /// The location strip while `-` flips through them: each location's
+    /// name, `None` for one since closed, and whether it is where `-` lands.
+    Strip(Vec<(Option<String>, bool)>),
+    /// One line across the whole bar.
+    Whole(String),
+    /// The scope and the parts beside it.
+    Parts(Parts),
 }
 
 /// Narrow `view` to what `focus` names. False when the shown range has none
