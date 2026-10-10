@@ -1,0 +1,145 @@
+--- a/src/platform/linux/wayland/client.rs
++++ b/src/platform/linux/wayland/client.rs
+@@ -49,6 +49,10 @@
+     zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
+     zwp_primary_selection_source_v1,
+ };
++// codesnob: the touchpad's hold gesture, fingers resting on it.
++use wayland_protocols::wp::pointer_gestures::zv1::client::{
++    zwp_pointer_gesture_hold_v1, zwp_pointer_gestures_v1,
++};
+ use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
+     ContentHint, ContentPurpose,
+ };
+@@ -117,6 +121,8 @@
+     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
+     pub blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
+     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
++    // codesnob: version 3 has the hold gesture.
++    pub pointer_gestures: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
+     pub executor: ForegroundExecutor,
+ }
+ 
+@@ -154,6 +160,7 @@
+             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
+             blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
+             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
++            pointer_gestures: globals.bind(&qh, 3..=3, ()).ok(),
+             executor,
+             qh,
+         }
+@@ -224,6 +231,10 @@
+     vertical_modifier: f32,
+     horizontal_modifier: f32,
+     scroll_event_received: bool,
++    // codesnob: the fingers lifted in this frame; and the hold gesture that
++    // says when they rest on the touchpad.
++    axis_stop: bool,
++    hold_gesture: Option<zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1>,
+     enter_token: Option<()>,
+     button_pressed: Option<MouseButton>,
+     mouse_focused_window: Option<WaylandWindowStatePtr>,
+@@ -597,6 +608,8 @@
+             },
+             capslock: Capslock { on: false },
+             scroll_event_received: false,
++            axis_stop: false,
++            hold_gesture: None,
+             axis_source: AxisSource::Wheel,
+             mouse_location: None,
+             continuous_scroll_delta: None,
+@@ -949,6 +962,42 @@
+ delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
+ delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
+ delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
++delegate_noop!(WaylandClientStatePtr: ignore zwp_pointer_gestures_v1::ZwpPointerGesturesV1);
++
++// codesnob: fingers coming to rest on the touchpad start a hold; it is
++// passed on as a scroll that starts without moving, `TouchPhase::Started`,
++// which stops a fling.
++impl Dispatch<zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1, ()>
++    for WaylandClientStatePtr
++{
++    fn event(
++        this: &mut Self,
++        _: &zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1,
++        event: zwp_pointer_gesture_hold_v1::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        if !matches!(event, zwp_pointer_gesture_hold_v1::Event::Begin { .. }) {
++            return;
++        }
++        let client = this.get_client();
++        let state = client.borrow();
++        let (Some(window), Some(position)) =
++            (state.mouse_focused_window.clone(), state.mouse_location)
++        else {
++            return;
++        };
++        let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
++            position,
++            delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
++            modifiers: state.modifiers,
++            touch_phase: TouchPhase::Started,
++        });
++        drop(state);
++        window.handle_input(input);
++    }
++}
+ delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
+ 
+ impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
+@@ -1178,6 +1227,16 @@
+                     wl_pointer.release();
+                 }
+ 
++                // codesnob: hear the fingers resting on the touchpad.
++                if let Some(hold) = state.hold_gesture.take() {
++                    hold.destroy();
++                }
++                state.hold_gesture = state
++                    .globals
++                    .pointer_gestures
++                    .as_ref()
++                    .map(|gestures| gestures.get_hold_gesture(&pointer, qh, ()));
++
+                 state.wl_pointer = Some(pointer);
+             }
+         }
+@@ -1780,18 +1839,33 @@
+                     _ => unreachable!(),
+                 }
+             }
++            // codesnob: the fingers lifted off the touchpad; the frame that
++            // ends with this ends the scroll, `TouchPhase::Ended`.
++            wl_pointer::Event::AxisStop { .. } => {
++                state.axis_stop = true;
++                state.scroll_event_received = true;
++            }
+             wl_pointer::Event::Frame => {
+                 if state.scroll_event_received {
+                     state.scroll_event_received = false;
++                    let stopped = std::mem::take(&mut state.axis_stop);
+                     let continuous = state.continuous_scroll_delta.take();
+                     let discrete = state.discrete_scroll_delta.take();
++                    let continuous = match (continuous, discrete) {
++                        (None, None) if stopped => Some(point(px(0.0), px(0.0))),
++                        (continuous, _) => continuous,
++                    };
+                     if let Some(continuous) = continuous {
+                         if let Some(window) = state.mouse_focused_window.clone() {
+                             let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                 position: state.mouse_location.unwrap(),
+                                 delta: ScrollDelta::Pixels(continuous),
+                                 modifiers: state.modifiers,
+-                                touch_phase: TouchPhase::Moved,
++                                touch_phase: if stopped {
++                                    TouchPhase::Ended
++                                } else {
++                                    TouchPhase::Moved
++                                },
+                             });
+                             drop(state);
+                             window.handle_input(input);
