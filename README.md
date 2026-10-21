@@ -7,8 +7,8 @@
 </h1>
 
 A lean, fast terminal code viewer that agents can drive: files, diffs and
-pull requests, with highlights and notes. You comment directly in the code,
-and the agent reads your comments.
+pull requests, with marks on the lines that matter. You comment directly
+in the code, the agent reads your comments and leaves its own.
 
 Point it at a repository or worktree and it shows what changed since the
 branch point: committed work, staged and unstaged edits, and untracked files,
@@ -70,21 +70,29 @@ by itself; [What is compared](#what-is-compared) explains how.
 **3. Ask the agent to show you something.** Start the agent in the
 repository and ask "show me where the config file is parsed", or "what
 changed on this branch?". The viewer switches to that code or diff and
-highlights the lines the agent means, lettered `[A]`, `[B]`, and so on. `<`
-and `>` step through them. Esc takes you back to what you had before.
+marks the lines the agent means, lettered `[A]`, `[B]`, and so on. `<` and
+`>` step through them. Esc takes you back to what you had before.
 
-**4. Answer it.** Put the cursor on one of its highlights, press Enter, type,
-and press Enter again to save. Enter on any other line comments on that
-line; for several lines, press `v` on the first, move to the last and press
-Enter. Your comments are marks too, drawn in amber and lettered after the
-agent's.
+**4. Answer it.** Put the cursor on one of its marks, press Enter, type,
+and press Enter again to save: your answer appears in a thread under the
+mark. Enter on any other line comments on that line; for several lines,
+press `v` on the first, move to the last and press Enter. Shift-Enter
+breaks the line while you type. Your comments are marks like the agent's,
+drawn in teal under the lines they are about, and lettered after it.
 
 Then tell the agent "I left comments". It reads them and answers under each
-one: its first answer to `[C]` is `[C1]`, the next `[C2]`. Press Enter on
-its answer to reply in the same thread. Your comments stay until you delete
-them; the agent removes them only when you ask it to. Until it has read
-them, it can't pull you to another location: the request waits behind a
-banner at the top, and `y` goes there anyway.
+one, in the same thread. Press Enter anywhere in a thread to add to it.
+Your comments stay until you delete them; the agent removes them only when
+you ask it to. Until it has read them, it can't pull you to another
+location: the request waits behind a banner at the top, and `y` goes there
+anyway.
+
+Ask it to review something and it comments the same way you do, on the
+lines you are looking at. Whenever it adds marks or a reply while you are
+not typing, the cursor goes there, to the first of them; while you stay
+there, anything further waits behind `>`. Every mark stays until someone
+removes it: `x` removes the one under the cursor, `X` all of them, and the
+agent clears its own once they have served.
 
 **5. Look around yourself.** `j` and `k` (or the arrow keys) move the cursor
 line, `n` and `p` jump between hunks, `N` and `P` between files. `f` lists
@@ -129,28 +137,36 @@ Most other agents take a JSON configuration in this form:
 }
 ```
 
-The server gives the agent seven tools:
+The server gives the agent eight tools:
 
 | Tool | Does |
 |---|---|
-| `show_code` | show whole files or excerpts, as they are or as of a revision, with highlighted lines and optional notes |
-| `show_diff` | show any comparison from [the range table](#what-is-compared), optionally limited to some files, with highlighted lines |
-| `list_locations` | list the locations open in the viewer, which one is on screen, and how many comments each has that the agent has not read; and other viewers running |
-| `get_review` | read every mark on a location: the agent's highlights, your comments and the replies under them, with the code they are on and what is new |
-| `reply_to_comment` | answer one of your comments under it, as `[C1]`, `[C2]`, … |
-| `move_comment` | put one of your comments on other lines after the agent changed the code under it; it keeps its letter, text and replies |
-| `clear_marks` | remove the agent's own highlights and replies. Your comments only when the call says you explicitly asked for that (`user_explicitly_asked_to_delete_comments`); otherwise it is refused |
+| `show_code` | show whole files or excerpts, as they are or as of a revision, with marks on lines and optional text |
+| `show_diff` | show any comparison from [the range table](#what-is-compared), optionally limited to some files, with marks on lines |
+| `list_locations` | list every location: each repository or pull request, what it shows, which viewer has it on screen, and how many of your words it has that the agent has not read |
+| `get_review` | read every mark on a location, the agent's and yours, with the threads under them, the code under your marks and what is new |
+| `mark` | mark lines with words, up to 20 in one call, without changing the view: for comments on code you are already looking at |
+| `reply` | answer in the thread under a mark |
+| `move_mark` | put a mark on other lines after the agent changed the code under it; it keeps its letter, text and thread |
+| `clear_marks` | remove the agent's own marks. A mark you made or wrote under goes whole, thread and all, and only when the call says you explicitly asked for that (`user_explicitly_asked_to_delete_comments`); otherwise it is refused |
 
-Every reply tells the agent the location id and the letters of the marks it
-placed, and whether you have comments it has not read yet. The tool
-descriptions tell the agent when to use them, so you don't need to mention
-codesnob in your prompts: "show me", "what changed on this branch" and "I
-left some comments" are enough.
+Every reply tells the agent the letters of the marks it placed and whether
+you have comments it has not read yet. A reply that leaves marks of the
+agent's also lists them all, with a reminder to remove the ones no longer
+needed. The review tools work on the
+location on screen unless the agent names another, by the repository's
+path (`repo`) or as `owner/repo#123` (`pr`). The tool descriptions tell the
+agent when to use them, so you don't need to mention codesnob in your
+prompts: "show me", "what changed on this branch" and "I left some
+comments" are enough.
 
-The viewer must already be running; the agent does not start one. If you
-have more than one viewer open, the agent's requests go to the one on the
-same Hyprland workspace as the agent's terminal, or the nearest numbered
-workspace. On other desktops they go to the viewer that was opened first.
+The viewer must already be running for the agent to show anything; the
+agent does not start one. If you have more than one viewer open, the
+agent's requests go to the one on the same Hyprland workspace as the
+agent's terminal, or the nearest numbered workspace. On other desktops they
+go to the viewer that was opened first. Marks are shared: two viewers on
+the same repository show the same ones, and reading or writing comments
+needs no viewer at all.
 
 ## How the viewer works
 
@@ -187,26 +203,49 @@ You can always ask for something else, from the Open prompt (`o`), with
 
 ### Locations
 
-Everything you open stays open in the viewer as a location, with an id like
-`L3` shown in the status bar. A location holds its own range, cursor and
-marks. `Alt-←` and `Alt-→` (or `-`) move between them, and `L` lists them.
+Everything you open stays open in the viewer as a location: one per
+repository, one per pull request. A location holds its own range, cursor
+and marks. `Alt-←` and `Alt-→` (or `-`) move between them, and `L` lists
+them. With several open, the status bar names the one on screen.
 
-When an agent shows you something in a repository you already have open, it
-replaces what that repository's location was showing. Esc brings back what
-you had before.
+Agents name a location by what it is: the repository's path, or
+`owner/repo#123` for a pull request. When an agent shows you something in a
+repository you already have open, it replaces what that repository's
+location was showing. Esc brings back what you had before.
 
-### Marks and comments
+The marks on a location belong to the location, not to a viewer. The daemon
+keeps them: a second viewer opening the same repository shows the same
+marks, and they survive closing the viewer until the daemon exits.
 
-Marks are highlighted line ranges, lettered `[A]`, `[B]`, … in the order
-they were made. A mark keeps its letter, so you and the agent can both say
-"B" and mean the same lines. The agent's highlights can carry a short note;
-your comments are drawn in amber.
+### Marks
 
-Your comments are yours. The agent answers one with a reply under it,
-numbered after its letter (`[C1]`, `[C2]`), and you can reply to that in
-turn, in the same thread. When it changes the code a comment is on, it can
-move the comment to the right lines, but it cannot change what you wrote,
-and it deletes your comments only when you ask it to.
+A mark is a line range with a letter, `[A]`, `[B]`, … in the order marks
+were made, whoever made it, with words on it or not. A mark keeps its
+letter, so you and the agent can both say "B" and mean the same lines.
+Yours are drawn in teal, the agent's in purple. Yours always carry words,
+since Enter is how you make one; the agent's carry words when you asked it
+to explain, review or comment, and are bare when it is only pointing.
+
+Every mark stays until someone removes it. A show adds marks and removes
+none, so the agent is told to clear its own once they have served; `x`
+removes the mark under the cursor, whoever made it, and `X` clears the
+location after asking.
+
+A mark's text sits under the lines it is about, and its thread under
+that. Enter on a marked line, on a mark's row, or on any turn in its
+thread adds a turn at the end of the thread; what you type appears where
+it will go, and Shift-Enter (or Alt-Enter) breaks the line. To put a
+second mark on lines that already carry one, select them with `v`. The
+agent answers your marks the same way, and you can answer its.
+Turns have no letters of their own: `[C]` names the mark, and the thread
+under it reads top to bottom. New marks or a new turn of the agent's take
+the cursor to the first of them, unless you are typing or selecting lines,
+or have not moved since the last time it did that.
+
+A mark you made, or wrote under, is yours. The agent cannot remove it, nor
+anything in its thread, unless you ask it to, and then the mark goes whole.
+When it changes the code a mark is on, it can move the mark to the right
+lines, but it cannot change what you wrote.
 
 Marks follow their code as you edit. If the lines a mark pointed at are
 deleted, the mark stays and is flagged stale.
@@ -285,15 +324,16 @@ moves the cursor to it, and the mouse wheel scrolls.
 | `Alt-→` | next location |
 | `L` | list the open locations |
 
-**Marks and comments**
+**Marks**
 
 | Key | Does |
 |---|---|
-| Enter | comment on the cursor's line; on your comment or reply, edit it; on an agent's highlight, answer it; on an agent's reply, reply to it in the same thread |
+| Enter | comment on the cursor's line; on a marked line, a mark or in its thread, add to the thread |
+| Shift-Enter, Alt-Enter | while typing, break the line |
 | `v`, `Ctrl-Space` | start marking lines; move to extend, then Enter to write the comment, Esc to cancel |
-| `e` | edit the comment or reply under the cursor |
-| `x` | delete the comment (with its replies) or your reply under the cursor |
-| `X` | delete all your comments in this location, after asking |
+| `e` | edit your comment or your turn under the cursor |
+| `x` | delete the mark under the cursor (with its thread), whoever made it, or your turn |
+| `X` | delete all marks in this location, after asking |
 | `<` `>` | previous, next mark (or hunk, when there are no marks) |
 | `y` | switch to what the agent is waiting to show |
 
@@ -327,18 +367,22 @@ The subcommands talk to viewers that are already running:
 | Command | Does |
 |---|---|
 | `codesnob show PATH [--range R]` | show the repository at `PATH` in the viewer, optionally a specific range |
-| `codesnob locations [--json]` | list the locations open in the viewer, with their marks and unread comments, and the other viewers running |
-| `codesnob review [--location L3] [--json]` | print the marks on a location (default: the one on screen); the comments count as read afterwards |
-| `codesnob reply LETTER TEXT [--location L3]` | answer one of the user's comments under it |
-| `codesnob move LETTER LINES [--path P] [--location L3]` | put one of the user's comments on other lines, e.g. `codesnob move C 40-42` |
-| `codesnob clear [LETTERS…] [--which mine\|user\|all] [--location L3]` | remove marks by letter, or by owner: `mine` is the agent's highlights and replies (the default), `user` is the user's comments. Removing the user's comments needs `--user-explicitly-asked-to-delete-comments` |
-| `codesnob status [--json]` | list the connected viewers, with their workspace and directory |
+| `codesnob locations [--json]` | list every location, with its marks and unread comments and the viewers it is open in |
+| `codesnob review [--repo DIR \| --pr REF] [--json]` | print the marks on a location (default: the one on screen); the user's words count as read afterwards |
+| `codesnob mark PATH LINES TEXT [--repo DIR \| --pr REF]` | mark lines of a file with words, as the agent, e.g. `codesnob mark src/x.rs 40-42 "unused"` |
+| `codesnob reply LETTER TEXT [--repo DIR \| --pr REF]` | answer in the thread under a mark |
+| `codesnob move LETTER LINES [--path P] [--repo DIR \| --pr REF]` | put a mark on other lines, e.g. `codesnob move C 40-42` |
+| `codesnob clear [LETTERS…] [--which mine\|user\|all] [--repo DIR \| --pr REF]` | remove marks by letter, or by owner: `mine` is the agent's own (the default), `user` is every mark the user made or wrote under. Removing the user's marks needs `--user-explicitly-asked-to-delete-comments` |
+| `codesnob status [--json]` | list the connected viewers, with their workspace and directory, and every location |
 | `codesnob mcp` | run the MCP server on stdin and stdout |
 | `codesnob prune` | remove PR checkouts that no viewer has open |
 | `codesnob daemon` | run the daemon in the foreground |
 
 Viewers and agents talk through a small per-user daemon over a Unix socket.
-It starts when it is first needed and you don't have to manage it.
+It starts when it is first needed and you don't have to manage it. The
+daemon keeps every location's marks, so the review commands work without a
+viewer, and a location that is not on screen is named with `--repo` or
+`--pr`.
 
 ## Files it keeps
 

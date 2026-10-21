@@ -8,6 +8,55 @@ the machinery, not decoration.
 
 <!-- next -->
 
+## Unreleased
+
+- **Locations are named by what they are.** The `L3` ids are gone. A
+  location is a repository or a pull request, and agents name it by the
+  repository's path (`repo`) or as `owner/repo#123` (`pr`); the review
+  tools default to the location on screen. With several locations open,
+  the status bar shows the name of the one on screen.
+- **Marks are shared.** The daemon keeps every location's marks. Two
+  viewers on the same repository show the same marks, reading and
+  answering comments needs no viewer, and comments survive closing the
+  viewer until the daemon exits.
+- **Threads instead of numbered replies.** Replies no longer have labels
+  like `[C1]`; every mark has a thread under it. Enter on a mark or
+  anywhere in its thread adds to the thread, and what you type appears
+  where it will go. Answering an agent's mark starts the thread under it.
+  `e` edits your own words.
+- **Your threads are yours.** A mark you made or wrote under cannot be
+  touched by the agent, not even its own turns, unless you explicitly ask
+  for it to be deleted, and then it goes whole.
+- **One kind of mark.** Yours and the agent's are the same thing: a
+  lettered line range with an author, words on it or not, and a thread.
+  Every mark stays until someone removes it; a show adds marks and removes
+  none (the `append` option is gone with the rule it softened). The agent
+  is told to clear its own once they have served, and every reply that
+  leaves marks of its own lists them with a reminder to do so. `x` removes
+  the mark under the cursor whoever made it, `X` clears the location after
+  asking. Your marks are drawn in teal.
+- **Text under the lines, over several rows.** A mark's text and its
+  thread now sit below the lines they are about, as in a review on the
+  web, and a jump puts the first marked line at the top. Shift-Enter (or
+  Alt-Enter) breaks the line while you type, and text with several lines
+  is drawn on several rows. Enter on a line that already carries a mark
+  adds to that mark's thread instead of starting another; `v` still marks
+  the same lines again on purpose. Saving a comment leaves the cursor on
+  it. A mark's tint now covers its lines even where the diff coloured
+  them, and the bar beside the lines is gone: the letter marks the first
+  line, the tint says how far it runs.
+- **The agent marks without showing.** A new `mark` tool (and `codesnob
+  mark`) puts marks with words on lines, up to 20 in one call, without
+  changing the view, for comments on code you are already looking at. Its
+  marks are lettered top to bottom, as a show's are. New marks or a reply
+  of the agent's take the cursor to the topmost of them, unless you are
+  typing or have not moved since the last jump. The show tools
+  take `marks` with `text` instead of `highlights` with `note`; `reply`
+  (was `reply_to_comment`) answers under any mark, `move_mark` (was
+  `move_comment`) moves any mark, and `get_review` says who made each.
+- The protocol version is now 3. Viewers, agents and the daemon must be
+  on the same build.
+
 ## v0.1.0
 
 The first release.

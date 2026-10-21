@@ -32,10 +32,11 @@ pub enum Msg {
         Box<crate::proto::ViewSpec>,
         Option<String>,
     ),
-    /// An agent asks this viewer something, to answer under `id`.
-    Query {
-        id: String,
-        query: crate::proto::ViewerQuery,
+    /// The daemon says what a location's marks are now, after any change
+    /// anywhere; `note` says what an agent did, for the user.
+    Location {
+        state: Box<crate::proto::LocationState>,
+        note: Option<String>,
     },
     /// Daemon link went up or down.
     Link(bool),

@@ -130,10 +130,14 @@ impl Panel {
         self.refilter();
     }
 
-    /// Pasted text goes into the input, newlines dropped.
+    /// Pasted text goes into the input; newlines stay in a comment and
+    /// are dropped anywhere else.
     pub fn paste(&mut self, text: &str) {
-        self.input
-            .extend(text.chars().filter(|c| *c != '\n' && *c != '\r'));
+        let multiline = self.kind == Kind::Comment;
+        self.input.extend(
+            text.chars()
+                .filter(|c| *c != '\r' && (multiline || *c != '\n')),
+        );
         self.refilter();
     }
 
@@ -192,9 +196,15 @@ impl Panel {
     pub fn key(&mut self, k: KeyEvent, rows: usize) -> Outcome {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match (k.code, ctrl) {
             (KeyCode::Char('c'), true) => return Outcome::Quit,
             (KeyCode::Esc, _) => return Outcome::Close,
+            // A comment runs over lines: Shift-Enter (or Alt-Enter where
+            // the terminal cannot tell Shift) starts the next.
+            (KeyCode::Enter, _) if self.kind == Kind::Comment && (shift || alt) => {
+                self.input.push('\n');
+            }
             (KeyCode::Enter, _) if self.kind.takes_input() => {
                 return Outcome::Submit {
                     input: self.input.clone(),
@@ -281,7 +291,7 @@ impl Panel {
             let text = match self.kind {
                 Kind::Open if self.items.is_empty() => "  type a path, Tab completes",
                 Kind::Open => "  Enter opens the path",
-                Kind::Comment => "  Enter saves, Esc cancels",
+                Kind::Comment => "  Enter saves, Shift-Enter breaks the line, Esc cancels",
                 _ => "  no matches",
             };
             buf.set_span(area.x, area.y + 1, &Span::styled(text, dim), area.width);

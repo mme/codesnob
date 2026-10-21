@@ -4,10 +4,12 @@ mod git;
 mod highlight;
 mod link;
 mod loader;
+mod marks;
 mod mcp;
 mod pr;
 mod proto;
 mod recent;
+mod registry;
 #[cfg(test)]
 mod testutil;
 mod ui;
@@ -81,56 +83,83 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// List the marks on a location in the viewer: the agent's highlights
-    /// and the user's comments, which count as read afterwards.
+    /// List the marks on a location in the viewer, the agent's and the
+    /// user's; the user's words count as read afterwards.
     Review {
-        /// The location, as the viewer names it (L3); default: the one on screen.
+        /// The location: a directory in its checkout; default: the one on screen.
         #[arg(long)]
-        location: Option<String>,
+        repo: Option<PathBuf>,
+        /// The location: a pull request, like owner/repo#142.
+        #[arg(long)]
+        pr: Option<String>,
         /// Print the raw JSON reply.
         #[arg(long)]
         json: bool,
     },
     /// Remove marks from a location in the viewer.
     Clear {
-        /// The location, as the viewer names it (L3); default: the one on screen.
+        /// The location: a directory in its checkout; default: the one on screen.
         #[arg(long)]
-        location: Option<String>,
-        /// Which marks: the agent's highlights (mine), the user's comments
-        /// (user), or every mark (all). Default: mine.
+        repo: Option<PathBuf>,
+        /// The location: a pull request, like owner/repo#142.
+        #[arg(long)]
+        pr: Option<String>,
+        /// Which marks: the agent's own (mine), the marks the user made or
+        /// wrote under (user), or every mark (all). Default: mine.
         #[arg(long, value_parser = ["mine", "user", "all"])]
         which: Option<String>,
-        /// Letters of the marks to remove instead, e.g. C D, or replies,
-        /// e.g. C1.
+        /// Letters of the marks to remove instead, e.g. C D. A mark goes
+        /// with its whole thread.
         letters: Vec<String>,
-        /// Allow removing the user's comments and replies. Only when the
+        /// Allow removing the user's marks, threads and all. Only when the
         /// user explicitly asked for them to be deleted.
         #[arg(long)]
         user_explicitly_asked_to_delete_comments: bool,
     },
-    /// Answer one of the user's comments, under it: C1, C2…
+    /// Mark lines of a file with words, as the agent, without changing
+    /// what the viewer shows.
+    Mark {
+        /// The file, relative to the current directory.
+        path: String,
+        /// The lines: 40-42, or 42.
+        lines: String,
+        /// The words on the mark.
+        text: String,
+        /// The location: a directory in its checkout; default: the one on screen.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// The location: a pull request, like owner/repo#142.
+        #[arg(long)]
+        pr: Option<String>,
+    },
+    /// Answer in the thread under a mark the user made or wrote under.
     Reply {
-        /// The comment's letter, e.g. C.
+        /// The mark's letter, e.g. C.
         letter: String,
         /// The reply.
         text: String,
-        /// The location, as the viewer names it (L3); default: the one on screen.
+        /// The location: a directory in its checkout; default: the one on screen.
         #[arg(long)]
-        location: Option<String>,
+        repo: Option<PathBuf>,
+        /// The location: a pull request, like owner/repo#142.
+        #[arg(long)]
+        pr: Option<String>,
     },
-    /// Move one of the user's comments to other lines, keeping its letter,
-    /// text and replies.
+    /// Move a mark to other lines, keeping its letter, text and thread.
     Move {
-        /// The comment's letter, e.g. C.
+        /// The mark's letter, e.g. C.
         letter: String,
         /// Where it goes: 40-42, or 42.
         lines: String,
         /// The file it goes to (default: the one it is on).
         #[arg(long)]
         path: Option<String>,
-        /// The location, as the viewer names it (L3); default: the one on screen.
+        /// The location: a directory in its checkout; default: the one on screen.
         #[arg(long)]
-        location: Option<String>,
+        repo: Option<PathBuf>,
+        /// The location: a pull request, like owner/repo#142.
+        #[arg(long)]
+        pr: Option<String>,
     },
     /// Run the daemon in the foreground (it normally starts on demand).
     Daemon,
@@ -138,6 +167,17 @@ enum Cmd {
     Mcp,
     /// Remove PR checkouts that no viewer has open.
     Prune,
+}
+
+/// The location `--repo` or `--pr` names, if either was given.
+fn location_ref(repo: Option<PathBuf>, pr: Option<String>) -> Option<proto::LocationRef> {
+    if repo.is_none() && pr.is_none() {
+        return None;
+    }
+    Some(proto::LocationRef {
+        repo: repo.map(|r| std::fs::canonicalize(&r).unwrap_or(r)),
+        pr,
+    })
 }
 
 fn canonical(path: &std::path::Path) -> Result<PathBuf> {
@@ -156,18 +196,19 @@ fn main() -> Result<()> {
         Some(Cmd::Locations { json }) => {
             return link::locations(json).map_err(|e| anyhow::anyhow!(e));
         }
-        Some(Cmd::Review { location, json }) => {
-            return link::review(location, json).map_err(|e| anyhow::anyhow!(e));
+        Some(Cmd::Review { repo, pr, json }) => {
+            return link::review(location_ref(repo, pr), json).map_err(|e| anyhow::anyhow!(e));
         }
         Some(Cmd::Clear {
-            location,
+            repo,
+            pr,
             which,
             letters,
             user_explicitly_asked_to_delete_comments,
         }) => {
             let which = which.unwrap_or_else(|| "mine".to_string());
             return link::clear(
-                location,
+                location_ref(repo, pr),
                 which,
                 letters,
                 user_explicitly_asked_to_delete_comments,
@@ -177,25 +218,45 @@ fn main() -> Result<()> {
         Some(Cmd::Reply {
             letter,
             text,
-            location,
+            repo,
+            pr,
         }) => {
-            return link::reply(location, letter, text).map_err(|e| anyhow::anyhow!(e));
+            return link::reply(location_ref(repo, pr), letter, text)
+                .map_err(|e| anyhow::anyhow!(e));
+        }
+        Some(Cmd::Mark {
+            path,
+            lines,
+            text,
+            repo,
+            pr,
+        }) => {
+            let args = serde_json::json!({
+                "marks": [{ "path": path, "lines": lines, "text": text }],
+                "repo": repo,
+                "pr": pr,
+            });
+            let cwd = std::env::current_dir()?;
+            let query = mcp::mark_args(&args, &cwd).map_err(|e| anyhow::anyhow!(e))?;
+            return link::mark(query).map_err(|e| anyhow::anyhow!(e));
         }
         Some(Cmd::Move {
             letter,
             lines,
             path,
-            location,
+            repo,
+            pr,
         }) => {
             let args = serde_json::json!({
                 "letter": letter,
                 "lines": lines,
                 "path": path,
-                "location": location,
+                "repo": repo,
+                "pr": pr,
             });
             let cwd = std::env::current_dir()?;
             let query = mcp::move_args(&args, &cwd).map_err(|e| anyhow::anyhow!(e))?;
-            return link::move_comment(query).map_err(|e| anyhow::anyhow!(e));
+            return link::move_mark(query).map_err(|e| anyhow::anyhow!(e));
         }
         Some(Cmd::Mcp) => return mcp::serve(),
         Some(Cmd::Prune) => {
