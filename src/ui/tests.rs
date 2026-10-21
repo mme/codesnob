@@ -3077,6 +3077,39 @@ fn the_previous_mark_from_an_inner_one_is_the_mark_around_it() {
 }
 
 #[test]
+fn a_selection_keeps_its_lines_while_rows_arrive_above_it() {
+    let dir = repo_with_long_file("ui-select-shift");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    h.keys(&"j".repeat(30));
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 30"), "{text}");
+    h.keys("vjj");
+    assert!(
+        h.status().starts_with("marking lines 30-32"),
+        "{}",
+        h.status()
+    );
+    // The agent's mark above adds rows; the user is busy, so no jump.
+    assert_eq!(h.mark("src/long.rs", 10, 10, "one\ntwo\nthree"), "A");
+    assert!(
+        h.status().starts_with("marking lines 30-32"),
+        "{}",
+        h.status()
+    );
+    h.keys("<enter>");
+    assert!(
+        h.status().starts_with("src/long.rs 30-32 ·"),
+        "the comment goes on the lines selected: {}",
+        h.status()
+    );
+    cleanup(dir);
+}
+
+#[test]
 fn marks_starting_on_the_same_line_are_stepped_through_one_by_one() {
     let dir = repo_with_long_file("ui-marks-same-line");
     let mut h = Harness::open(&dir);
@@ -3348,6 +3381,13 @@ fn several_marks_in_one_call_jump_once_and_separate_calls_wait_for_a_move() {
     assert!(text.contains("// line 48"), "{text}");
     let f = h.app.cur().unwrap().marks.get(5).unwrap();
     assert_eq!((f.label.as_str(), f.start), ("F", 48));
+    // Rows arriving above the cursor do not count as the user moving.
+    assert_eq!(h.mark("src/long.rs", 1, 1, "way up"), "H");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("// line 48"),
+        "still where the last jump put it: {text}"
+    );
     cleanup(dir);
 }
 

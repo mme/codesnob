@@ -437,6 +437,15 @@ impl Location {
         })
     }
 
+    /// The cursor is still where the agent's last news put it: the same
+    /// place, whatever rows came and went around it.
+    fn still_at_jump(&self) -> bool {
+        match (&self.jumped_to, self.view.anchor()) {
+            (Some(j), Some(now)) => j.same_place(&now),
+            _ => false,
+        }
+    }
+
     /// Take the user to the topmost of `news` that is shown; whether one
     /// was.
     fn jump_to_news(&mut self, news: &[(usize, Option<usize>)]) -> bool {
@@ -451,7 +460,7 @@ impl Location {
             Some(n) => self.view.go_to_turn(seq, n),
             None => self.view.go_to_seq(seq),
         };
-        self.jumped_to = went.then(|| self.view.cursor());
+        self.jumped_to = went.then(|| self.view.anchor()).flatten();
         went
     }
 
@@ -655,7 +664,7 @@ struct Location {
     place_pending: bool,
     /// Where the cursor was put for the agent's last news; while it is
     /// still there, further news waits behind `>`.
-    jumped_to: Option<usize>,
+    jumped_to: Option<diffview::Anchor>,
     /// News of the agent's whose lines were not shown yet: the jump waits
     /// for the load that brings them in.
     pending_jump: Vec<(usize, Option<usize>)>,
@@ -704,7 +713,9 @@ pub struct App {
     next_id: u64,
     panel: Option<Panel>,
     /// Lines being marked for a comment: the row the marking started on.
-    marking: Option<usize>,
+    /// The line a selection started on, as a place rather than a row, so
+    /// rows coming and going above it change nothing.
+    marking: Option<diffview::Anchor>,
     /// What the comment prompt is for.
     composing: Option<Compose>,
     /// Where the cursor was when the composer opened; it goes back there
@@ -1003,7 +1014,7 @@ impl App {
         if !news.is_empty()
             && !self.typing()
             && let Some(loc) = self.cur_mut()
-            && loc.jumped_to != Some(loc.view.cursor())
+            && !loc.still_at_jump()
             && !loc.jump_to_news(&news)
         {
             loc.pending_jump = news;
@@ -3087,20 +3098,28 @@ impl App {
         }
     }
 
+    /// The row the selection started on, as the rows are now.
+    fn marking_row(&self) -> Option<usize> {
+        let from = self.marking.as_ref()?;
+        self.cur()?.view.locate(from)
+    }
+
     fn start_region(&mut self) {
         let Some(loc) = self.cur() else { return };
         let cursor = loc.view.cursor();
         if loc.view.region(cursor, cursor).is_some() {
-            self.marking = Some(cursor);
+            self.marking = loc.view.anchor();
         } else {
             self.message = Some("move onto a line first".to_string());
         }
     }
 
     fn end_region(&mut self) {
-        let Some(from) = self.marking.take() else {
+        let Some(from) = self.marking_row() else {
+            self.marking = None;
             return;
         };
+        self.marking = None;
         let Some(loc) = self.cur() else { return };
         match loc.view.region(from, loc.view.cursor()) {
             Some(region) => self.compose(region, None),
@@ -3605,7 +3624,7 @@ impl App {
                 loc.desc_width = body.width;
             }
         }
-        let marking = self.marking;
+        let marking = self.marking_row();
         let compose = self.compose_row();
         if let Some(loc) = self.locations.first_mut() {
             let cursor = loc.view.cursor();
@@ -3767,7 +3786,7 @@ impl App {
         }
         let left = format!(" {}", self.scope());
         let mut right = String::new();
-        if let Some(from) = self.marking
+        if let Some(from) = self.marking_row()
             && let Some(loc) = self.cur()
         {
             let lines = match loc.view.region(from, loc.view.cursor()) {

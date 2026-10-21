@@ -170,6 +170,7 @@ pub struct Region {
 }
 
 /// Where the cursor is, expressed in terms that survive a reload.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Anchor {
     path: String,
     /// (side, line number): side 0 is the old file, 1 the new file.
@@ -186,6 +187,18 @@ pub struct Anchor {
     at_line: usize,
     /// How many rows below the top of the view the cursor sat.
     offset: usize,
+}
+
+impl Anchor {
+    /// The same place, wherever on the screen it sits.
+    pub fn same_place(&self, other: &Anchor) -> bool {
+        self.path == other.path
+            && self.line == other.line
+            && self.at_hunk == other.at_hunk
+            && self.at_mark == other.at_mark
+            && self.at_turn == other.at_turn
+            && self.at_line == other.at_line
+    }
 }
 
 #[derive(Default)]
@@ -998,12 +1011,17 @@ impl DiffView {
     // ---- position --------------------------------------------------------
 
     pub fn anchor(&self) -> Option<Anchor> {
-        let fi = self.current_file()?;
+        self.anchor_of(self.cursor)
+    }
+
+    /// Where `row` is, in terms that survive a reload.
+    pub fn anchor_of(&self, row: usize) -> Option<Anchor> {
+        let fi = self.file_at(row)?;
         let path = self.files[fi].path.clone();
         let mut at_mark = None;
         let mut at_turn = None;
         let mut at_line = 0;
-        let (line, at_hunk) = match self.rows.get(self.cursor)? {
+        let (line, at_hunk) = match self.rows.get(row)? {
             Row::Line(fi, hi, li) => {
                 let l = &self.files[*fi].hunks[*hi].lines[*li];
                 (l.new_no.map(|n| (1, n)).or(l.old_no.map(|n| (0, n))), false)
@@ -1022,7 +1040,7 @@ impl DiffView {
             Row::Mark(m) | Row::MarkLine(m, _) | Row::Turn(m, _) | Row::TurnLine(m, _, _) => {
                 let mark = &self.marks[*m];
                 at_mark = Some(mark.seq);
-                match self.rows[self.cursor] {
+                match self.rows[row] {
                     Row::Turn(_, t) => at_turn = Some(t),
                     Row::TurnLine(_, t, k) => {
                         at_turn = Some(t);
@@ -1056,19 +1074,25 @@ impl DiffView {
             at_mark,
             at_turn,
             at_line,
-            offset: self.cursor - self.scroll,
+            offset: row.saturating_sub(self.scroll),
         })
     }
 
     pub fn restore(&mut self, a: Anchor) {
-        let Some(fi) = self.files.iter().position(|f| f.path == a.path) else {
+        let Some(row) = self.locate(&a) else {
             self.fit();
             return;
         };
-        let Some(start) = self.file_row(fi) else {
-            self.fit();
-            return;
-        };
+        self.cursor = row;
+        self.scroll = self.cursor.saturating_sub(a.offset);
+        self.fit();
+    }
+
+    /// The row `a` names now, if its file is still shown: the same line,
+    /// or the nearest; the same mark's row or turn when it was on one.
+    pub fn locate(&self, a: &Anchor) -> Option<usize> {
+        let fi = self.files.iter().position(|f| f.path == a.path)?;
+        let start = self.file_row(fi)?;
         let end = self
             .file_starts
             .iter()
@@ -1088,7 +1112,7 @@ impl DiffView {
                 }
             }
         }
-        self.cursor = match best {
+        let mut at = match best {
             // Back onto the hunk header when we were on one.
             Some((_, r)) if a.at_hunk => self
                 .hunk_starts
@@ -1108,7 +1132,7 @@ impl DiffView {
         {
             // A turn that went leaves the cursor on the one above.
             let turns = self.marks[m].thread.len();
-            self.cursor = match a.at_turn {
+            at = match a.at_turn {
                 Some(i) if turns > 0 => self
                     .rows
                     .iter()
@@ -1117,11 +1141,10 @@ impl DiffView {
                 _ => row,
             };
             // As far into the text as before, while it has the rows.
-            let (_, end) = self.text_span(self.cursor);
-            self.cursor = (self.cursor + a.at_line).min(end);
+            let (_, end) = self.text_span(at);
+            at = (at + a.at_line).min(end);
         }
-        self.scroll = self.cursor.saturating_sub(a.offset);
-        self.fit();
+        Some(at)
     }
 
     fn max_scroll(&self) -> usize {
