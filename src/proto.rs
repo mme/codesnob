@@ -685,8 +685,14 @@ pub fn connect_or_spawn() -> Option<UnixStream> {
     // A daemon from an older build makes way for one from this build,
     // which asks it to exit as it starts.
     let current = |s: UnixStream| -> Option<UnixStream> {
+        // The probe waits only so long; the stream goes on without a limit.
+        let wait = Some(Duration::from_secs(2));
+        s.set_read_timeout(wait).ok()?;
+        s.set_write_timeout(wait).ok()?;
         let mut probe = Client::new(s.try_clone().ok()?, "probe-").ok()?;
         let hello = probe.hello().ok()?;
+        s.set_read_timeout(None).ok()?;
+        s.set_write_timeout(None).ok()?;
         (!crate::daemon::outdated(&hello)).then_some(s)
     };
     if let Ok(s) = UnixStream::connect(daemon_socket())

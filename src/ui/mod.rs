@@ -672,10 +672,13 @@ struct Location {
     /// News of the agent's whose lines were not shown yet: the jump waits
     /// for the load that brings them in.
     pending_jump: Vec<(usize, Option<usize>)>,
-    /// The next load only follows the marks the daemon just sent; what it
-    /// finds is not news to send back, or two viewers on different
-    /// revisions would correct each other forever.
+    /// The next load only follows the marks the daemon just sent: what it
+    /// finds is sent back only when it is not what this viewer last sent,
+    /// or two viewers on different revisions would correct each other
+    /// forever.
     syncing: bool,
+    /// The anchoring this viewer last sent the daemon.
+    published: Option<Vec<marks::Anchored>>,
     /// The daemon has told this viewer what the location's marks are, so
     /// the marks here are the daemon's, not ones made before it knew the
     /// location.
@@ -831,6 +834,7 @@ impl App {
             jumped_to: None,
             pending_jump: Vec::new(),
             syncing: false,
+            published: None,
             synced: false,
             focus: Focus::All,
             view: DiffView::default(),
@@ -1171,6 +1175,7 @@ impl App {
             jumped_to: None,
             pending_jump: Vec::new(),
             syncing: false,
+            published: None,
             synced: false,
             focus: Focus::All,
             view: DiffView::default(),
@@ -1701,12 +1706,13 @@ impl App {
                 .find(|(p, _)| p == path)
                 .map(|(_, d)| crate::diff::text_lines(d))
         });
-        if std::mem::take(&mut loc.syncing) {
+        if std::mem::take(&mut loc.syncing) && loc.published.as_ref() == Some(&moved) {
             moved.retain(|a| unseen.contains(&a.seq));
         }
         if !moved.is_empty()
             && let Some(key) = loc.key.clone()
         {
+            loc.published = Some(moved.clone());
             self.link.send_op(key, Op::Anchored { marks: moved });
         }
         // A file shows whole or as excerpts around its line and marks,
@@ -1850,12 +1856,13 @@ impl App {
                 })
                 .map(crate::diff::text_lines)
         });
-        if std::mem::take(&mut loc.syncing) {
+        if std::mem::take(&mut loc.syncing) && loc.published.as_ref() == Some(&moved) {
             moved.retain(|a| unseen.contains(&a.seq));
         }
         if !moved.is_empty()
             && let Some(key) = loc.key.clone()
         {
+            loc.published = Some(moved.clone());
             self.link.send_op(key, Op::Anchored { marks: moved });
         }
         let ranges: Vec<(String, usize, usize)> = loc
