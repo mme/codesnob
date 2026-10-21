@@ -515,6 +515,13 @@ impl Marks {
     ) -> Result<&Mark, String> {
         check_lines(start, end)?;
         let seq = self.find_label(letter).ok_or_else(|| no_mark(letter))?;
+        // Where it already is: nothing changes, least of all its text.
+        let same = self.get(seq).is_some_and(|m| {
+            path.as_ref().is_none_or(|p| *p == m.path) && start == m.start && end == m.end
+        });
+        if same {
+            return Ok(self.get(seq).expect("found"));
+        }
         let m = self.get_mut(seq).expect("found");
         if let Some(path) = path {
             m.path = path;
@@ -862,6 +869,17 @@ mod tests {
             (7, 8),
             "an agent moves its own mark"
         );
+        m.apply(&Op::Anchored {
+            marks: vec![Anchored {
+                seq: 1,
+                start: 7,
+                end: 8,
+                stale: false,
+                text: Some(vec!["x".to_string(), "y".to_string()]),
+            }],
+        });
+        let same = m.move_to("B", Some("a.rs".to_string()), 7, 8).unwrap();
+        assert!(same.text.is_some(), "moved nowhere, it keeps its text");
         let moved = m.move_to("A", None, 9, 9).unwrap();
         assert_eq!((moved.start, moved.end), (9, 9), "shown ones too");
         let err = m.reply("B", "and?").unwrap_err();

@@ -3077,6 +3077,41 @@ fn the_previous_mark_from_an_inner_one_is_the_mark_around_it() {
 }
 
 #[test]
+fn a_show_of_the_same_repository_waits_while_the_user_types() {
+    let dir = repo_with_long_file("ui-hold-same-repo");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    h.keys("jjjjj<enter>half a");
+    let spec = code(None, &[("a.txt", None)]);
+    h.app
+        .dispatch(Msg::View(target(&dir), Box::new(spec), None));
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen.contains("[A] you: half a") && screen.contains("wants to show"),
+        "the composer stays and the request waits:\n{screen}"
+    );
+    h.keys(" thought<s-enter>and<c-w>more<enter>");
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen.contains("a.txt") && !screen.contains("wants to show"),
+        "saved, the request went through:\n{screen}"
+    );
+    h.keys("<");
+    let (marks, _) = h.review();
+    assert_eq!(
+        marks[0].text.as_deref(),
+        Some("half a thought\nmore"),
+        "Ctrl-W took a word, not the line before it"
+    );
+    cleanup(dir);
+}
+
+#[test]
 fn a_selection_keeps_its_lines_while_rows_arrive_above_it() {
     let dir = repo_with_long_file("ui-select-shift");
     let mut h = Harness::open(&dir);

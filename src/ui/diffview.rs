@@ -1478,13 +1478,6 @@ impl DiffView {
                     .compose
                     .as_ref()
                     .is_some_and(|c| c.at == ComposeAt::EditMark(mark.seq));
-                // While its source is edited, the words are what is shown.
-                if !editing && let Some((pic, into)) = picture_at(&mark.pictures, k) {
-                    let who = if mark.author == Author::User { 5 } else { 0 };
-                    let lead = 2 + mark.label.chars().count() + 3 + who;
-                    self.render_picture(pic, into, idx, lead, area, buf, picker);
-                    return;
-                }
                 let mut lead = vec![Span::styled(
                     format!("  [{}] ", mark.label),
                     tint.fg(fg).add_modifier(Modifier::BOLD),
@@ -1497,6 +1490,16 @@ impl DiffView {
                         "you: ",
                         tint.fg(fg).add_modifier(Modifier::BOLD),
                     ));
+                }
+                // While its source is edited, the words are what is shown. A
+                // picture on the first row still has the lead before it.
+                if !editing && let Some((pic, into)) = picture_at(&mark.pictures, k) {
+                    let lead_w: usize = lead.iter().map(|s| s.content.chars().count()).sum();
+                    if k == 0 {
+                        buf.set_line(area.x, area.y, &Line::from(lead), area.width);
+                    }
+                    self.render_picture(pic, into, idx, lead_w, area, buf, picker);
+                    return;
                 }
                 let text = self.mark_text(m);
                 let line = text_lines(&text).nth(k).unwrap_or_default().to_string();
@@ -1516,14 +1519,6 @@ impl DiffView {
                     .compose
                     .as_ref()
                     .is_some_and(|c| c.at == ComposeAt::EditTurn(self.marks[m].seq, turn.n));
-                if !editing && let Some((pic, into)) = picture_at(&turn.pictures, k) {
-                    let lead = 6 + match turn.author {
-                        Author::User => "you: ".len(),
-                        Author::Agent => "agent: ".len(),
-                    };
-                    self.render_picture(pic, into, idx, lead, area, buf, picker);
-                    return;
-                }
                 let who = match turn.author {
                     Author::User => "you",
                     Author::Agent => "agent",
@@ -1532,6 +1527,14 @@ impl DiffView {
                     format!("      {who}: "),
                     tint.fg(fg).add_modifier(Modifier::BOLD),
                 )];
+                if !editing && let Some((pic, into)) = picture_at(&turn.pictures, k) {
+                    let lead_w: usize = lead.iter().map(|s| s.content.chars().count()).sum();
+                    if k == 0 {
+                        buf.set_line(area.x, area.y, &Line::from(lead), area.width);
+                    }
+                    self.render_picture(pic, into, idx, lead_w, area, buf, picker);
+                    return;
+                }
                 let text = self.turn_text(m, t);
                 let line = text_lines(&text).nth(k).unwrap_or_default().to_string();
                 self.render_text_row(area, buf, lead, line, k, tint.fg(fg));

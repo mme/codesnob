@@ -986,10 +986,21 @@ impl App {
         let current = i == 0;
         let (target, tx) = (self.target(), self.tx.clone());
         let loc = &mut self.locations[i];
-        let places = |m: &Marks| -> Vec<(usize, String, usize, usize, bool)> {
+        // A mark whose text was taken away, as by a move, needs a load
+        // to take it afresh.
+        let places = |m: &Marks| -> Vec<(usize, String, usize, usize, bool, bool)> {
             m.marks
                 .iter()
-                .map(|m| (m.seq, m.path.clone(), m.start, m.end, m.stale))
+                .map(|m| {
+                    (
+                        m.seq,
+                        m.path.clone(),
+                        m.start,
+                        m.end,
+                        m.stale,
+                        m.text.is_some(),
+                    )
+                })
                 .collect()
         };
         let before = places(&loc.marks);
@@ -1025,10 +1036,7 @@ impl App {
         if let Some(note) = note {
             self.message = Some(note);
         }
-        // Read, or gone, the comments no longer hold an agent's request back.
-        if !self.typing() && self.cur().is_some_and(|l| l.unread() == 0) {
-            self.apply_pending();
-        }
+        self.release_pending();
     }
 
     /// Bring location `i` to the front, as it was left.
@@ -2018,12 +2026,14 @@ impl App {
                     {
                         loc.view.restore(a);
                     }
+                    self.release_pending();
                 }
                 Some(Outcome::Submit { input, .. }) if composing => {
                     self.panel = None;
                     self.compose_origin = None;
                     self.save_comment(input);
                     self.sync_compose();
+                    self.release_pending();
                 }
                 Some(Outcome::Close) => self.close_panel(true),
                 Some(Outcome::Choose(action, key)) => {
@@ -2080,6 +2090,7 @@ impl App {
                 KeyCode::Esc => {
                     self.marking = None;
                     self.message = Some("marking cancelled".to_string());
+                    self.release_pending();
                     return;
                 }
                 KeyCode::Enter => {
@@ -3034,9 +3045,23 @@ impl App {
     /// A request that would take the user away from a review they are in
     /// the middle of waits: while they type, or hold comments no agent has
     /// read.
+    /// Whether a request has to wait: any while the user is typing or
+    /// selecting, since it would take the rows under them away; one that
+    /// would switch locations while they have words here no agent read.
     fn held(&self, target: &Target, view: Option<&crate::proto::ViewSpec>) -> bool {
-        self.would_switch(target, view)
-            && (self.typing() || self.cur().is_some_and(|l| l.unread() > 0))
+        self.typing()
+            || self.would_switch(target, view) && self.cur().is_some_and(|l| l.unread() > 0)
+    }
+
+    /// Let a waiting request through once nothing holds it any more.
+    fn release_pending(&mut self) {
+        let still = self
+            .pending_show
+            .as_ref()
+            .is_some_and(|p| self.held(&p.target, p.view.as_ref()));
+        if self.pending_show.is_some() && !still {
+            self.apply_pending();
+        }
     }
 
     fn hold(

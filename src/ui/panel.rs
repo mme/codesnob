@@ -233,8 +233,12 @@ impl Panel {
                 self.refilter();
             }
             (KeyCode::Char('w'), true) => {
-                let trimmed = self.input.trim_end().len();
-                let cut = self.input[..trimmed].rfind(' ').map(|i| i + 1).unwrap_or(0);
+                // Back to the last word's start: a line break ends a word too.
+                let trimmed = self.input.trim_end_matches(' ').len();
+                let cut = self.input[..trimmed]
+                    .rfind([' ', '\n'])
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
                 self.input.truncate(cut);
                 self.refilter();
             }
