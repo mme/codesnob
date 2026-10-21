@@ -354,10 +354,13 @@ fn drawn(m: &Mark, target: &diagram::Target, tx: &Sender<Msg>) -> diffview::Mark
             .map(|(at, p)| (*at, diffview::Pic(p.clone())))
             .collect()
     };
+    // The room a drawing has: what is left of the width after the lead
+    // of its row, letter and author and all.
+    let mark_lead = 2 + m.label.chars().count() + 3 + 8 + 5;
     let comment = m
         .comment
         .as_deref()
-        .map(|c| diagram::display(c, target, tx));
+        .map(|c| diagram::display(c, &target.after(mark_lead), tx));
     diffview::Mark {
         path: m.path.clone(),
         start: m.start,
@@ -373,7 +376,8 @@ fn drawn(m: &Mark, target: &diagram::Target, tx: &Sender<Msg>) -> diffview::Mark
             .thread
             .iter()
             .map(|t| {
-                let shown = diagram::display(&t.text, target, tx);
+                let lead = 6 + "agent: ".len();
+                let shown = diagram::display(&t.text, &target.after(lead), tx);
                 diffview::Turn {
                     n: t.n,
                     author: t.author,
@@ -947,10 +951,10 @@ impl App {
         touched
     }
 
-    /// How diagrams are drawn now: the room they have is the body less the
-    /// text's lead; pictures where the terminal shows them.
+    /// How diagrams are drawn now: the room they have is the body's width,
+    /// less each row's own lead; pictures where the terminal shows them.
     fn target(&self) -> diagram::Target {
-        let width = self.body_w.saturating_sub(12).max(20);
+        let width = self.body_w;
         match &self.logo {
             Some(logo) => {
                 let font = logo.picker().font_size();

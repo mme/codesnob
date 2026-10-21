@@ -79,6 +79,23 @@ pub enum Target {
     },
 }
 
+impl Target {
+    /// The same target with `lead` fewer columns: what is drawn sits that
+    /// far in from the left.
+    pub fn after(&self, lead: usize) -> Target {
+        match self {
+            Target::Text { width } => Target::Text {
+                width: width.saturating_sub(lead).max(20),
+            },
+            Target::Picture { cols, cell, light } => Target::Picture {
+                cols: cols.saturating_sub(lead).max(10),
+                cell: *cell,
+                light: *light,
+            },
+        }
+    }
+}
+
 /// A diagram as a picture: its pixels, and the cells they fill.
 #[derive(Debug)]
 pub struct Picture {

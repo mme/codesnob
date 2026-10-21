@@ -180,8 +180,9 @@ pub struct Anchor {
     /// The cursor was on a mark's own row: the mark, by its place in the
     /// order marks were made.
     at_mark: Option<usize>,
-    /// The cursor was on a turn under that mark: the turn, by index.
-    at_turn: Option<usize>,
+    /// The cursor was on a turn under that mark: the turn, by index and
+    /// by its number, which stays when turns before it go.
+    at_turn: Option<(usize, usize)>,
     /// How many rows into that text the cursor was, for text taller than
     /// the screen.
     at_line: usize,
@@ -1041,9 +1042,9 @@ impl DiffView {
                 let mark = &self.marks[*m];
                 at_mark = Some(mark.seq);
                 match self.rows[row] {
-                    Row::Turn(_, t) => at_turn = Some(t),
+                    Row::Turn(_, t) => at_turn = Some((t, mark.thread[t].n)),
                     Row::TurnLine(_, t, k) => {
-                        at_turn = Some(t);
+                        at_turn = Some((t, mark.thread[t].n));
                         at_line = k;
                     }
                     Row::MarkLine(_, k) => at_line = k,
@@ -1060,7 +1061,7 @@ impl DiffView {
                 }
                 Some(ComposeAt::Turn(seq)) => {
                     at_mark = Some(*seq);
-                    at_turn = Some(usize::MAX);
+                    at_turn = Some((usize::MAX, usize::MAX));
                     (None, false)
                 }
                 _ => (None, false),
@@ -1130,14 +1131,20 @@ impl DiffView {
             && let Some(m) = self.marks.iter().position(|m| m.seq == seq)
             && let Some(row) = self.mark_rows[m]
         {
-            // A turn that went leaves the cursor on the one above.
-            let turns = self.marks[m].thread.len();
+            // The same turn by its number; a turn that went leaves the
+            // cursor where it was in the thread, or at the thread's end.
+            let thread = &self.marks[m].thread;
             at = match a.at_turn {
-                Some(i) if turns > 0 => self
-                    .rows
-                    .iter()
-                    .position(|r| *r == Row::Turn(m, i.min(turns - 1)))
-                    .unwrap_or(row),
+                Some((i, n)) if !thread.is_empty() => {
+                    let t = thread
+                        .iter()
+                        .position(|t| t.n == n)
+                        .unwrap_or(i.min(thread.len() - 1));
+                    self.rows
+                        .iter()
+                        .position(|r| *r == Row::Turn(m, t))
+                        .unwrap_or(row)
+                }
                 _ => row,
             };
             // As far into the text as before, while it has the rows.

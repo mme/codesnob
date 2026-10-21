@@ -3112,6 +3112,34 @@ fn a_show_of_the_same_repository_waits_while_the_user_types() {
 }
 
 #[test]
+fn the_cursor_stays_on_its_turn_when_an_earlier_one_goes() {
+    let dir = repo_with_long_file("ui-turn-stays");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    h.keys("jjj<enter>why<enter>");
+    h.keys("<enter>first<enter>");
+    h.keys("<enter>second<enter>");
+    h.keys("<enter>third<enter>");
+    h.keys("k");
+    let (_, text) = h.cursor();
+    assert!(text.contains("you: second"), "{text}");
+    // Another viewer removes the first turn; this cursor keeps its turn.
+    h.agent(None, |m| {
+        m.apply(&Op::Delete { seq: 0, n: Some(1) });
+        Ok(())
+    })
+    .unwrap();
+    let (_, text) = h.cursor();
+    assert!(text.contains("you: second"), "{text}");
+    h.keys("x");
+    assert!(h.screen().contains("you: third") && !h.screen().contains("you: second"));
+    cleanup(dir);
+}
+
+#[test]
 fn a_selection_keeps_its_lines_while_rows_arrive_above_it() {
     let dir = repo_with_long_file("ui-select-shift");
     let mut h = Harness::open(&dir);
