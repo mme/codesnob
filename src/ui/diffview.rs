@@ -581,7 +581,7 @@ impl DiffView {
     /// The turn whose row the cursor is on: its mark, by its place in the
     /// order marks were made, and the turn.
     pub fn turn_at_cursor(&self) -> Option<(usize, &Turn)> {
-        let Row::Turn(m, t) = *self.rows.get(self.cursor)? else {
+        let (Row::Turn(m, t) | Row::TurnLine(m, t, _)) = *self.rows.get(self.cursor)? else {
             return None;
         };
         let mark = &self.marks[m];
@@ -593,7 +593,7 @@ impl DiffView {
     /// row the cursor is on.
     pub fn any_mark_at_cursor(&self) -> Option<usize> {
         match self.rows.get(self.cursor)? {
-            Row::Mark(m) => Some(self.marks[*m].seq),
+            Row::Mark(m) | Row::MarkLine(m, _) => Some(self.marks[*m].seq),
             Row::Line(fi, hi, li) => {
                 let f = &self.files[*fi];
                 let line = &f.hunks[*hi].lines[*li];
@@ -612,7 +612,7 @@ impl DiffView {
     /// row the cursor is on.
     pub fn comment_at_cursor(&self) -> Option<usize> {
         match self.rows.get(self.cursor)? {
-            Row::Mark(m) => {
+            Row::Mark(m) | Row::MarkLine(m, _) => {
                 let mark = &self.marks[*m];
                 (mark.author == Author::User).then_some(mark.seq)
             }

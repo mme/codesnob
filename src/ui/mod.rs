@@ -870,8 +870,14 @@ impl App {
                 text: m.comment.clone(),
             })
             .collect();
-        if !shown.is_empty() {
-            self.link.send_op(key.clone(), Op::Marks { marks: shown });
+        // As many as one show may place at a time.
+        for chunk in shown.chunks(marks::MAX_MARKS) {
+            self.link.send_op(
+                key.clone(),
+                Op::Marks {
+                    marks: chunk.to_vec(),
+                },
+            );
         }
         for m in fresh.marks.iter().filter(|m| m.author == Author::User) {
             self.link.send_op(

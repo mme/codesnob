@@ -3171,6 +3171,11 @@ fn a_tall_block_at_the_end_scrolls_into_view_row_by_row() {
         "the tail came into view:\n{}",
         h.screen()
     );
+    // Deep in the text, the keys still mean the mark.
+    h.keys("<enter>");
+    assert!(h.screen().contains("reply under [A]"), "{}", h.screen());
+    h.keys("<esc>x");
+    assert!(h.status().contains("[A] removed"), "{}", h.status());
     cleanup(dir);
 }
 
