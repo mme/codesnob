@@ -5,6 +5,7 @@
 //! on a background thread; the screen only ever shows the newest result.
 
 mod commands;
+mod diagram;
 mod diffview;
 mod logo;
 mod markdown;
@@ -333,8 +334,19 @@ fn agent_news(old: &Marks, new: &Marks) -> Vec<(usize, Option<usize>)> {
         .collect()
 }
 
-/// A mark as the view draws it.
-fn drawn(m: &Mark) -> diffview::Mark {
+/// A mark as the view draws it: its text with diagrams drawn.
+fn drawn(m: &Mark, target: &diagram::Target, tx: &Sender<Msg>) -> diffview::Mark {
+    let pics = |shown: &diagram::Shown| -> Vec<(usize, diffview::Pic)> {
+        shown
+            .pictures
+            .iter()
+            .map(|(at, p)| (*at, diffview::Pic(p.clone())))
+            .collect()
+    };
+    let comment = m
+        .comment
+        .as_deref()
+        .map(|c| diagram::display(c, target, tx));
     diffview::Mark {
         path: m.path.clone(),
         start: m.start,
@@ -342,16 +354,21 @@ fn drawn(m: &Mark) -> diffview::Mark {
         label: m.label.clone(),
         seq: m.seq,
         author: m.author,
-        comment: m.comment.clone(),
+        pictures: comment.as_ref().map(pics).unwrap_or_default(),
+        comment: comment.map(|s| s.text),
         stale: m.stale,
         old_side: m.old_side,
         thread: m
             .thread
             .iter()
-            .map(|t| diffview::Turn {
-                n: t.n,
-                author: t.author,
-                text: t.text.clone(),
+            .map(|t| {
+                let shown = diagram::display(&t.text, target, tx);
+                diffview::Turn {
+                    n: t.n,
+                    author: t.author,
+                    pictures: pics(&shown),
+                    text: shown.text,
+                }
             })
             .collect(),
     }
@@ -409,9 +426,13 @@ impl Location {
         })
     }
 
-    /// Its marks as the view draws them.
-    fn drawn(&self) -> Vec<diffview::Mark> {
-        self.marks.marks.iter().map(drawn).collect()
+    /// Its marks as the view draws them, diagrams drawn for `target`.
+    fn drawn(&self, target: &diagram::Target, tx: &Sender<Msg>) -> Vec<diffview::Mark> {
+        self.marks
+            .marks
+            .iter()
+            .map(|m| drawn(m, target, tx))
+            .collect()
     }
 
     /// How agents name it: the checkout's path, or `owner/repo#142`.
@@ -660,6 +681,8 @@ pub struct App {
     recent: HashMap<panel::Kind, Vec<String>>,
     message: Option<String>,
     body_h: usize,
+    /// The width of the body at the last draw, for what has to fit in it.
+    body_w: usize,
     /// Where the body starts on screen; mouse rows are relative to it.
     body_y: u16,
     /// Commit messages are shown above a commit's diff unless turned off.
@@ -704,6 +727,7 @@ impl App {
             recent: HashMap::new(),
             message: None,
             body_h: 1,
+            body_w: 80,
             body_y: 0,
             show_commit_desc: true,
             show_pr_desc: false,
@@ -809,16 +833,44 @@ impl App {
     /// send it to the daemon. The marks touched, by their place in the
     /// order marks were made.
     fn apply_op(&mut self, i: usize, op: Op) -> Vec<usize> {
+        let (target, tx) = (self.target(), self.tx.clone());
         let Some(loc) = self.locations.get_mut(i) else {
             return Vec::new();
         };
         let touched = loc.marks.apply(&op);
-        let marks = loc.drawn();
+        let marks = loc.drawn(&target, &tx);
         loc.view.set_marks(marks);
         if let Some(key) = loc.key.clone() {
             self.link.send_op(key, op);
         }
         touched
+    }
+
+    /// How diagrams are drawn now: the room they have is the body less the
+    /// text's lead; pictures where the terminal shows them.
+    fn target(&self) -> diagram::Target {
+        let width = self.body_w.saturating_sub(12).max(20);
+        match &self.logo {
+            Some(logo) => {
+                let font = logo.picker().font_size();
+                diagram::Target::Picture {
+                    cols: width,
+                    cell: (font.width, font.height),
+                    light: self.palette.light,
+                }
+            }
+            None => diagram::Target::Text { width },
+        }
+    }
+
+    /// A diagram got drawn, or the room for one changed: every location's
+    /// marks are drawn again.
+    fn redraw_marks(&mut self) {
+        let (target, tx) = (self.target(), self.tx.clone());
+        for loc in &mut self.locations {
+            let marks = loc.drawn(&target, &tx);
+            loc.view.set_marks(marks);
+        }
     }
 
     /// The daemon says what a location's marks are now: take them over.
@@ -831,6 +883,7 @@ impl App {
             return;
         };
         let current = i == 0;
+        let (target, tx) = (self.target(), self.tx.clone());
         let loc = &mut self.locations[i];
         let places = |m: &Marks| -> Vec<(usize, String, usize, usize, bool)> {
             m.marks
@@ -842,7 +895,7 @@ impl App {
         let news = agent_news(&loc.marks, &state.marks);
         loc.marks = state.marks;
         let moved = before != places(&loc.marks);
-        let marks = loc.drawn();
+        let marks = loc.drawn(&target, &tx);
         loc.view.set_marks(marks);
         if moved {
             // The lines a mark needs may not be shown yet.
@@ -1504,6 +1557,7 @@ impl App {
     /// Files to show as they are have loaded.
     fn apply_code(&mut self, id: u64, seq: u64, code: git::CodeSnapshot) {
         let current = self.locations.first().is_some_and(|l| l.id == id);
+        let (target, tx) = (self.target(), self.tx.clone());
         let Some(loc) = self.locations.iter_mut().find(|l| l.id == id) else {
             return;
         };
@@ -1562,7 +1616,7 @@ impl App {
             })
             .collect();
         loc.view.set_built(files);
-        let marks = loc.drawn();
+        let marks = loc.drawn(&target, &tx);
         loc.view.set_marks(marks);
         if current && let Some(text) = gone_message(gone) {
             self.message = Some(text);
@@ -1598,6 +1652,7 @@ impl App {
         let context = self.opts.context;
         // A location loaded in the background speaks only once it is shown.
         let current = self.locations.first().is_some_and(|l| l.id == id);
+        let (target, tx) = (self.target(), self.tx.clone());
         let Some(loc) = self.locations.iter_mut().find(|l| l.id == id) else {
             return;
         };
@@ -1690,7 +1745,7 @@ impl App {
                 .map(|&(_, a, b)| (a, b))
                 .collect()
         });
-        let marks = loc.drawn();
+        let marks = loc.drawn(&target, &tx);
         loc.view.set_marks(marks);
         if current && let Some(text) = gone_message(gone) {
             self.message = Some(text);
@@ -1758,6 +1813,7 @@ impl App {
                 }
             }
             Msg::Location { state, note } => self.take_location(*state, note),
+            Msg::Diagram => self.redraw_marks(),
             Msg::Link(up) => {
                 self.linked = up;
                 if up {
@@ -3426,6 +3482,10 @@ impl App {
             (banner, p.words.clone())
         });
         self.body_h = body.height as usize;
+        if self.body_w != body.width as usize {
+            self.body_w = body.width as usize;
+            self.redraw_marks();
+        }
         self.body_y = body.y;
         let rebuild = self
             .cur()
@@ -3474,7 +3534,9 @@ impl App {
             Some(notice) => self.render_empty(&notice, body, buf),
             None => {
                 if let Some(loc) = self.locations.first() {
-                    loc.view.render(body, buf, &self.palette, &mut self.hl);
+                    let picker = self.logo.as_ref().map(logo::Logo::picker);
+                    loc.view
+                        .render(body, buf, &self.palette, &mut self.hl, picker);
                     if composing {
                         text_cursor = loc.view.compose_cursor(body);
                     }

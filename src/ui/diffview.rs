@@ -1,12 +1,21 @@
 //! The flat diff: files, hunks and lines as one scrollable list of rows,
 //! with a sticky file header, line numbers, syntax and intra-line highlights.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Widget;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image, Resize};
 
 use super::Palette;
+use super::diagram::Picture;
 use crate::diff::{self, FileDiff, Kind, Status};
 use crate::git::FileChange;
 use crate::highlight::Highlighter;
@@ -60,6 +69,28 @@ fn text_lines(text: &str) -> std::str::Split<'_, char> {
     text.split('\n')
 }
 
+/// A picture in some text, the same one as long as it is the same
+/// drawing.
+#[derive(Clone, Debug)]
+pub struct Pic(pub Arc<Picture>);
+
+impl PartialEq for Pic {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Pic {}
+
+/// The picture line `k` of some text falls in, if any, and how many lines
+/// into it.
+fn picture_at(pictures: &[(usize, Pic)], k: usize) -> Option<(&Pic, usize)> {
+    pictures
+        .iter()
+        .find(|(at, p)| (*at..*at + usize::from(p.0.rows)).contains(&k))
+        .map(|(at, p)| (p, k - at))
+}
+
 /// A mark as drawn: its file, its lines, its letter and text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mark {
@@ -73,6 +104,9 @@ pub struct Mark {
     pub author: Author,
     /// The words on it.
     pub comment: Option<String>,
+    /// Pictures among the words, each at the line it starts on; the lines
+    /// it takes are blank in `comment`.
+    pub pictures: Vec<(usize, Pic)>,
     /// Its lines no longer exist; drawn near where they were, untinted.
     pub stale: bool,
     /// Its lines are the old side's: deleted lines in a diff.
@@ -88,6 +122,8 @@ pub struct Turn {
     pub n: usize,
     pub author: Author,
     pub text: String,
+    /// Pictures among the words, as on a mark.
+    pub pictures: Vec<(usize, Pic)>,
 }
 
 /// Text being typed, shown where it will go once saved.
@@ -187,6 +223,9 @@ pub struct DiffView {
     compose: Option<Composing>,
     /// The row showing it, when it has one of its own.
     compose_row: Option<usize>,
+    /// Pictures encoded for the terminal, by picture, the rows of it shown
+    /// and how many, and where it starts on screen.
+    encoded: RefCell<HashMap<(usize, usize, u16, u16), Protocol>>,
 }
 
 impl DiffView {
@@ -1251,7 +1290,14 @@ impl DiffView {
 
     // ---- rendering --------------------------------------------------------
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer, p: &Palette, hl: &mut Highlighter) {
+    pub fn render(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        p: &Palette,
+        hl: &mut Highlighter,
+        picker: Option<&Picker>,
+    ) {
         let mut y = area.y;
         let mut idx = self.scroll;
         // Sticky header unless the real header is the first visible row.
@@ -1266,7 +1312,7 @@ impl DiffView {
                 break;
             };
             let line = Rect::new(area.x, y, area.width, 1);
-            self.render_row(idx, row, line, buf, p, hl);
+            self.render_row(idx, row, line, buf, p, hl, picker);
             if idx == self.cursor {
                 self.render_cursor(row, line, buf, p);
             }
@@ -1276,6 +1322,7 @@ impl DiffView {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn render_row(
         &self,
         idx: usize,
@@ -1284,6 +1331,7 @@ impl DiffView {
         buf: &mut Buffer,
         p: &Palette,
         hl: &mut Highlighter,
+        picker: Option<&Picker>,
     ) {
         match row {
             Row::Mark(m) | Row::MarkLine(m, _) => {
@@ -1292,6 +1340,12 @@ impl DiffView {
                 let (bg, fg) = p.mark_colors(mark.author);
                 let tint = Style::default().bg(bg);
                 buf.set_style(area, tint);
+                if let Some((pic, into)) = picture_at(&mark.pictures, k) {
+                    let who = if mark.author == Author::User { 5 } else { 0 };
+                    let lead = 2 + mark.label.chars().count() + 3 + who;
+                    self.render_picture(pic, into, idx, lead, area, buf, picker);
+                    return;
+                }
                 let editing = self
                     .compose
                     .as_ref()
@@ -1323,6 +1377,14 @@ impl DiffView {
                 let (bg, fg) = p.mark_colors(turn.author);
                 let tint = Style::default().bg(bg);
                 buf.set_style(area, tint);
+                if let Some((pic, into)) = picture_at(&turn.pictures, k) {
+                    let lead = 6 + match turn.author {
+                        Author::User => "you: ".len(),
+                        Author::Agent => "agent: ".len(),
+                    };
+                    self.render_picture(pic, into, idx, lead, area, buf, picker);
+                    return;
+                }
                 let who = match turn.author {
                     Author::User => "you",
                     Author::Agent => "agent",
@@ -1405,6 +1467,66 @@ impl DiffView {
                 cell.modifier.insert(Modifier::BOLD);
             }
         }
+    }
+
+    /// A picture's rows: drawn once, from the first of its rows on screen
+    /// down as far as the screen goes, `lead` cells in from the left. Rows
+    /// before that one, and terminals that show no pictures, get the tint
+    /// alone.
+    #[allow(clippy::too_many_arguments)]
+    fn render_picture(
+        &self,
+        pic: &Pic,
+        into: usize,
+        idx: usize,
+        lead: usize,
+        area: Rect,
+        buf: &mut Buffer,
+        picker: Option<&Picker>,
+    ) {
+        let Some(picker) = picker else { return };
+        // The first row of it on screen draws it: its own first row, or
+        // the top of the screen when it starts above.
+        if into != 0 && idx != self.scroll {
+            return;
+        }
+        let picture = &pic.0;
+        let left = usize::from(picture.rows) - into;
+        let shown = (self.scroll + self.visible_at(self.scroll))
+            .saturating_sub(idx)
+            .min(left)
+            .min(usize::from(u16::MAX)) as u16;
+        if shown == 0 || area.width as usize <= lead {
+            return;
+        }
+        let cols = picture.cols.min(area.width - lead as u16);
+        let key = (Arc::as_ptr(picture) as usize, into, shown, cols);
+        let mut encoded = self.encoded.borrow_mut();
+        if let std::collections::hash_map::Entry::Vacant(slot) = encoded.entry(key) {
+            let cell_h = picture.image.height() / u32::from(picture.rows.max(1));
+            let cell_w = picture.image.width() / u32::from(picture.cols.max(1));
+            let slice = image::imageops::crop_imm(
+                &picture.image,
+                0,
+                into as u32 * cell_h,
+                u32::from(cols) * cell_w,
+                u32::from(shown) * cell_h,
+            )
+            .to_image();
+            let size = Size::new(cols, shown);
+            let Ok(protocol) = picker.new_protocol(
+                image::DynamicImage::ImageRgba8(slice),
+                size,
+                Resize::Fit(None),
+            ) else {
+                return;
+            };
+            slot.insert(protocol);
+        }
+        let at = Rect::new(area.x + lead as u16, area.y, cols, shown);
+        Image::new(&encoded[&key])
+            .allow_clipping(true)
+            .render(at, buf);
     }
 
     /// One row of a block of text: the lead (letter, who) on the first

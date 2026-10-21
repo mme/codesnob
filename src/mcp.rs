@@ -81,7 +81,7 @@ fn initialize(params: &Value) -> Value {
 }
 
 /// Always in the agent's context, so this is what makes it reach for codesnob.
-const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a terminal beside you. When the user wants to see code, show it there instead of pasting it into the chat: `show_code` for files and lines, with marks on the lines you mean; `show_diff` for what changed between any two states (the branch point, commits, branches, staged work, a pull request). Typical requests: \"show me the code\", \"where is this handled\", \"open that file\", \"what changed\", \"show me the diff\", \"compare main and this branch\", \"show me PR 123\". A call updates that repository's view in the viewer; the user gets back to where they were with Esc. Read files with your own tools; codesnob is for showing. Marks are lettered [A], [B]… in the viewer and shared between you and the user, each with a thread under it; yours and theirs are the same thing. A mark stays until someone removes it: a show adds marks and removes none, so clear your own with `clear_marks` once they have served, and before pointing somewhere new. Put words on a mark only when the user asks you to explain, review or comment on code: in the show call, or with `mark` for lines they are already looking at. The user marks lines in the viewer too; call `get_review` whenever they say they reviewed, commented or marked something, or a reply tells you they have unread comments, and answer to the letters. A location is a repository or a pull request, named by the repository's path (repo) or as owner/repo#123 (pr); the review tools default to the location on screen, so name one only for marks elsewhere. `list_locations` lists the locations open, with their unread comments. Answer in the thread under a mark with `reply`, and when you change the code under a mark, keep it on the right lines with `move_mark`. A mark the user made or wrote under is theirs: `clear_marks` removes it only whole and only when the user explicitly asks you to delete it.";
+const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a terminal beside you. When the user wants to see code, show it there instead of pasting it into the chat: `show_code` for files and lines, with marks on the lines you mean; `show_diff` for what changed between any two states (the branch point, commits, branches, staged work, a pull request). Typical requests: \"show me the code\", \"where is this handled\", \"open that file\", \"what changed\", \"show me the diff\", \"compare main and this branch\", \"show me PR 123\". A call updates that repository's view in the viewer; the user gets back to where they were with Esc. Read files with your own tools; codesnob is for showing. Marks are lettered [A], [B]… in the viewer and shared between you and the user, each with a thread under it; yours and theirs are the same thing. A mark stays until someone removes it: a show adds marks and removes none, so clear your own with `clear_marks` once they have served, and before pointing somewhere new. Put words on a mark only when the user asks you to explain, review or comment on code: in the show call, or with `mark` for lines they are already looking at. A ```mermaid fence in a mark's words is drawn as a diagram, so a flow or a sequence can be shown next to the code it describes. The user marks lines in the viewer too; call `get_review` whenever they say they reviewed, commented or marked something, or a reply tells you they have unread comments, and answer to the letters. A location is a repository or a pull request, named by the repository's path (repo) or as owner/repo#123 (pr); the review tools default to the location on screen, so name one only for marks elsewhere. `list_locations` lists the locations open, with their unread comments. Answer in the thread under a mark with `reply`, and when you change the code under a mark, keep it on the right lines with `move_mark`. A mark the user made or wrote under is theirs: `clear_marks` removes it only whole and only when the user explicitly asks you to delete it.";
 
 fn tools() -> Value {
     json!([{
@@ -107,7 +107,7 @@ fn tools() -> Value {
                                     "type": "object",
                                     "properties": {
                                         "lines": { "type": "string", "description": "1-based and inclusive: \"40-60\", or \"42\" for one line." },
-                                        "text": { "type": "string", "description": "Words shown under the lines; a newline starts a new row. Only when the user asked you to explain, review or comment on the code." }
+                                        "text": { "type": "string", "description": "Words shown under the lines; a newline starts a new row, and a ```mermaid fence is drawn as a diagram. Only when the user asked you to explain, review or comment on the code." }
                                     },
                                     "required": ["lines"]
                                 }
@@ -140,7 +140,7 @@ fn tools() -> Value {
                         "properties": {
                             "path": { "type": "string", "description": "Relative to your working directory, or absolute." },
                             "lines": { "type": "string", "description": "1-based and inclusive: \"40-60\", or \"42\" for one line." },
-                            "text": { "type": "string", "description": "Words shown under the lines; a newline starts a new row. Only when the user asked you to explain, review or comment on the code." }
+                            "text": { "type": "string", "description": "Words shown under the lines; a newline starts a new row, and a ```mermaid fence is drawn as a diagram. Only when the user asked you to explain, review or comment on the code." }
                         },
                         "required": ["path", "lines"]
                     }
@@ -177,7 +177,7 @@ fn tools() -> Value {
                         "properties": {
                             "path": { "type": "string", "description": "The file, relative to your working directory." },
                             "lines": { "type": "string", "description": "The lines, 1-based and inclusive: \"40-60\", or \"42\"." },
-                            "text": { "type": "string", "description": "The words, a few sentences at most." }
+                            "text": { "type": "string", "description": "The words, a few sentences at most. A ```mermaid fence inside is drawn as a diagram: flowchart, sequence, state, class, ER and the other Mermaid kinds." }
                         },
                         "required": ["path", "lines", "text"]
                     }

@@ -40,6 +40,8 @@ pub enum Msg {
     },
     /// Daemon link went up or down.
     Link(bool),
+    /// A diagram in some mark's text is drawn, or given up on.
+    Diagram,
     /// How location `loc`'s watcher ended up detecting changes.
     Watching {
         loc: u64,

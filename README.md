@@ -145,7 +145,7 @@ The server gives the agent eight tools:
 | `show_diff` | show any comparison from [the range table](#what-is-compared), optionally limited to some files, with marks on lines |
 | `list_locations` | list every location: each repository or pull request, what it shows, which viewer has it on screen, and how many of your words it has that the agent has not read |
 | `get_review` | read every mark on a location, the agent's and yours, with the threads under them, the code under your marks and what is new |
-| `mark` | mark lines with words, up to 20 in one call, without changing the view: for comments on code you are already looking at |
+| `mark` | mark lines with words, up to 20 in one call, without changing the view: for comments on code you are already looking at. A ```mermaid fence in the words is drawn as a diagram |
 | `reply` | answer in the thread under a mark |
 | `move_mark` | put a mark on other lines after the agent changed the code under it; it keeps its letter, text and thread |
 | `clear_marks` | remove the agent's own marks. A mark you made or wrote under goes whole, thread and all, and only when the call says you explicitly asked for that (`user_explicitly_asked_to_delete_comments`); otherwise it is refused |
@@ -249,6 +249,13 @@ lines, but it cannot change what you wrote.
 
 Marks follow their code as you edit. If the lines a mark pointed at are
 deleted, the mark stays and is flagged stale.
+
+A ```mermaid fence in a mark's text is drawn as a diagram in place of the
+fence, with the words around it as they are: flowcharts, sequence, state,
+class and ER diagrams and the other Mermaid kinds. In a terminal that shows
+images (Sixel, kitty or iTerm2) it is a picture on the mark's own colour;
+elsewhere it is box-drawing text. The drawing is made off the main thread
+and cached; a diagram that cannot be drawn shows its source and why.
 
 ### When the agent shows something while you are busy
 

@@ -54,6 +54,11 @@ the machinery, not decoration.
   take `marks` with `text` instead of `highlights` with `note`; `reply`
   (was `reply_to_comment`) answers under any mark, `move_mark` (was
   `move_comment`) moves any mark, and `get_review` says who made each.
+- **Diagrams in marks.** A ```mermaid fence in a mark's text, the
+  agent's or yours, is drawn as a diagram where the fence was: a picture
+  on the mark's colour in a terminal that shows images, box-drawing text
+  anywhere else. All Mermaid kinds; drawn off the main thread, cached,
+  and given up on after a few seconds with the source shown instead.
 - The protocol version is now 3. Viewers, agents and the daemon must be
   on the same build.
 

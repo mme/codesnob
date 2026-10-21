@@ -129,6 +129,11 @@ impl Logo {
         Some(canvas.into())
     }
 
+    /// The terminal's way of showing pictures, for other pictures.
+    pub fn picker(&self) -> &Picker {
+        &self.picker
+    }
+
     /// Draw the sticker in `area`, a size `size_in` gave.
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let size = area.as_size();

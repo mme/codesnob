@@ -3056,6 +3056,60 @@ fn an_agents_mark_on_a_diff_shows_its_text_under_the_lines() {
 }
 
 #[test]
+fn a_mermaid_fence_in_a_mark_is_drawn_as_a_diagram() {
+    let dir = repo_with_long_file("ui-mermaid");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    let text =
+        "How it flows:\n```mermaid\nflowchart LR\n  V[Viewer] --> D[Daemon]\n```\nThat is all.";
+    assert_eq!(h.mark("src/long.rs", 10, 10, text), "A");
+    let screen = h.screen();
+    assert!(
+        screen.contains("[A] How it flows:")
+            && (screen.contains("drawing the diagram…") || screen.contains('┌')),
+        "the words show at once, the drawing is on its way or there:\n{screen}"
+    );
+    wait_until(&mut h, &|h| h.screen().contains('┌'));
+    let screen = h.screen();
+    let rows: Vec<&str> = screen.lines().collect();
+    let a = rows
+        .iter()
+        .position(|l| l.contains("[A] How it flows:"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    let drawing: Vec<&str> = rows[a + 1..]
+        .iter()
+        .take_while(|l| !l.contains("That is all."))
+        .copied()
+        .collect();
+    assert!(
+        drawing.iter().any(|l| l.contains("Viewer"))
+            && drawing.iter().any(|l| l.contains("Daemon")),
+        "the nodes are drawn under the words:\n{screen}"
+    );
+    assert!(
+        !screen.contains("```") && !screen.contains("drawing the diagram"),
+        "the fence is gone:\n{screen}"
+    );
+    assert!(
+        rows[a + 1 + drawing.len()].contains("That is all."),
+        "the text goes on after the drawing:\n{screen}"
+    );
+    // The agent reads its own fence back, not the drawing.
+    let (marks, _) = h.review();
+    assert!(marks[0].text.as_deref().unwrap().contains("```mermaid"));
+    // The cursor steps over the drawing's rows as over any text.
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 10"), "{text}");
+    h.keys("jj");
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 11"), "{text}");
+    cleanup(dir);
+}
+
+#[test]
 fn deleting_a_comment_from_its_own_row_leaves_the_cursor_on_its_line() {
     let dir = repo_with_long_file("ui-comment-row-delete");
     let mut h = Harness::open(&dir);
