@@ -498,12 +498,23 @@ impl DiffView {
         rows
     }
 
-    /// The next mark below the cursor.
+    /// Where the cursor is among the marks shown: the mark it was last
+    /// taken to, when it is still on that mark's first row.
+    fn at_mark(&self, marks: &[(usize, usize)]) -> Option<usize> {
+        let current = self.current_mark?;
+        marks
+            .iter()
+            .position(|(r, i)| *i == current && *r == self.cursor)
+    }
+
+    /// The next mark below the cursor; from a mark, the one after it,
+    /// though it start on the same line.
     pub fn next_mark(&mut self) {
-        let next = self
-            .shown_marks()
-            .into_iter()
-            .find(|(r, _)| *r > self.cursor);
+        let marks = self.shown_marks();
+        let next = match self.at_mark(&marks) {
+            Some(pos) => marks.get(pos + 1).copied(),
+            None => marks.iter().find(|(r, _)| *r > self.cursor).copied(),
+        };
         if let Some((_, i)) = next {
             self.go_to_mark(i);
         }
@@ -513,6 +524,12 @@ impl DiffView {
     /// cursor is on is where we are, not where we go.
     pub fn prev_mark(&mut self) {
         let marks = self.shown_marks();
+        if let Some(pos) = self.at_mark(&marks) {
+            if let Some(&(_, i)) = pos.checked_sub(1).and_then(|p| marks.get(p)) {
+                self.go_to_mark(i);
+            }
+            return;
+        }
         // The innermost of the marks the cursor is in: the one starting last.
         let here = marks
             .iter()

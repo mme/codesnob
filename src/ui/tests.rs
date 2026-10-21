@@ -3077,6 +3077,37 @@ fn the_previous_mark_from_an_inner_one_is_the_mark_around_it() {
 }
 
 #[test]
+fn marks_starting_on_the_same_line_are_stepped_through_one_by_one() {
+    let dir = repo_with_long_file("ui-marks-same-line");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.marks = vec![
+        hl("src/long.rs", 10, 12, Some("short")),
+        hl("src/long.rs", 10, 20, Some("long")),
+        hl("src/long.rs", 30, 30, Some("later")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    assert!(h.status().contains("[A] 1 of 3"), "{}", h.status());
+    h.keys(">");
+    assert!(h.status().contains("[B] 2 of 3"), "{}", h.status());
+    h.keys(">");
+    assert!(h.status().contains("[C] 3 of 3"), "{}", h.status());
+    h.keys("<");
+    assert!(h.status().contains("[B] 2 of 3"), "{}", h.status());
+    h.keys("<");
+    assert!(h.status().contains("[A] 1 of 3"), "{}", h.status());
+    h.keys("<");
+    assert!(
+        h.status().contains("[A] 1 of 3"),
+        "nothing before: {}",
+        h.status()
+    );
+    cleanup(dir);
+}
+
+#[test]
 fn a_mark_on_a_line_the_diff_did_not_show_is_jumped_to_once_it_is() {
     let dir = repo_with_long_file("ui-jump-later");
     let body: String = (1..=60)

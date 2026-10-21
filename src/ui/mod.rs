@@ -30,7 +30,7 @@ use crate::git::{self, Range};
 use crate::highlight::Highlighter;
 use crate::link::Link;
 use crate::loader;
-use crate::marks::{self, Author, Mark, Marks, Op};
+use crate::marks::{self, Author, Mark, MarkSpec, Marks, Op};
 use crate::proto::Target;
 use crate::registry::{LocationKey, LocationState, checkout_root};
 use crate::watch::{self, Mode, Msg};
@@ -663,6 +663,10 @@ struct Location {
     /// finds is not news to send back, or two viewers on different
     /// revisions would correct each other forever.
     syncing: bool,
+    /// The daemon has told this viewer what the location's marks are, so
+    /// the marks here are the daemon's, not ones made before it knew the
+    /// location.
+    synced: bool,
     focus: Focus,
     view: DiffView,
     info: Option<Info>,
@@ -812,6 +816,7 @@ impl App {
             jumped_to: None,
             pending_jump: Vec::new(),
             syncing: false,
+            synced: false,
             focus: Focus::All,
             view: DiffView::default(),
             info: None,
@@ -838,9 +843,50 @@ impl App {
 
     /// Tell the daemon this viewer has location `i` open, so it hands
     /// back the marks everyone shares.
+    /// Tell the daemon about location `i`. Marks made before the location
+    /// had a key, as on a pull request still being fetched, go as ops: the
+    /// daemon may know the location already, and then it keeps its own
+    /// marks and letters these after them.
     fn share(&self, i: usize) {
-        if let Some(state) = self.locations.get(i).and_then(Location::state) {
+        let Some(loc) = self.locations.get(i) else {
+            return;
+        };
+        let Some(mut state) = loc.state() else { return };
+        if loc.synced || loc.marks.marks.is_empty() {
             self.link.send_location(state);
+            return;
+        }
+        let fresh = std::mem::take(&mut state.marks);
+        let key = state.key.clone();
+        self.link.send_location(state);
+        let shown: Vec<MarkSpec> = fresh
+            .marks
+            .iter()
+            .filter(|m| m.author == Author::Agent)
+            .map(|m| MarkSpec {
+                path: m.path.clone(),
+                start: m.start,
+                end: m.end,
+                text: m.comment.clone(),
+            })
+            .collect();
+        if !shown.is_empty() {
+            self.link.send_op(key.clone(), Op::Marks { marks: shown });
+        }
+        for m in fresh.marks.iter().filter(|m| m.author == Author::User) {
+            self.link.send_op(
+                key.clone(),
+                Op::Mark {
+                    author: Author::User,
+                    path: m.path.clone(),
+                    start: m.start,
+                    end: m.end,
+                    old_side: m.old_side,
+                    with_deletions: m.with_deletions,
+                    text: m.comment.clone().unwrap_or_default(),
+                    lines: m.text.clone().unwrap_or_default(),
+                },
+            );
         }
     }
 
@@ -932,6 +978,7 @@ impl App {
         let before = places(&loc.marks);
         let news = agent_news(&loc.marks, &state.marks);
         loc.marks = state.marks;
+        loc.synced = true;
         let moved = before != places(&loc.marks);
         let marks = loc.drawn(&target, &tx);
         loc.view.set_marks(marks);
@@ -1095,6 +1142,7 @@ impl App {
             jumped_to: None,
             pending_jump: Vec::new(),
             syncing: false,
+            synced: false,
             focus: Focus::All,
             view: DiffView::default(),
             info: None,
