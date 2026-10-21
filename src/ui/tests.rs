@@ -2129,7 +2129,7 @@ fn comments_are_deleted_one_by_one_or_cleared_after_a_question() {
     h.keys("jjjj<enter>two<enter>");
     h.keys("kj");
     assert!(
-        h.status().contains("2 yours") && h.status().contains("3 marks"),
+        h.status().contains("2 yours") && h.status().contains("of 3"),
         "{}",
         h.status()
     );

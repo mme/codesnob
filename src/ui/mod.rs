@@ -2997,8 +2997,16 @@ impl App {
             Action::Commits => has_info,
             Action::NextMark | Action::PrevMark => loc.view.has_marks(),
             Action::Comment | Action::MarkRegion => has_rows,
-            Action::EditComment | Action::DeleteComment => {
+            Action::EditComment => {
                 loc.view.comment_at_cursor().is_some()
+                    || loc
+                        .view
+                        .turn_at_cursor()
+                        .is_some_and(|(_, t)| t.author == Author::User)
+            }
+            // Any mark goes; of the turns, the user's own.
+            Action::DeleteComment => {
+                loc.view.any_mark_at_cursor().is_some()
                     || loc
                         .view
                         .turn_at_cursor()

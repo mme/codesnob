@@ -286,10 +286,10 @@ impl DiffView {
         marks.sort_by_key(|m| (at(&m.path), m.start, m.end, m.seq));
         if self.marks != marks {
             let anchor = self.anchor();
-            // The same marks after a reload keep their place in order.
-            if self.marks.len() != marks.len() {
-                self.current_mark = None;
-            }
+            // The mark last jumped to stays that mark, wherever it now
+            // sorts; gone, there is none.
+            let current = self.current_mark.map(|i| self.marks[i].seq);
+            self.current_mark = current.and_then(|seq| marks.iter().position(|m| m.seq == seq));
             self.marks = marks;
             self.build_rows();
             if let Some(a) = anchor {
