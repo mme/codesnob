@@ -334,6 +334,17 @@ fn agent_news(old: &Marks, new: &Marks) -> Vec<(usize, Option<usize>)> {
         .collect()
 }
 
+/// The marks whose lines have not been seen yet: anchoring them is news
+/// wherever it happens.
+fn unseen_marks(marks: &Marks) -> Vec<usize> {
+    marks
+        .marks
+        .iter()
+        .filter(|m| m.text.is_none())
+        .map(|m| m.seq)
+        .collect()
+}
+
 /// A mark as the view draws it: its text with diagrams drawn.
 fn drawn(m: &Mark, target: &diagram::Target, tx: &Sender<Msg>) -> diffview::Mark {
     let pics = |shown: &diagram::Shown| -> Vec<(usize, diffview::Pic)> {
@@ -424,6 +435,24 @@ impl Location {
             name: self.long_name(),
             marks: self.marks.clone(),
         })
+    }
+
+    /// Take the user to the topmost of `news` that is shown; whether one
+    /// was.
+    fn jump_to_news(&mut self, news: &[(usize, Option<usize>)]) -> bool {
+        let Some(&(seq, turn)) = news
+            .iter()
+            .filter(|(seq, _)| self.view.start_row(*seq).is_some())
+            .min_by_key(|(seq, _)| self.view.start_row(*seq))
+        else {
+            return false;
+        };
+        let went = match turn {
+            Some(n) => self.view.go_to_turn(seq, n),
+            None => self.view.go_to_seq(seq),
+        };
+        self.jumped_to = went.then(|| self.view.cursor());
+        went
     }
 
     /// Its marks as the view draws them, diagrams drawn for `target`.
@@ -627,6 +656,13 @@ struct Location {
     /// Where the cursor was put for the agent's last news; while it is
     /// still there, further news waits behind `>`.
     jumped_to: Option<usize>,
+    /// News of the agent's whose lines were not shown yet: the jump waits
+    /// for the load that brings them in.
+    pending_jump: Vec<(usize, Option<usize>)>,
+    /// The next load only follows the marks the daemon just sent; what it
+    /// finds is not news to send back, or two viewers on different
+    /// revisions would correct each other forever.
+    syncing: bool,
     focus: Focus,
     view: DiffView,
     info: Option<Info>,
@@ -774,6 +810,8 @@ impl App {
             marks: Marks::default(),
             place_pending: false,
             jumped_to: None,
+            pending_jump: Vec::new(),
+            syncing: false,
             focus: Focus::All,
             view: DiffView::default(),
             info: None,
@@ -901,26 +939,21 @@ impl App {
             // The lines a mark needs may not be shown yet.
             loc.fingerprint = 0;
             loc.code_fp = 0;
+            loc.syncing = true;
         }
         if !current {
             return;
         }
         // Something new of the agent's: the user, when not busy and not
-        // still on the last such thing, is taken to the topmost of it.
+        // still on the last such thing, is taken to the topmost of it. News
+        // on lines not shown yet waits for the load that shows them.
         if !news.is_empty()
             && !self.typing()
             && let Some(loc) = self.cur_mut()
             && loc.jumped_to != Some(loc.view.cursor())
-            && let Some(&(seq, turn)) = news
-                .iter()
-                .filter(|(seq, _)| loc.view.start_row(*seq).is_some())
-                .min_by_key(|(seq, _)| loc.view.start_row(*seq))
+            && !loc.jump_to_news(&news)
         {
-            let went = match turn {
-                Some(n) => loc.view.go_to_turn(seq, n),
-                None => loc.view.go_to_seq(seq),
-            };
-            loc.jumped_to = went.then(|| loc.view.cursor());
+            loc.pending_jump = news;
         }
         if moved {
             self.request();
@@ -1060,6 +1093,8 @@ impl App {
             marks: Marks::default(),
             place_pending: false,
             jumped_to: None,
+            pending_jump: Vec::new(),
+            syncing: false,
             focus: Focus::All,
             view: DiffView::default(),
             info: None,
@@ -1557,6 +1592,7 @@ impl App {
     /// Files to show as they are have loaded.
     fn apply_code(&mut self, id: u64, seq: u64, code: git::CodeSnapshot) {
         let current = self.locations.first().is_some_and(|l| l.id == id);
+        let typing = self.typing();
         let (target, tx) = (self.target(), self.tx.clone());
         let Some(loc) = self.locations.iter_mut().find(|l| l.id == id) else {
             return;
@@ -1581,12 +1617,16 @@ impl App {
             return;
         }
         let anchor = if same_view { loc.view.anchor() } else { None };
-        let (gone, moved) = reanchor(&mut loc.marks, &|path, _| {
+        let unseen = unseen_marks(&loc.marks);
+        let (gone, mut moved) = reanchor(&mut loc.marks, &|path, _| {
             code.files
                 .iter()
                 .find(|(p, _)| p == path)
                 .map(|(_, d)| crate::diff::text_lines(d))
         });
+        if std::mem::take(&mut loc.syncing) {
+            moved.retain(|a| unseen.contains(&a.seq));
+        }
         if !moved.is_empty()
             && let Some(key) = loc.key.clone()
         {
@@ -1636,6 +1676,10 @@ impl App {
                 loc.view.place_target = loc.view.target.is_some() || loc.view.has_marks();
             }
         }
+        let news = std::mem::take(&mut loc.pending_jump);
+        if current && !typing {
+            loc.jump_to_news(&news);
+        }
         loc.code_shown = Some(spec);
         loc.code_rev = code.rev;
         loc.code_fp = fingerprint;
@@ -1652,6 +1696,7 @@ impl App {
         let context = self.opts.context;
         // A location loaded in the background speaks only once it is shown.
         let current = self.locations.first().is_some_and(|l| l.id == id);
+        let typing = self.typing();
         let (target, tx) = (self.target(), self.tx.clone());
         let Some(loc) = self.locations.iter_mut().find(|l| l.id == id) else {
             return;
@@ -1714,7 +1759,8 @@ impl App {
         let anchor = if same_range { loc.view.anchor() } else { None };
         let (info, files) = Info::split(snap);
         loc.fingerprint = fingerprint;
-        let (gone, moved) = reanchor(&mut loc.marks, &|path, old_side| {
+        let unseen = unseen_marks(&loc.marks);
+        let (gone, mut moved) = reanchor(&mut loc.marks, &|path, old_side| {
             files
                 .iter()
                 .find(|f| f.new_path.as_deref().or(f.old_path.as_deref()) == Some(path))
@@ -1727,6 +1773,9 @@ impl App {
                 })
                 .map(crate::diff::text_lines)
         });
+        if std::mem::take(&mut loc.syncing) {
+            moved.retain(|a| unseen.contains(&a.seq));
+        }
         if !moved.is_empty()
             && let Some(key) = loc.key.clone()
         {
@@ -1772,6 +1821,10 @@ impl App {
         }
         loc.info = Some(info);
         loc.desc_dirty = true;
+        let news = std::mem::take(&mut loc.pending_jump);
+        if current && !typing {
+            loc.jump_to_news(&news);
+        }
         if current {
             self.hl.clear();
             if manual {

@@ -46,13 +46,16 @@ pub enum Row {
 }
 
 impl Row {
-    /// Rows the cursor may rest on: not the spacing, nor the continuation
-    /// of some text, nor what is being typed.
+    /// Rows the cursor may rest on: not the spacing, nor what is being
+    /// typed. The continuation of some text rests it only when the text is
+    /// taller than the screen; see [`DiffView::move_cursor`].
     fn rests(self) -> bool {
-        !matches!(
-            self,
-            Row::Blank | Row::Compose | Row::ComposeLine(_) | Row::MarkLine(..) | Row::TurnLine(..)
-        )
+        !matches!(self, Row::Blank | Row::Compose | Row::ComposeLine(_))
+    }
+
+    /// A row of some text after its first.
+    fn continues(self) -> bool {
+        matches!(self, Row::MarkLine(..) | Row::TurnLine(..))
     }
 }
 
@@ -178,6 +181,9 @@ pub struct Anchor {
     at_mark: Option<usize>,
     /// The cursor was on a turn under that mark: the turn, by index.
     at_turn: Option<usize>,
+    /// How many rows into that text the cursor was, for text taller than
+    /// the screen.
+    at_line: usize,
     /// How many rows below the top of the view the cursor sat.
     offset: usize,
 }
@@ -306,12 +312,17 @@ impl DiffView {
         };
         if let Some(row) = shown {
             // The cursor sits on what is being typed, and the view shows
-            // it, scrolling just enough.
+            // its last line, scrolling just enough.
             self.cursor = row;
+            let lines = self
+                .compose
+                .as_ref()
+                .map_or(1, |c| text_lines(&c.text).count());
+            let last = row + lines - 1;
             for _ in 0..2 {
                 let visible = self.visible_at(self.scroll);
-                if row + 1 > self.scroll + visible {
-                    self.scroll = (row + 1).saturating_sub(visible);
+                if last + 1 > self.scroll + visible {
+                    self.scroll = (last + 1).saturating_sub(visible);
                 }
             }
             if row < self.scroll {
@@ -502,10 +513,13 @@ impl DiffView {
     /// cursor is on is where we are, not where we go.
     pub fn prev_mark(&mut self) {
         let marks = self.shown_marks();
+        // The innermost of the marks the cursor is in: the one starting last.
         let here = marks
             .iter()
-            .find(|(r, i)| (*r..=self.block_end(*i)).contains(&self.cursor))
-            .map_or(self.cursor, |(r, _)| *r);
+            .filter(|(r, i)| (*r..=self.block_end(*i)).contains(&self.cursor))
+            .map(|(r, _)| *r)
+            .max()
+            .unwrap_or(self.cursor);
         if let Some((_, i)) = marks.into_iter().rev().find(|(r, _)| *r < here) {
             self.go_to_mark(i);
         }
@@ -971,6 +985,7 @@ impl DiffView {
         let path = self.files[fi].path.clone();
         let mut at_mark = None;
         let mut at_turn = None;
+        let mut at_line = 0;
         let (line, at_hunk) = match self.rows.get(self.cursor)? {
             Row::Line(fi, hi, li) => {
                 let l = &self.files[*fi].hunks[*hi].lines[*li];
@@ -987,11 +1002,17 @@ impl DiffView {
             }
             // A mark's row or a turn's: the mark's first line, and the row
             // itself if it stays.
-            Row::Mark(m) | Row::Turn(m, _) => {
+            Row::Mark(m) | Row::MarkLine(m, _) | Row::Turn(m, _) | Row::TurnLine(m, _, _) => {
                 let mark = &self.marks[*m];
                 at_mark = Some(mark.seq);
-                if let Row::Turn(_, t) = self.rows[self.cursor] {
-                    at_turn = Some(t);
+                match self.rows[self.cursor] {
+                    Row::Turn(_, t) => at_turn = Some(t),
+                    Row::TurnLine(_, t, k) => {
+                        at_turn = Some(t);
+                        at_line = k;
+                    }
+                    Row::MarkLine(_, k) => at_line = k,
+                    _ => {}
                 }
                 let old = mark.old_side || self.files[fi].status == Status::Deleted;
                 (Some((if old { 0 } else { 1 }, mark.start)), false)
@@ -1017,6 +1038,7 @@ impl DiffView {
             at_hunk,
             at_mark,
             at_turn,
+            at_line,
             offset: self.cursor - self.scroll,
         })
     }
@@ -1077,6 +1099,9 @@ impl DiffView {
                     .unwrap_or(row),
                 _ => row,
             };
+            // As far into the text as before, while it has the rows.
+            let (_, end) = self.text_span(self.cursor);
+            self.cursor = (self.cursor + a.at_line).min(end);
         }
         self.scroll = self.cursor.saturating_sub(a.offset);
         self.fit();
@@ -1135,7 +1160,29 @@ impl DiffView {
                 self.scroll = (self.cursor + 1).saturating_sub(visible);
             }
         }
+        // On the first row of a block of text, the whole block when it fits.
+        let end = self.block_end_at(self.cursor);
+        let visible = self.visible_at(self.scroll);
+        if end > self.cursor && end - self.cursor < visible && end + 1 > self.scroll + visible {
+            self.scroll = end + 1 - visible;
+        }
         self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// The last row of the block of text starting at `row`: the thread
+    /// under a mark, what is typed under it, or `row` itself.
+    fn block_end_at(&self, row: usize) -> usize {
+        match self.rows.get(row) {
+            Some(Row::Mark(m) | Row::Turn(m, _)) => self.block_end(*m),
+            Some(Row::Compose) => {
+                let mut r = row;
+                while matches!(self.rows.get(r + 1), Some(Row::ComposeLine(_))) {
+                    r += 1;
+                }
+                r
+            }
+            _ => row,
+        }
     }
 
     /// Keep scroll and cursor within the rows, and the cursor in sight.
@@ -1188,11 +1235,53 @@ impl DiffView {
     }
 
     /// Move the cursor by `delta` rows; the view scrolls to keep up.
+    /// Move the cursor `delta` rows, one stop at a time. A text's rows
+    /// after its first are one stop with it while the text fits on the
+    /// screen; a taller text is walked row by row, so all of it can be seen.
     pub fn move_cursor(&mut self, delta: isize) {
-        let max = self.max_scroll() as isize;
-        self.cursor = (self.cursor as isize + delta).clamp(0, max) as usize;
-        self.settle_cursor(delta.signum());
+        let dir = delta.signum();
+        for _ in 0..delta.unsigned_abs() {
+            let mut r = self.cursor;
+            while let Some(next) = r.checked_add_signed(dir).filter(|&n| n < self.rows.len()) {
+                r = next;
+                let row = self.rows[r];
+                if !row.rests() || row.continues() && self.text_fits(r) {
+                    continue;
+                }
+                self.cursor = r;
+                break;
+            }
+        }
         self.follow();
+    }
+
+    /// Whether the text the row `r` belongs to fits on the screen.
+    fn text_fits(&self, r: usize) -> bool {
+        let (start, end) = self.text_span(r);
+        end - start < self.visible_at(self.scroll)
+    }
+
+    /// The first and last row of the text `r` is a row of: a mark's words
+    /// or a turn's.
+    fn text_span(&self, r: usize) -> (usize, usize) {
+        let same = |a: Row, b: Row| match (a, b) {
+            (Row::Mark(m) | Row::MarkLine(m, _), Row::Mark(n) | Row::MarkLine(n, _)) => m == n,
+            (
+                Row::Turn(m, t) | Row::TurnLine(m, t, _),
+                Row::Turn(n, u) | Row::TurnLine(n, u, _),
+            ) => m == n && t == u,
+            _ => false,
+        };
+        let row = self.rows[r];
+        let mut start = r;
+        while start > 0 && same(row, self.rows[start - 1]) {
+            start -= 1;
+        }
+        let mut end = r;
+        while end + 1 < self.rows.len() && same(row, self.rows[end + 1]) {
+            end += 1;
+        }
+        (start, end)
     }
 
     /// Move the view by `delta` rows, the cursor keeping its place on the
@@ -1246,7 +1335,12 @@ impl DiffView {
         };
         let row = self.scroll + y;
         if self.rows.get(row).is_some_and(|r| r.rests()) {
-            self.cursor = row;
+            // A click into text that fits on the screen is a click on it.
+            self.cursor = if self.rows[row].continues() && self.text_fits(row) {
+                self.text_span(row).0
+            } else {
+                row
+            };
             self.follow();
         }
     }
@@ -1340,16 +1434,17 @@ impl DiffView {
                 let (bg, fg) = p.mark_colors(mark.author);
                 let tint = Style::default().bg(bg);
                 buf.set_style(area, tint);
-                if let Some((pic, into)) = picture_at(&mark.pictures, k) {
+                let editing = self
+                    .compose
+                    .as_ref()
+                    .is_some_and(|c| c.at == ComposeAt::EditMark(mark.seq));
+                // While its source is edited, the words are what is shown.
+                if !editing && let Some((pic, into)) = picture_at(&mark.pictures, k) {
                     let who = if mark.author == Author::User { 5 } else { 0 };
                     let lead = 2 + mark.label.chars().count() + 3 + who;
                     self.render_picture(pic, into, idx, lead, area, buf, picker);
                     return;
                 }
-                let editing = self
-                    .compose
-                    .as_ref()
-                    .is_some_and(|c| c.at == ComposeAt::EditMark(mark.seq));
                 let mut lead = vec![Span::styled(
                     format!("  [{}] ", mark.label),
                     tint.fg(fg).add_modifier(Modifier::BOLD),
@@ -1377,7 +1472,11 @@ impl DiffView {
                 let (bg, fg) = p.mark_colors(turn.author);
                 let tint = Style::default().bg(bg);
                 buf.set_style(area, tint);
-                if let Some((pic, into)) = picture_at(&turn.pictures, k) {
+                let editing = self
+                    .compose
+                    .as_ref()
+                    .is_some_and(|c| c.at == ComposeAt::EditTurn(self.marks[m].seq, turn.n));
+                if !editing && let Some((pic, into)) = picture_at(&turn.pictures, k) {
                     let lead = 6 + match turn.author {
                         Author::User => "you: ".len(),
                         Author::Agent => "agent: ".len(),

@@ -591,7 +591,36 @@ fn handle(
                 .recv_timeout(REPLY_TIMEOUT)
                 .ok()
                 .and_then(|v| serde_json::from_value(v).ok());
-            shared.state.lock().unwrap().forget_reply(&id);
+            let mut st = shared.state.lock().unwrap();
+            st.forget_reply(&id);
+            // The viewer lettered the marks from its own copy, which may
+            // have been behind the daemon's: the letters that count are the
+            // ones the daemon gave, when it applied the viewer's op just
+            // before this answer.
+            if let Some(ack) = result.ack.as_mut()
+                && !ack.marks.is_empty()
+                && let Some(loc) = st
+                    .registry
+                    .locations
+                    .iter()
+                    .find(|l| l.key.name() == ack.location)
+            {
+                let n = ack.marks.len();
+                let fresh: Vec<proto::MarkInfo> = loc
+                    .marks
+                    .marks
+                    .iter()
+                    .rev()
+                    .take(n)
+                    .rev()
+                    .map(crate::marks::Mark::info)
+                    .collect();
+                if fresh.len() == n {
+                    ack.marks = fresh;
+                }
+                ack.mine = loc.marks.mine();
+            }
+            drop(st);
             json!(result)
         }
         Method::Query {
@@ -1005,8 +1034,11 @@ mod tests {
     #[test]
     fn a_show_carries_the_viewers_answer_when_it_gives_one() {
         let d = Daemon::start("relay-show");
-        let viewer = d.viewer("v1", &[]);
+        // The daemon already holds a mark here that the viewer never saw.
+        let loc = with_comment(repo("/x"), "kept");
+        let viewer = d.viewer("v1", &[&loc]);
         let (mut writer, mut reader) = viewer.into_parts();
+        let _ = location_event(&mut reader);
         let dir = d.dir.clone();
         let caller = std::thread::spawn({
             let socket = d.socket.clone();
@@ -1025,17 +1057,39 @@ mod tests {
         let Event::Show { id: Some(id), .. } = next_event(&mut reader) else {
             panic!("a show event with an id");
         };
+        // The viewer, lettering from an empty copy, calls its new mark [A]
+        // and says so right after its op; the daemon knows it as [B].
+        let op = Request {
+            id: "v".to_string(),
+            method: Method::ViewerOp {
+                key: loc.key.clone(),
+                op: Op::Marks {
+                    marks: vec![proto::MarkSpec {
+                        path: "b.rs".to_string(),
+                        start: 2,
+                        end: 2,
+                        text: None,
+                    }],
+                },
+            },
+        };
+        writer.write_all(to_line(&op).as_bytes()).unwrap();
         let reply = Request {
             id: "v".to_string(),
             method: Method::ViewerReply {
                 id,
-                result: json!({ "location": "/x", "dir": "/x", "marks": [], "unread": 1, "applied": true }),
+                result: json!({ "location": "/x", "dir": "/x", "marks": [{ "label": "A", "author": "agent", "path": "b.rs", "start": 2, "end": 2 }], "unread": 1, "applied": true }),
             },
         };
         writer.write_all(to_line(&reply).as_bytes()).unwrap();
         let r: ShowResult = serde_json::from_value(caller.join().unwrap().unwrap()).unwrap();
         let ack = r.ack.expect("the viewer's answer");
         assert_eq!((ack.location.as_str(), ack.unread), ("/x", 1));
+        assert_eq!(
+            ack.marks[0].label, "B",
+            "the daemon's letter, not the viewer's"
+        );
+        assert_eq!(ack.mine.len(), 1);
     }
 
     #[test]

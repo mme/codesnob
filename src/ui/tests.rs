@@ -3056,6 +3056,94 @@ fn an_agents_mark_on_a_diff_shows_its_text_under_the_lines() {
 }
 
 #[test]
+fn the_previous_mark_from_an_inner_one_is_the_mark_around_it() {
+    let dir = repo_with_long_file("ui-marks-nested");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.marks = vec![
+        hl("src/long.rs", 10, 20, Some("outer")),
+        hl("src/long.rs", 15, 16, Some("inner")),
+    ];
+    h.app.show_view(target(&dir), spec);
+    h.settle();
+    h.screen();
+    h.keys(">");
+    assert!(h.status().contains("[B] 2 of 2"), "{}", h.status());
+    h.keys("<");
+    assert!(h.status().contains("[A] 1 of 2"), "{}", h.status());
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 10"), "{text}");
+    cleanup(dir);
+}
+
+#[test]
+fn a_mark_on_a_line_the_diff_did_not_show_is_jumped_to_once_it_is() {
+    let dir = repo_with_long_file("ui-jump-later");
+    let body: String = (1..=60)
+        .map(|i| {
+            if i == 50 {
+                "// line 50 changed\n".to_string()
+            } else {
+                format!("// line {i}\n")
+            }
+        })
+        .collect();
+    std::fs::write(dir.join("src/long.rs"), body).unwrap();
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), view(Some("worktree"), &["src/long.rs"]));
+    h.settle();
+    h.screen();
+    assert!(
+        !h.screen().contains("// line 5\n"),
+        "line 5 is outside the hunk"
+    );
+    assert_eq!(h.mark("src/long.rs", 5, 5, "up here"), "A");
+    wait_until(&mut h, &|h| h.cursor().1.contains("// line 5"));
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("// line 5"),
+        "jumped once the line came in: {text}"
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn a_tall_block_at_the_end_scrolls_into_view_row_by_row() {
+    let dir = repo_with_long_file("ui-tall-block");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+    h.settle();
+    h.screen();
+    let text: String = (1..=60)
+        .map(|i| format!("row {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(h.mark("src/long.rs", 60, 60, &text), "A");
+    h.keys("G");
+    let screen = h.screen();
+    let (_, line) = h.cursor();
+    assert!(
+        line.contains("row 60"),
+        "G lands on the last row of the text: {line}\n{screen}"
+    );
+    h.keys(&"k".repeat(59));
+    let (_, line) = h.cursor();
+    assert!(line.contains("[A] row 1"), "k walks up through it: {line}");
+    assert!(!h.screen().contains("row 60"), "{}", h.screen());
+    h.keys(&"j".repeat(59));
+    let (_, line) = h.cursor();
+    assert!(line.contains("row 60"), "j walks down through it: {line}");
+    assert!(
+        h.screen().contains("row 60"),
+        "the tail came into view:\n{}",
+        h.screen()
+    );
+    cleanup(dir);
+}
+
+#[test]
 fn a_mermaid_fence_in_a_mark_is_drawn_as_a_diagram() {
     let dir = repo_with_long_file("ui-mermaid");
     let mut h = Harness::open(&dir);
