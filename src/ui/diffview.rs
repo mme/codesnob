@@ -197,7 +197,7 @@ impl Anchor {
             && self.line == other.line
             && self.at_hunk == other.at_hunk
             && self.at_mark == other.at_mark
-            && self.at_turn == other.at_turn
+            && self.at_turn.map(|(_, n)| n) == other.at_turn.map(|(_, n)| n)
             && self.at_line == other.at_line
     }
 }

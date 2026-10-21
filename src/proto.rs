@@ -682,13 +682,24 @@ pub fn to_line<T: Serialize>(frame: &T) -> String {
 
 /// Connect to the daemon, starting one on demand.
 pub fn connect_or_spawn() -> Option<UnixStream> {
-    if let Ok(s) = UnixStream::connect(daemon_socket()) {
+    // A daemon from an older build makes way for one from this build,
+    // which asks it to exit as it starts.
+    let current = |s: UnixStream| -> Option<UnixStream> {
+        let mut probe = Client::new(s.try_clone().ok()?, "probe-").ok()?;
+        let hello = probe.hello().ok()?;
+        (!crate::daemon::outdated(&hello)).then_some(s)
+    };
+    if let Ok(s) = UnixStream::connect(daemon_socket())
+        && let Some(s) = current(s)
+    {
         return Some(s);
     }
     spawn_daemon();
     for _ in 0..40 {
         std::thread::sleep(Duration::from_millis(25));
-        if let Ok(s) = UnixStream::connect(daemon_socket()) {
+        if let Ok(s) = UnixStream::connect(daemon_socket())
+            && let Some(s) = current(s)
+        {
             return Some(s);
         }
     }

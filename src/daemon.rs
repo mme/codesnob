@@ -379,11 +379,17 @@ fn ask_existing_daemon_to_exit(socket: &std::path::Path) -> Existing {
     let Ok(hello) = client.hello() else {
         return Existing::Stale;
     };
-    if !is_newer(proto::VERSION, &hello.version) {
+    if !outdated(&hello) {
         return Existing::Newer;
     }
     let _ = client.call(Method::DaemonShutdown);
     Existing::Replaced
+}
+
+/// Whether a running daemon that answered `hello` should make way for
+/// this build: it speaks an older protocol, or is an older version.
+pub fn outdated(hello: &HelloResult) -> bool {
+    hello.protocol < proto::PROTOCOL_VERSION || is_newer(proto::VERSION, &hello.version)
 }
 
 fn is_newer(candidate: &str, running: &str) -> bool {
@@ -856,6 +862,25 @@ mod tests {
             Event::Location { state, note } => (state, note),
             other => panic!("a location event, not {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_older_protocol_or_version_makes_way() {
+        let hello = |protocol: u32, version: &str| HelloResult {
+            protocol,
+            version: version.to_string(),
+            target: None,
+        };
+        assert!(outdated(&hello(
+            proto::PROTOCOL_VERSION - 1,
+            proto::VERSION
+        )));
+        assert!(outdated(&hello(proto::PROTOCOL_VERSION, "0.0.1")));
+        assert!(!outdated(&hello(proto::PROTOCOL_VERSION, proto::VERSION)));
+        assert!(!outdated(&hello(
+            proto::PROTOCOL_VERSION + 1,
+            proto::VERSION
+        )));
     }
 
     #[test]

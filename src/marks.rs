@@ -515,9 +515,13 @@ impl Marks {
     ) -> Result<&Mark, String> {
         check_lines(start, end)?;
         let seq = self.find_label(letter).ok_or_else(|| no_mark(letter))?;
-        // Where it already is: nothing changes, least of all its text.
+        // Where it already is, on the new side: nothing changes, least of
+        // all its text.
         let same = self.get(seq).is_some_and(|m| {
-            path.as_ref().is_none_or(|p| *p == m.path) && start == m.start && end == m.end
+            !m.old_side
+                && path.as_ref().is_none_or(|p| *p == m.path)
+                && start == m.start
+                && end == m.end
         });
         if same {
             return Ok(self.get(seq).expect("found"));
