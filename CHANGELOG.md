@@ -8,6 +8,27 @@ the machinery, not decoration.
 
 <!-- next -->
 
+## v0.2.0
+
+- Document the three tools and named locations
+- Redesign the agent API around named locations
+- Letter diagram pictures in a bundled Inter
+- Fix what the ninth review round found
+- Fix what the eighth review round found
+- Fix what the seventh review round found
+- Fix what the sixth review round found
+- Fix what the fifth review round found
+- Fix what the fourth review round found
+- Fix what the third review round found
+- Fix what the second review round found
+- Fix what the first review round found
+- Draw Mermaid diagrams in marks
+- Share marks through the daemon, one kind of mark, text under the lines
+- Show the sticker on the empty screen
+- List the locations open in the viewer
+- Keep the user's comments the user's
+- Rewrite the README for a public audience
+
 ## Unreleased
 
 - **Locations are named by what they are.** The `L3` ids are gone. To an

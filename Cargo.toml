@@ -1,6 +1,6 @@
 [package]
 name = "codesnob"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Fast terminal code viewer that agents can drive: files, diffs and pull requests"
 license = "Apache-2.0"
