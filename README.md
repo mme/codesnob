@@ -254,8 +254,11 @@ A ```mermaid fence in a mark's text is drawn as a diagram in place of the
 fence, with the words around it as they are: flowcharts, sequence, state,
 class and ER diagrams and the other Mermaid kinds. In a terminal that shows
 images (Sixel, kitty or iTerm2) it is a picture on the mark's own colour;
-elsewhere it is box-drawing text. The drawing is made off the main thread
-and cached; a diagram that cannot be drawn shows its source and why.
+elsewhere it is box-drawing text. Pictures are lettered in Inter, which
+codesnob brings along, so they look the same on every machine; a diagram
+that names its own `fontFamily` in a `%%{init: …}%%` preamble gets that
+font if the machine has it. The drawing is made off the main thread and
+cached; a diagram that cannot be drawn shows its source and why.
 
 ### When the agent shows something while you are busy
 

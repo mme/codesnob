@@ -59,6 +59,9 @@ the machinery, not decoration.
   on the mark's colour in a terminal that shows images, box-drawing text
   anywhere else. All Mermaid kinds; drawn off the main thread, cached,
   and given up on after a few seconds with the source shown instead.
+  Pictures are lettered in Inter, which codesnob carries with it, so a
+  diagram looks the same on every machine; a fence's own `fontFamily`
+  still wins.
 - The protocol version is now 3. Viewers, agents and the daemon must be
   on the same build.
 

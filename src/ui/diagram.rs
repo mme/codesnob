@@ -142,13 +142,24 @@ fn render_text(source: &str, width: usize) -> Result<String, String> {
     Ok(drawn.trim_end().to_string())
 }
 
-/// The system's fonts, loaded once for every picture.
+/// The face every picture's words are set in, carried in the binary so a
+/// diagram looks the same on every machine: Inter, under the SIL Open
+/// Font License (see `assets/fonts/Inter-LICENSE.txt`).
+const FONT: &[u8] = include_bytes!("../../assets/fonts/Inter-Regular.ttf");
+/// Its family name, for the SVG and for what `sans-serif` resolves to.
+const FONT_FAMILY: &str = "Inter";
+
+/// The fonts pictures are drawn with, loaded once: the bundled face, which
+/// `sans-serif` resolves to, with the system's fonts behind it for the
+/// glyphs it lacks and for a family a diagram asks for by name.
 fn fonts() -> Arc<resvg::usvg::fontdb::Database> {
     static FONTS: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
     FONTS
         .get_or_init(|| {
             let mut db = resvg::usvg::fontdb::Database::new();
             db.load_system_fonts();
+            db.load_font_data(FONT.to_vec());
+            db.set_sans_serif_family(FONT_FAMILY);
             Arc::new(db)
         })
         .clone()
@@ -161,11 +172,12 @@ fn render_picture(
     cell: (u16, u16),
     light: bool,
 ) -> Result<Picture, String> {
-    let theme = if light {
+    let mut theme = if light {
         mermaid_svg::Theme::default()
     } else {
         mermaid_svg::Theme::dark()
     };
+    theme.font_family = FONT_FAMILY.into();
     let svg = std::panic::catch_unwind(|| mermaid_svg::render_with(source, &theme))
         .map_err(|_| "the renderer gave up".to_string())?
         .map_err(|e| e.to_string())?;
@@ -320,6 +332,22 @@ mod tests {
             [Segment::Mermaid("graph TD\n  X".to_string())],
             "an open fence runs to the end; the word is read loosely"
         );
+    }
+
+    #[test]
+    fn the_bundled_face_is_loaded_and_answers_for_sans_serif() {
+        use resvg::usvg::fontdb::{Family, Query};
+        let db = fonts();
+        let inter = db.query(&Query {
+            families: &[Family::Name(FONT_FAMILY)],
+            ..Default::default()
+        });
+        assert!(inter.is_some(), "the bundled face is in the database");
+        let generic = db.query(&Query {
+            families: &[Family::SansSerif],
+            ..Default::default()
+        });
+        assert_eq!(generic, inter, "sans-serif resolves to the bundled face");
     }
 
     #[test]
