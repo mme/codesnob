@@ -81,151 +81,73 @@ fn initialize(params: &Value) -> Value {
 }
 
 /// Always in the agent's context, so this is what makes it reach for codesnob.
-const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a terminal beside you. When the user wants to see code, show it there instead of pasting it into the chat: `show_code` for files and lines, with marks on the lines you mean; `show_diff` for what changed between any two states (the branch point, commits, branches, staged work, a pull request). Typical requests: \"show me the code\", \"where is this handled\", \"open that file\", \"what changed\", \"show me the diff\", \"compare main and this branch\", \"show me PR 123\". A call updates that repository's view in the viewer; the user gets back to where they were with Esc. Read files with your own tools; codesnob is for showing. Marks are lettered [A], [B]… in the viewer and shared between you and the user, each with a thread under it; yours and theirs are the same thing. A mark stays until someone removes it: a show adds marks and removes none, so clear your own with `clear_marks` once they have served, and before pointing somewhere new. Put words on a mark only when the user asks you to explain, review or comment on code: in the show call, or with `mark` for lines they are already looking at. A ```mermaid fence in a mark's words is drawn as a diagram, so a flow or a sequence can be shown next to the code it describes. The user marks lines in the viewer too; call `get_review` whenever they say they reviewed, commented or marked something, or a reply tells you they have unread comments, and answer to the letters. A location is a repository or a pull request, named by the repository's path (repo) or as owner/repo#123 (pr); the review tools default to the location on screen, so name one only for marks elsewhere. `list_locations` lists the locations open, with their unread comments. Answer in the thread under a mark with `reply`, and when you change the code under a mark, keep it on the right lines with `move_mark`. A mark the user made or wrote under is theirs: `clear_marks` removes it only whole and only when the user explicitly asks you to delete it.";
+const INSTRUCTIONS: &str = "codesnob is the user's code viewer, open in a terminal beside you. When the user wants to see code, show it there instead of pasting it into the chat: `show` puts files, a diff or a pull request on their screen, with marks on the lines you mean. Typical requests: \"show me the code\", \"where is this handled\", \"open that file\", \"what changed\", \"show me the diff\", \"compare main and this branch\", \"show me PR 123\". Read files with your own tools; codesnob is for showing. Every call names its location: a checkout by absolute directory, with the view after # (`/dir` the files as they are, `/dir#main` as of a revision, `/dir#main...HEAD` or `/dir#abc~..abc` a comparison, `/dir#branch` everything since the branch point, `#worktree` `#staged` `#unstaged`), or a pull request as owner/repo#123. Every reply names the location it acted on; copy it into the next call. Marks are lettered [A], [B]… in the viewer and shared between you and the user, each with a thread under it; yours and theirs are the same thing, and a mark belongs to its location. A mark stays until deleted: a show adds marks and removes none unless told to, so pass replace when you point somewhere new, and delete yours once they have served. Put words on a mark only when the user asks you to explain, review or comment on code. A ```mermaid fence in a mark's words is drawn as a diagram, so a flow or a sequence can be shown next to the code it describes. The user marks lines in the viewer too; call `review` whenever they say they reviewed, commented or marked something, or a reply says they have unread words, and answer to the letters with `reply`. A mark the user made or wrote under is theirs: it goes only whole, and only when the user explicitly asks you to delete it. The user gets back to their previous view with Esc.";
 
 fn tools() -> Value {
+    let location = json!({
+        "type": "string",
+        "description": "A checkout by absolute directory, with the view after #: \"/home/u/repo\" the files as they are, \"/home/u/repo#main\" as of a revision, \"/home/u/repo#main...HEAD\" or \"#abc~..abc\" a comparison, \"#branch\" everything since the branch point with uncommitted work, \"#worktree\" \"#staged\" \"#unstaged\" as in git. Or a pull request: \"owner/repo#123\" or its URL. Never relative; copy it from the last reply."
+    });
     json!([{
-        "name": "show_code",
-        "description": "Show source code to the user in their codesnob viewer: whole files, or excerpts around a line and marked line ranges. Use it when the user asks to see, open or look at code, or where something is defined or handled, and whenever they ask you to show code while explaining. Prefer a few precise marks over large ranges. Put text on a mark only when the user asks you to explain, review or comment on the code. Marks stay until cleared, so clear yours when they have served.",
+        "name": "show",
+        "description": "Show code to the user in their codesnob viewer, and set the marks on it. location says which checkout and view, or which pull request; files what is on screen; marks what is pointed at. Whole files are shown unless a file has lines. With a diff view (#branch, #main...HEAD, a PR), no files means every changed file; with files as they are, no files means the marked lines with a few around them. A new mark is lettered in the order given and stays until deleted; pass replace when you point somewhere new, so your old marks go. Put text on a mark only when the user asks you to explain, review or comment on the code. A mark with a letter is an existing one: with path and lines it moves there, keeping its words and thread; with delete it goes. A show with only moves and deletions leaves the view as it is.",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "location": location,
                 "files": {
                     "type": "array",
-                    "minItems": 1,
-                    "description": "The files to show, in this order. Unless excerpts says otherwise, one file shows whole and several show as excerpts around their line and marks.",
+                    "description": "The files to show, in this order, relative to the checkout root. A file may appear more than once with different lines.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "path": { "type": "string", "description": "Relative to your working directory, or absolute." },
-                            "line": { "type": "integer", "minimum": 1, "description": "Open at this line, marked." },
-                            "excerpts": { "type": "boolean", "description": "true shows only this file's line and marks, each with a few lines around it, like a diff; false shows the whole file." },
-                            "marks": {
-                                "type": "array",
-                                "description": "Line ranges to mark in this file. The viewer letters marks as [A], [B] and so on, in the order they are made, by file in the order of files, then by line; the letters are fixed and never reused, and every mark stays until removed. At most 20 per call. The user steps through them with < and >; the result lists them in that order, so refer to them by their letters.",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "lines": { "type": "string", "description": "1-based and inclusive: \"40-60\", or \"42\" for one line." },
-                                        "text": { "type": "string", "description": "Words shown under the lines; a newline starts a new row, and a ```mermaid fence is drawn as a diagram. Only when the user asked you to explain, review or comment on the code." }
-                                    },
-                                    "required": ["lines"]
-                                }
-                            }
+                            "path": { "type": "string" },
+                            "lines": { "type": "string", "description": "Only this region, 1-based and inclusive: \"40-60\", or \"42\". Omit for the whole file." }
                         },
                         "required": ["path"]
                     }
                 },
-                "rev": { "type": "string", "description": "Show the files as of this revision instead of the working tree." },
-                "repo": { "type": "string", "description": "A directory in the repository. Defaults to your working directory." }
-            },
-            "required": ["files"],
-            // With marks the view opens at the first, so no file takes a line.
-            "if": { "properties": { "files": { "contains": { "required": ["marks"] } } } },
-            "then": { "properties": { "files": { "items": { "not": { "required": ["line"] } } } } }
-        }
-    }, {
-        "name": "show_diff",
-        "description": "Show the user a diff in their codesnob viewer. range takes git syntax (\"main...feature\", \"HEAD~3..HEAD\", a single commit, \"stash@{0}\"), \"worktree\", \"staged\" or \"unstaged\", or a pull request (\"#123\", \"owner/repo#123\", a URL). Without a range it shows everything since the branch point, uncommitted work included. Use it when the user asks what changed, to see or review a diff, to compare branches or commits, or to look at a pull request. Optionally narrow to files and mark lines; put text on a mark only when the user asks you to explain, review or comment on the code. Marks stay until cleared, so clear yours when they have served.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "range": { "type": "string", "description": "What to compare; see the description. Default: everything since the branch point." },
-                "files": { "type": "array", "items": { "type": "string" }, "description": "Only these files, relative to your working directory." },
                 "marks": {
                     "type": "array",
-                    "description": "Line ranges to mark. Lines are the new side's, or the old side's in a deleted file; unchanged lines are shown too. The viewer letters marks as [A], [B] and so on, in the order they are made, by file in path order, as the diff lists its files, then by line; the letters are fixed and never reused, and every mark stays until removed. At most 20 per call. The user steps through them with < and >; the result lists them in that order, so refer to them by their letters.",
+                    "description": "At most 20 new marks per call. {path, lines, text?} adds one on lines that are shown; {letter, path, lines} moves the mark with that letter; {letter, delete: true} removes it. Lines are the new side's in a diff. The reply lists new marks by letter.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "path": { "type": "string", "description": "Relative to your working directory, or absolute." },
-                            "lines": { "type": "string", "description": "1-based and inclusive: \"40-60\", or \"42\" for one line." },
-                            "text": { "type": "string", "description": "Words shown under the lines; a newline starts a new row, and a ```mermaid fence is drawn as a diagram. Only when the user asked you to explain, review or comment on the code." }
-                        },
-                        "required": ["path", "lines"]
+                            "path": { "type": "string", "description": "Relative to the checkout root." },
+                            "lines": { "type": "string", "description": "1-based and inclusive: \"40-60\", or \"42\"." },
+                            "text": { "type": "string", "description": "Words under the lines of a new mark, with ```mermaid fences drawn. Only when the user asked you to explain, review or comment." },
+                            "letter": { "type": "string", "description": "An existing mark: \"C\"." },
+                            "delete": { "type": "boolean", "description": "true removes the mark letter names, thread and all." }
+                        }
                     }
                 },
-                "repo": { "type": "string", "description": "A directory in the repository. Defaults to your working directory." }
-            }
-        }
-    }, {
-        "name": "list_locations",
-        "description": "List the locations open in the user's codesnob viewers: each repository or pull request, how to name it (repo or pr), what it shows, which is on screen, and how many marks it has, how many of the user's words, and how many of those are unread. get_review reads the location on screen unless given one, so use this when the user says they commented and the location on screen has nothing new, or to find a location they mean.",
-        "inputSchema": { "type": "object", "properties": {} }
-    }, {
-        "name": "get_review",
-        "description": "Read every mark on a location, yours and the user's: each with its letter, who made it, its file and lines, its text, the code under the user's marks, and the thread under it. Call it whenever the user says they reviewed, commented on or marked something, or a reply says they have unread comments. The user's words count as read once returned; those written or edited since your last call are flagged new. Marks on deleted lines give old-side line numbers; a stale mark's lines no longer exist.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "repo": { "type": "string", "description": "A directory in the repository, to name a location that is not on screen. Defaults to the location on screen." },
-                "pr": { "type": "string", "description": "A pull request, to name its location: \"owner/repo#123\", \"#123\" or a URL." },
-            }
-        }
-    }, {
-        "name": "mark",
-        "description": "Mark lines with words in the user's codesnob viewer, without changing what it shows: for comments on code the user is already looking at, as when they ask you to review it. Put everything you have to say in one call: the marks land together and the viewer takes the user to the first. They are marks like any other, lettered and kept until cleared; the user sees them when their file is on screen, so show the file if they are not looking at it. Lines are the new side's, as in show_diff.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "marks": {
-                    "type": "array",
-                    "minItems": 1,
-                    "description": "The marks, lettered top to bottom as the viewer shows them: by file, then by line. At most 20 per call.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "path": { "type": "string", "description": "The file, relative to your working directory." },
-                            "lines": { "type": "string", "description": "The lines, 1-based and inclusive: \"40-60\", or \"42\"." },
-                            "text": { "type": "string", "description": "The words, a few sentences at most. A ```mermaid fence inside is drawn as a diagram: flowchart, sequence, state, class, ER and the other Mermaid kinds." }
-                        },
-                        "required": ["path", "lines", "text"]
-                    }
-                },
-                "repo": { "type": "string", "description": "A directory in the repository, to resolve paths in and to name the location. Defaults to your working directory and the location on screen." },
-                "pr": { "type": "string", "description": "A pull request, to name its location: \"owner/repo#123\", \"#123\" or a URL." }
+                "replace": { "type": "boolean", "description": "true removes your own marks on the location first: the ones the user has not written under. Default: false." },
+                "user_explicitly_asked_to_delete": { "type": "boolean", "description": "true only when the user explicitly asked you to delete their marks; without it, deleting a mark the user made or wrote under is refused. Default: false." }
             },
-            "required": ["marks"]
+            "required": ["location"]
+        }
+    }, {
+        "name": "review",
+        "description": "Read the marks on a location, yours and the user's: each with its letter, who made it, its file and lines, its text, the code under the user's marks, and the thread under it. Call it whenever the user says they reviewed, commented on or marked something, or a reply says they have unread words. The user's words count as read once returned; those written or edited since your last call are flagged new. A stale mark's lines no longer exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "location": location,
+                "letters": { "type": "array", "items": { "type": "string" }, "description": "Only these marks: [\"C\", \"D\"]. Default: all." }
+            },
+            "required": ["location"]
         }
     }, {
         "name": "reply",
-        "description": "Answer in the thread under a mark in the user's codesnob viewer. Use it to say what you did about one of the user's marks, or to ask about it; the mark stays the user's to resolve, so reply instead of clearing it. You can also answer under one of your own marks once the user has written there.",
+        "description": "Answer in the thread under a mark in the user's codesnob viewer: to say what you did about one of the user's marks, or to ask about it. The mark stays theirs to resolve, so reply instead of deleting it. You can also answer under one of your own marks once the user has written there.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "repo": { "type": "string", "description": "A directory in the repository, to name a location that is not on screen. Defaults to the location on screen." },
-                "pr": { "type": "string", "description": "A pull request, to name its location: \"owner/repo#123\", \"#123\" or a URL." },
+                "location": location,
                 "letter": { "type": "string", "description": "The mark to answer under: \"C\"." },
-                "text": { "type": "string", "description": "The reply, one or two sentences." }
+                "text": { "type": "string", "description": "The reply, one or two sentences; ```mermaid fences are drawn." }
             },
-            "required": ["letter", "text"]
-        }
-    }, {
-        "name": "move_mark",
-        "description": "Move a mark in the user's codesnob viewer to other lines, when you changed the code it was on and it no longer sits on the code it is about: the user's, or one of yours. It keeps its letter, its text and its thread. Lines are the new side's, as in show_diff.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "letter": { "type": "string", "description": "The mark to move: \"C\"." },
-                "lines": { "type": "string", "description": "Where it goes, 1-based and inclusive: \"40-60\", or \"42\"." },
-                "path": { "type": "string", "description": "The file it goes to, relative to your working directory. Defaults to the file it is on." },
-                "repo": { "type": "string", "description": "A directory in the repository, to resolve path in and to name the location. Defaults to your working directory and the location on screen." },
-                "pr": { "type": "string", "description": "A pull request, to name its location: \"owner/repo#123\", \"#123\" or a URL." }
-            },
-            "required": ["letter", "lines"]
-        }
-    }, {
-        "name": "clear_marks",
-        "description": "Remove marks from a location in the user's codesnob viewer: the ones named by letter, else all of yours (mine: marks you made that the user has not written under), the user's (user) or every mark (all). Clear yours once they have served and before pointing somewhere new. A mark the user made, or wrote in the thread of, is theirs: it goes whole, thread and all, and only when the user explicitly asked you to delete it, which you say with user_explicitly_asked_to_delete_comments. To say you dealt with one of the user's marks, reply to it instead.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "repo": { "type": "string", "description": "A directory in the repository, to name a location that is not on screen. Defaults to the location on screen." },
-                "pr": { "type": "string", "description": "A pull request, to name its location: \"owner/repo#123\", \"#123\" or a URL." },
-                "which": { "type": "string", "enum": ["mine", "user", "all"], "description": "Which marks to remove when no letters are given. Default: mine." },
-                "letters": { "type": "array", "items": { "type": "string" }, "description": "The marks to remove, by letter: [\"C\", \"D\"]." },
-                "user_explicitly_asked_to_delete_comments": { "type": "boolean", "description": "true only when the user explicitly asked you to delete their marks; without it, a call that would remove a mark of the user's is refused. Default: false." }
-            }
+            "required": ["location", "letter", "text"]
         }
     }])
 }
@@ -234,14 +156,9 @@ fn call(params: &Value) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
     match name {
-        "show_diff" => tool_result(show_diff(&args)),
-        "show_code" => tool_result(show_code(&args)),
-        "list_locations" => tool_result(list_locations()),
-        "get_review" => tool_result(get_review(&args)),
-        "clear_marks" => tool_result(clear_marks(&args)),
-        "mark" => tool_result(mark(&args)),
+        "show" => tool_result(show(&args)),
+        "review" => tool_result(review(&args)),
         "reply" => tool_result(reply_in_thread(&args)),
-        "move_mark" => tool_result(move_mark(&args)),
         _ => tool_result(Err(format!("unknown tool: {name}"))),
     }
 }
@@ -253,113 +170,249 @@ fn tool_result(r: Result<String, String>) -> Value {
     }
 }
 
-fn show_diff(args: &Value) -> Result<String, String> {
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let (root, view, what) = prepare_diff(args, &cwd)?;
+/// A show call, checked: the location as named, its checkout root (empty
+/// for a pull request), and what to send.
+#[derive(Debug)]
+pub struct ShowArgs {
+    pub location: String,
+    pub files: Vec<crate::proto::FileSpec>,
+    pub marks: Vec<crate::proto::MarkEntry>,
+    pub replace: bool,
+    pub user_asked: bool,
+}
+
+fn show(args: &Value) -> Result<String, String> {
+    let a = show_args(args)?;
     let mut client = link::connect()?;
-    let r = link::request_show(&mut client, root, Some(view)).map_err(no_viewer)?;
-    Ok(shown(&r, &what))
-}
-
-fn show_code(args: &Value) -> Result<String, String> {
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let (root, view, what) = prepare_code(args, &cwd)?;
-    let mut client = link::connect()?;
-    let r = link::request_show(&mut client, root, Some(view)).map_err(no_viewer)?;
-    Ok(shown(&r, &what))
-}
-
-/// Words for a show reply: where it went, what it was, and what the viewer
-/// made of it when it answered.
-fn shown(r: &crate::proto::ShowResult, what: &str) -> String {
-    // With the viewer's answer, the letters say it all; without, the
-    // order the marks were sent in is the best there is.
-    let what = match &r.ack {
-        Some(ack) if !ack.marks.is_empty() => {
-            what.split("; marks, lettered").next().unwrap_or(what)
-        }
-        _ => what,
-    };
-    let mut text = format!("{}: {what}", link::describe(r));
-    match &r.ack {
-        Some(ack) => {
-            if !ack.marks.is_empty() {
-                let each: Vec<String> = ack
-                    .marks
-                    .iter()
-                    .map(|m| format!("[{}] {} {}", m.label, m.path, m.lines_word()))
-                    .collect();
-                text.push_str(&format!("; marks {}", each.join(", ")));
-            }
-            if !ack.location.is_empty() {
-                text.push_str(&format!("; location {}", ack.location));
-            }
-            if !ack.applied {
-                text.push_str("; the user is reviewing, so the viewer holds this until they accept it or you read their comments");
-            }
-            let location = if ack.location.is_empty() {
-                "the location on screen"
-            } else {
-                ack.location.as_str()
-            };
-            text.push_str(&crate::proto::unread_note(location, ack.unread));
-            text.push_str(&crate::proto::mine_note(location, &ack.mine));
-        }
-        None => text.push_str(
-            "; the viewer did not say which letters it gave, call get_review to see them",
-        ),
-    }
-    text.push_str("; the user gets back to their previous view with Esc");
-    text
-}
-
-/// The location a call names with `repo` or `pr`, if either.
-fn location_arg(args: &Value, cwd: &Path) -> Option<crate::proto::LocationRef> {
-    let word = |key: &str| {
-        args.get(key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    };
-    let repo = word("repo").map(|r| {
-        let joined = cwd.join(r);
-        std::fs::canonicalize(&joined).unwrap_or_else(|_| lexical(&joined))
-    });
-    let pr = word("pr");
-    (repo.is_some() || pr.is_some()).then_some(crate::proto::LocationRef { repo, pr })
-}
-
-fn list_locations() -> Result<String, String> {
-    let mut client = link::connect()?;
-    link::request_locations(&mut client).map_err(no_viewer)
-}
-
-fn get_review(args: &Value) -> Result<String, String> {
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let mut client = link::connect()?;
-    let v = link::request_query(
+    let r = link::request_show(
         &mut client,
-        crate::proto::AgentQuery::Review {
-            location: location_arg(args, &cwd),
-        },
+        a.location,
+        a.files,
+        a.marks,
+        a.replace,
+        a.user_asked,
     )
     .map_err(no_viewer)?;
-    let r: crate::proto::ReviewResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
     Ok(r.render())
 }
 
-/// Check a clear_marks call: which marks, and the letters, upper-cased and
-/// without brackets.
-fn clear_args(args: &Value) -> Result<(String, Vec<String>), String> {
-    let which = args
-        .get("which")
+/// The location a call names, checked: what it is, and its checkout root.
+fn location_arg(args: &Value) -> Result<(String, crate::location::Named, PathBuf), String> {
+    let s = args
+        .get("location")
         .and_then(Value::as_str)
-        .unwrap_or("mine")
-        .to_string();
-    if !["mine", "user", "all"].contains(&which.as_str()) {
-        return Err(format!("which must be mine, user or all, not {which}"));
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("location is required: an absolute directory, optionally with #view, or a pull request as owner/repo#142")?;
+    let named = crate::location::parse(s)?;
+    let (key, root, _) = crate::registry::resolve(&named)?;
+    Ok((key.name(), named, root))
+}
+
+/// Check a show call before anything reaches the daemon: the location,
+/// the files and regions, and every mark.
+pub fn show_args(args: &Value) -> Result<ShowArgs, String> {
+    use crate::location::{Named, View};
+    use crate::proto::{FileSpec, MarkEntry, MarkSpec};
+    let (location, named, root) = location_arg(args)?;
+    let view = match &named {
+        Named::Repo { view, .. } => Some(view.clone()),
+        Named::Pr(_) => None,
+    };
+    let mut files = Vec::new();
+    for item in list(args, "files")? {
+        let (path, lines) = match item {
+            Value::String(p) => (p.as_str(), None),
+            Value::Object(o) => (
+                o.get("path")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .ok_or("each file needs a path")?,
+                match o.get("lines") {
+                    None | Some(Value::Null) => None,
+                    some => Some(parse_lines(some)?),
+                },
+            ),
+            _ => return Err("each file is an object with a path".to_string()),
+        };
+        files.push(FileSpec {
+            path: relative_to(&root, path)?,
+            lines,
+        });
     }
+    let mut marks = Vec::new();
+    let mut adds = 0;
+    for item in list(args, "marks")? {
+        let Value::Object(o) = item else {
+            return Err("each mark is an object".to_string());
+        };
+        let letter = match o.get("letter") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_str()
+                    .and_then(crate::marks::parse_letter)
+                    .ok_or_else(|| not_a_letter(v))?,
+            ),
+        };
+        let delete = matches!(o.get("delete"), Some(Value::Bool(true)));
+        let path = o
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        let words = text(item);
+        match (letter, delete) {
+            (Some(letter), true) => marks.push(MarkEntry::Delete { letter }),
+            (Some(letter), false) => {
+                if words.is_some() {
+                    return Err(format!(
+                        "[{letter}] with text: a move keeps the mark's words; to say something new, reply under it"
+                    ));
+                }
+                let path = path
+                    .ok_or_else(|| format!("[{letter}]: path is required: the file it goes to"))?;
+                let (start, end) =
+                    parse_lines(o.get("lines")).map_err(|e| format!("[{letter}]: {e}"))?;
+                marks.push(MarkEntry::Move {
+                    letter,
+                    path: relative_to(&root, path)?,
+                    start,
+                    end,
+                });
+            }
+            (None, true) => return Err("delete needs the letter of the mark to remove".to_string()),
+            (None, false) => {
+                let path = path.ok_or("each new mark needs a path: the file it goes on")?;
+                if o.get("lines").is_none() {
+                    return Err(format!(
+                        "{path}: lines is required: where the mark goes, like \"40-42\""
+                    ));
+                }
+                let (start, end) = parse_lines(o.get("lines"))?;
+                adds += 1;
+                marks.push(MarkEntry::Add(MarkSpec {
+                    path: relative_to(&root, path)?,
+                    start,
+                    end,
+                    text: words,
+                }));
+            }
+        }
+    }
+    check_count(adds)?;
+    let replace = matches!(args.get("replace"), Some(Value::Bool(true)));
+    let user_asked = matches!(
+        args.get("user_explicitly_asked_to_delete"),
+        Some(Value::Bool(true))
+    );
+    let goes = !files.is_empty() || adds > 0 || marks.is_empty() && !replace;
+    // Files as they are must be there, and the marks on shown lines.
+    if let Some(view) = &view {
+        match view {
+            View::Files | View::Rev { .. } if goes => {
+                if files.is_empty() && adds == 0 {
+                    return Err(
+                        "files is required to show files as they are; a diff view (#branch, #main...HEAD) shows every changed file"
+                            .to_string(),
+                    );
+                }
+                let rev = match view {
+                    View::Rev { rev } => Some(rev.as_str()),
+                    _ => None,
+                };
+                check_shown(&root, rev, &files, &marks)?;
+            }
+            View::Files | View::Rev { .. } => {}
+            diff => {
+                if let Some(spec) = diff.git_spec() {
+                    crate::git::parse_spec(&root, &spec).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
+    Ok(ShowArgs {
+        location,
+        files,
+        marks,
+        replace,
+        user_asked,
+    })
+}
+
+/// Every file to show is there at `rev`, every region is within it, and
+/// every new mark lies on lines that will be shown.
+fn check_shown(
+    root: &Path,
+    rev: Option<&str>,
+    files: &[crate::proto::FileSpec],
+    marks: &[crate::proto::MarkEntry],
+) -> Result<(), String> {
+    use crate::proto::MarkEntry;
+    let mut paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+    for m in marks {
+        if let MarkEntry::Add(spec) = m
+            && !paths.contains(&spec.path)
+        {
+            paths.push(spec.path.clone());
+        }
+    }
+    let snap = crate::git::read_code(root, rev, &paths).map_err(|e| e.to_string())?;
+    let length = |path: &str| -> usize {
+        snap.files
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, data)| {
+                data.split(|&b| b == b'\n').count() - usize::from(data.ends_with(b"\n"))
+            })
+            .unwrap_or(0)
+    };
+    for f in files {
+        if let Some((a, b)) = f.lines {
+            let n = length(&f.path);
+            if b > n.max(1) {
+                return Err(format!(
+                    "{} has {n} lines; lines {a}-{b} do not exist",
+                    f.path
+                ));
+            }
+        }
+    }
+    for m in marks {
+        let MarkEntry::Add(spec) = m else { continue };
+        let shown = files
+            .iter()
+            .filter(|f| f.path == spec.path)
+            .collect::<Vec<_>>();
+        let inside = if shown.is_empty() {
+            // Shown for the mark's sake, as excerpts: only the file's length limits it.
+            spec.end <= length(&spec.path).max(1)
+        } else {
+            shown.iter().any(|f| match f.lines {
+                None => spec.end <= length(&spec.path).max(1),
+                Some((a, b)) => spec.start >= a && spec.end <= b,
+            })
+        };
+        if !inside {
+            let n = length(&spec.path);
+            return Err(if shown.iter().any(|f| f.lines.is_some()) {
+                format!(
+                    "{} {}-{}: a mark must lie on lines that are shown; show that region too",
+                    spec.path, spec.start, spec.end
+                )
+            } else {
+                format!(
+                    "{} has {n} lines; lines {}-{} do not exist",
+                    spec.path, spec.start, spec.end
+                )
+            });
+        }
+    }
+    Ok(())
+}
+
+fn review(args: &Value) -> Result<String, String> {
+    let (location, ..) = location_arg(args)?;
     let letters: Vec<String> = match args.get("letters") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(items)) => items
@@ -372,33 +425,14 @@ fn clear_args(args: &Value) -> Result<(String, Vec<String>), String> {
             .collect::<Result<_, _>>()?,
         Some(_) => return Err("letters must be a list".to_string()),
     };
-    Ok((which, letters))
-}
-
-fn clear_marks(args: &Value) -> Result<String, String> {
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let (which, letters) = clear_args(args)?;
-    let user_asked = args
-        .get("user_explicitly_asked_to_delete_comments")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let mut client = link::connect()?;
     let v = link::request_query(
         &mut client,
-        crate::proto::AgentQuery::ClearMarks {
-            location: location_arg(args, &cwd),
-            which,
-            letters,
-            user_asked,
-        },
+        crate::proto::AgentQuery::Review { location, letters },
     )
     .map_err(no_viewer)?;
-    let r: crate::proto::ClearResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
-    Ok(format!(
-        "{}{}",
-        r.render(),
-        crate::proto::unread_note(&r.location, r.unread)
-    ))
+    let r: crate::proto::ReviewResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
+    Ok(r.render())
 }
 
 /// Why a value is no mark's letter: replies used to have labels of their
@@ -426,64 +460,8 @@ fn letter_arg(args: &Value) -> Result<String, String> {
         .ok_or_else(|| not_a_letter(v))
 }
 
-/// Check a mark call: every mark's file made relative to the checkout
-/// root, as the viewer names files, its lines, and its text.
-pub fn mark_args(args: &Value, cwd: &Path) -> Result<crate::proto::AgentQuery, String> {
-    let items = list(args, "marks")?;
-    if items.is_empty() {
-        return Err("marks must list at least one mark".to_string());
-    }
-    check_count(items.len())?;
-    let root = repo_root(args, cwd)?;
-    let mut marks = Vec::with_capacity(items.len());
-    for item in items {
-        let path = item
-            .get("path")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .ok_or("each mark needs a path: the file it goes on")?;
-        if item.get("lines").is_none() {
-            return Err(format!(
-                "{path}: lines is required: where the mark goes, like \"40-42\""
-            ));
-        }
-        let (start, end) = parse_lines(item.get("lines"))?;
-        let text = item
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .ok_or_else(|| format!("{path}: text is required: the words on the mark"))?
-            .to_string();
-        marks.push(crate::proto::MarkSpec {
-            path: relative_to(&root, cwd, path)?,
-            start,
-            end,
-            text: Some(text),
-        });
-    }
-    Ok(crate::proto::AgentQuery::Mark {
-        location: location_arg(args, cwd),
-        marks,
-    })
-}
-
-fn mark(args: &Value) -> Result<String, String> {
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let query = mark_args(args, &cwd)?;
-    let mut client = link::connect()?;
-    let v = link::request_query(&mut client, query).map_err(no_viewer)?;
-    let r: crate::proto::MarkResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
-    Ok(format!(
-        "{}{}{}",
-        r.render(),
-        crate::proto::unread_note(&r.location, r.unread),
-        crate::proto::mine_note(&r.location, &r.mine)
-    ))
-}
-
 fn reply_in_thread(args: &Value) -> Result<String, String> {
+    let (location, ..) = location_arg(args)?;
     let letter = letter_arg(args)?;
     let text = args
         .get("text")
@@ -492,167 +470,18 @@ fn reply_in_thread(args: &Value) -> Result<String, String> {
         .filter(|t| !t.is_empty())
         .ok_or("text is required: the reply")?
         .to_string();
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut client = link::connect()?;
     let v = link::request_query(
         &mut client,
         crate::proto::AgentQuery::Reply {
-            location: location_arg(args, &cwd),
+            location,
             letter,
             text,
         },
     )
     .map_err(no_viewer)?;
     let r: crate::proto::ReplyResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
-    Ok(format!(
-        "{}{}",
-        r.render(),
-        crate::proto::unread_note(&r.location, r.unread)
-    ))
-}
-
-/// Check a move_mark call: the letter, the lines, and the file made
-/// relative to the checkout root, as the viewer names files.
-pub fn move_args(args: &Value, cwd: &Path) -> Result<crate::proto::AgentQuery, String> {
-    let letter = letter_arg(args)?;
-    if args.get("lines").is_none() {
-        return Err("lines is required: where the mark goes, like \"40-42\"".to_string());
-    }
-    let (start, end) = parse_lines(args.get("lines"))?;
-    let path = match args.get("path").and_then(Value::as_str).map(str::trim) {
-        Some(p) if !p.is_empty() => Some(relative_to(&repo_root(args, cwd)?, cwd, p)?),
-        _ => None,
-    };
-    Ok(crate::proto::AgentQuery::MoveMark {
-        location: location_arg(args, cwd),
-        letter,
-        path,
-        start,
-        end,
-    })
-}
-
-fn move_mark(args: &Value) -> Result<String, String> {
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let query = move_args(args, &cwd)?;
-    let mut client = link::connect()?;
-    let v = link::request_query(&mut client, query).map_err(no_viewer)?;
-    let r: crate::proto::MoveResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
-    Ok(format!(
-        "{}{}",
-        r.render(),
-        crate::proto::unread_note(&r.location, r.unread)
-    ))
-}
-
-/// Check a show_code call: the repository, the revision, and that every file
-/// exists there. Returns the checkout root, what to send, and words for it.
-fn prepare_code(
-    args: &Value,
-    cwd: &Path,
-) -> Result<(PathBuf, crate::proto::ViewSpec, String), String> {
-    let root = repo_root(args, cwd)?;
-    let rev = args
-        .get("rev")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
-        .map(str::to_owned);
-    let items = match args.get("files") {
-        Some(Value::Array(items)) if !items.is_empty() => items,
-        _ => return Err("files must list at least one file".to_string()),
-    };
-    let mut files = Vec::new();
-    let mut marks: Vec<(usize, crate::proto::MarkSpec)> = Vec::new();
-    for item in items {
-        if let Value::Object(_) = item {
-            for h in list(item, "marks")? {
-                let (start, end) = parse_lines(h.get("lines"))?;
-                marks.push((
-                    files.len(),
-                    crate::proto::MarkSpec {
-                        path: String::new(),
-                        start,
-                        end,
-                        text: text(h),
-                    },
-                ));
-            }
-        }
-        let (path, line, excerpts) = match item {
-            Value::String(p) => (p.as_str(), None, None),
-            Value::Object(o) => (
-                o.get("path")
-                    .and_then(Value::as_str)
-                    .ok_or("each file needs a path")?,
-                o.get("line").and_then(Value::as_u64),
-                match o.get("excerpts") {
-                    None | Some(Value::Null) => None,
-                    Some(Value::Bool(b)) => Some(*b),
-                    Some(_) => return Err("excerpts is true or false".to_string()),
-                },
-            ),
-            _ => return Err("each file is an object with a path".to_string()),
-        };
-        if line == Some(0) {
-            return Err(format!("{path}: lines start at 1"));
-        }
-        files.push(crate::proto::CodeFile {
-            path: relative_to(&root, cwd, path)?,
-            line: line.map(|l| l as usize),
-            excerpts,
-        });
-    }
-    check_count(marks.len())?;
-    // Every file must be there to be shown.
-    let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
-    let snap = crate::git::read_code(&root, rev.as_deref(), &paths).map_err(|e| e.to_string())?;
-    let lengths: Vec<usize> = snap
-        .files
-        .iter()
-        .map(|(_, data)| data.split(|&b| b == b'\n').count() - usize::from(data.ends_with(b"\n")))
-        .collect();
-    for (f, &n) in files.iter().zip(&lengths) {
-        if let Some(l) = f.line
-            && l > n.max(1)
-        {
-            return Err(format!("{} has {n} lines; line {l} does not exist", f.path));
-        }
-    }
-    let mut placed: Vec<crate::proto::MarkSpec> = marks
-        .into_iter()
-        .map(|(i, mut h)| {
-            if h.end > lengths[i] {
-                return Err(format!(
-                    "{} has {} lines; lines {}-{} do not exist",
-                    files[i].path, lengths[i], h.start, h.end
-                ));
-            }
-            h.path = files[i].path.clone();
-            Ok(h)
-        })
-        .collect::<Result<_, String>>()?;
-    // Numbered as the viewer shows them: by file in the listed order, then line.
-    let at = |path: &str| files.iter().position(|f| f.path == path);
-    placed.sort_by_key(|h| (at(&h.path), h.start, h.end));
-    let mut what = files
-        .iter()
-        .map(|f| match f.line {
-            Some(l) => format!("{} at line {l}", f.path),
-            None => f.path.clone(),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    if let Some(r) = &rev {
-        what.push_str(&format!(" as of {r}"));
-    }
-    what.push_str(&list_marks(&placed));
-    let view = crate::proto::ViewSpec {
-        code: Some(crate::proto::CodeSpec { rev, files }),
-        marks: placed,
-        ..Default::default()
-    };
-    Ok((root, view, what))
+    Ok(r.render())
 }
 
 /// An optional list argument.
@@ -707,32 +536,10 @@ fn check_count(n: usize) -> Result<(), String> {
     let max = crate::proto::MAX_MARKS;
     if n > max {
         return Err(format!(
-            "at most {max} marks per call (got {n}); keep the ones that matter most"
+            "at most {max} new marks per call (got {n}); keep the ones that matter most"
         ));
     }
     Ok(())
-}
-
-/// The marks in the order the viewer letters them.
-fn list_marks(marks: &[crate::proto::MarkSpec]) -> String {
-    if marks.is_empty() {
-        return String::new();
-    }
-    let each: Vec<String> = marks
-        .iter()
-        .map(|h| {
-            let lines = if h.start == h.end {
-                h.start.to_string()
-            } else {
-                format!("{}-{}", h.start, h.end)
-            };
-            format!("{} {lines}", h.path)
-        })
-        .collect();
-    format!(
-        "; marks, lettered in this order in the viewer: {}",
-        each.join(", ")
-    )
 }
 
 fn no_viewer(e: String) -> String {
@@ -744,93 +551,33 @@ fn no_viewer(e: String) -> String {
     }
 }
 
-/// Check a show_diff call before anything reaches the viewer: the
-/// repository, the range and the files. Returns the checkout root, what to
-/// send, and words for what will be shown.
-fn prepare_diff(
-    args: &Value,
-    cwd: &Path,
-) -> Result<(PathBuf, crate::proto::ViewSpec, String), String> {
-    let root = repo_root(args, cwd)?;
-    let range = args
-        .get("range")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
-        .map(str::to_owned);
-    if let Some(r) = &range
-        && crate::pr::parse(r).is_none()
-    {
-        crate::git::parse_spec(&root, r).map_err(|e| e.to_string())?;
-    }
-    let files = match args.get("files") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|v| {
-                let p = v.as_str().ok_or("files must be strings")?;
-                relative_to(&root, cwd, p)
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        Some(_) => return Err("files must be a list of paths".to_string()),
+/// `path` as the agent gave it, relative to the checkout root or absolute
+/// under it, made relative to the root the way the viewer names files.
+/// With no root known, as for a pull request, it is taken as relative.
+fn relative_to(root: &Path, path: &str) -> Result<String, String> {
+    let p = Path::new(path.trim());
+    let rel = if p.is_absolute() {
+        if root.as_os_str().is_empty() {
+            return Err(format!(
+                "{path}: paths in a pull request are relative to its checkout"
+            ));
+        }
+        let full = std::fs::canonicalize(p).unwrap_or_else(|_| lexical(p));
+        full.strip_prefix(root)
+            .map(Path::to_path_buf)
+            .map_err(|_| format!("{path} is outside the checkout at {}", root.display()))?
+    } else {
+        let clean = lexical(p);
+        if clean.components().next().is_none()
+            || clean.starts_with("..")
+            || clean.as_os_str().to_string_lossy().starts_with("..")
+        {
+            return Err(format!(
+                "{path} leads outside the checkout; paths are relative to its root"
+            ));
+        }
+        clean
     };
-    let mut marks = Vec::new();
-    for h in list(args, "marks")? {
-        let path = h
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or("each mark needs a path")?;
-        let (start, end) = parse_lines(h.get("lines"))?;
-        marks.push(crate::proto::MarkSpec {
-            path: relative_to(&root, cwd, path)?,
-            start,
-            end,
-            text: text(h),
-        });
-    }
-    check_count(marks.len())?;
-    // Numbered as the viewer shows them: by path, as the diff orders files,
-    // then line.
-    marks.sort_by(|a, b| (&a.path, a.start, a.end).cmp(&(&b.path, b.start, b.end)));
-    let mut what = range
-        .clone()
-        .unwrap_or_else(|| "everything since the branch point".to_string());
-    if !files.is_empty() {
-        what.push_str(&format!(", narrowed to {}", files.join(", ")));
-    }
-    what.push_str(&list_marks(&marks));
-    let view = crate::proto::ViewSpec {
-        range,
-        files,
-        marks,
-        ..Default::default()
-    };
-    Ok((root, view, what))
-}
-
-/// The checkout root of `repo`, or of the working directory.
-fn repo_root(args: &Value, cwd: &Path) -> Result<PathBuf, String> {
-    let dir = match args.get("repo").and_then(Value::as_str) {
-        Some(r) => cwd.join(r),
-        None => cwd.to_path_buf(),
-    };
-    let repo = gix::discover(&dir)
-        .map_err(|_| format!("{} is not inside a git repository", dir.display()))?;
-    let root = repo
-        .workdir()
-        .ok_or("bare repositories have no working tree")?;
-    std::fs::canonicalize(root).map_err(|e| e.to_string())
-}
-
-/// `path` as given by the agent (relative to its working directory, or
-/// absolute) made relative to the checkout root, the way the viewer names
-/// files. The file may no longer exist, as in a diff that deletes it.
-fn relative_to(root: &Path, cwd: &Path, path: &str) -> Result<String, String> {
-    let joined = cwd.join(path);
-    let full = std::fs::canonicalize(&joined).unwrap_or_else(|_| lexical(&joined));
-    let rel = full
-        .strip_prefix(root)
-        .map_err(|_| format!("{path} is outside the repository at {}", root.display()))?;
     Ok(rel.to_string_lossy().into_owned())
 }
 
@@ -840,7 +587,9 @@ fn lexical(path: &Path) -> PathBuf {
     for c in path.components() {
         match c {
             std::path::Component::ParentDir => {
-                out.pop();
+                if !out.pop() {
+                    out.push("..");
+                }
             }
             std::path::Component::CurDir => {}
             other => out.push(other),
@@ -852,439 +601,211 @@ fn lexical(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{FileSpec, MarkEntry};
     use crate::testutil::branch_with_history;
 
+    fn at(dir: &Path, view: &str) -> String {
+        format!("{}{view}", dir.display())
+    }
+
     #[test]
-    fn a_diff_call_is_checked_before_it_is_sent() {
-        let dir = branch_with_history("mcp-prepare");
-        let sub = dir.join("src");
-        let (root, view, what) = prepare_diff(
-            &json!({ "range": "main...feature", "files": ["deep/one.rs"] }),
-            &sub,
-        )
+    fn a_show_is_checked_before_it_is_sent() {
+        let dir = branch_with_history("mcp-show");
+        let a = show_args(&json!({
+            "location": at(&dir.join("src"), "#main...feature"),
+            "files": [{ "path": "src/deep/one.rs" }, "a.txt"],
+        }))
         .unwrap();
-        assert_eq!(root, dir);
-        assert_eq!(view.range.as_deref(), Some("main...feature"));
         assert_eq!(
-            view.files,
-            ["src/deep/one.rs"],
-            "paths become repository-relative"
+            a.location,
+            at(&dir, "#main...feature"),
+            "the root, with the view"
         );
-        assert_eq!(what, "main...feature, narrowed to src/deep/one.rs");
+        assert_eq!(
+            a.files,
+            [
+                FileSpec {
+                    path: "src/deep/one.rs".to_string(),
+                    lines: None
+                },
+                FileSpec {
+                    path: "a.txt".to_string(),
+                    lines: None
+                }
+            ]
+        );
+        assert!(a.marks.is_empty() && !a.replace && !a.user_asked);
 
-        let (_, view, what) = prepare_diff(&json!({}), &dir).unwrap();
-        assert_eq!(view, crate::proto::ViewSpec::default());
-        assert_eq!(what, "everything since the branch point");
-
-        let err = prepare_diff(&json!({ "range": "nope...feature" }), &dir).unwrap_err();
+        let err = show_args(&json!({ "location": at(&dir, "#nope...feature") })).unwrap_err();
         assert!(err.contains("nope"), "{err}");
-        let err = prepare_diff(&json!({ "files": ["../../elsewhere.rs"] }), &dir).unwrap_err();
-        assert!(err.contains("outside the repository"), "{err}");
-        let (_, view, _) = prepare_diff(&json!({ "range": "#12" }), &dir).unwrap();
-        assert_eq!(
-            view.range.as_deref(),
-            Some("#12"),
-            "PRs are left to the viewer"
-        );
+        let err = show_args(&json!({ "location": "src", "files": ["a.txt"] })).unwrap_err();
+        assert!(err.contains("absolute directory"), "{err}");
+        let err = show_args(&json!({ "files": ["a.txt"] })).unwrap_err();
+        assert!(err.contains("location is required"), "{err}");
+        let err = show_args(&json!({
+            "location": at(&dir, ""),
+            "files": ["../elsewhere.rs"]
+        }))
+        .unwrap_err();
+        assert!(err.contains("outside the checkout"), "{err}");
+        let err = show_args(&json!({ "location": at(&dir, "") })).unwrap_err();
+        assert!(err.contains("files is required"), "{err}");
+        let a = show_args(&json!({ "location": at(&dir, "#branch") })).unwrap();
+        assert!(a.files.is_empty(), "a diff shows every changed file");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn a_code_call_is_checked_before_it_is_sent() {
-        let dir = branch_with_history("mcp-code");
-        let sub = dir.join("src");
-        let (root, view, what) = prepare_code(
-            &json!({ "files": [{ "path": "deep/one.rs", "line": 1 }, { "path": "../a.txt" }] }),
-            &sub,
-        )
+    fn files_as_they_are_must_exist_and_regions_and_marks_fit() {
+        let dir = branch_with_history("mcp-files");
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let a = show_args(&json!({
+            "location": at(&dir, ""),
+            "files": [{ "path": dir.join("a.txt").display().to_string(), "lines": "1-2" }],
+            "marks": [{ "path": "a.txt", "lines": "2", "text": " here " }],
+        }))
         .unwrap();
-        assert_eq!(root, dir);
-        let code = view.code.unwrap();
-        assert_eq!(code.files[0].path, "src/deep/one.rs");
-        assert_eq!(code.files[0].line, Some(1));
-        assert_eq!(code.files[1].path, "a.txt");
-        assert_eq!(what, "src/deep/one.rs at line 1, a.txt");
-
-        let (_, view, what) =
-            prepare_code(&json!({ "files": ["gone.txt"], "rev": "main" }), &dir).unwrap();
-        assert_eq!(view.code.unwrap().rev.as_deref(), Some("main"));
-        assert_eq!(what, "gone.txt as of main");
-
-        let err = prepare_code(&json!({ "files": ["gone.txt"] }), &dir).unwrap_err();
-        assert!(err.contains("gone.txt does not exist"), "{err}");
+        assert_eq!(
+            a.files[0].lines,
+            Some((1, 2)),
+            "absolute paths under the root are fine"
+        );
+        assert_eq!(a.files[0].path, "a.txt");
+        assert_eq!(
+            a.marks,
+            [MarkEntry::Add(crate::proto::MarkSpec {
+                path: "a.txt".to_string(),
+                start: 2,
+                end: 2,
+                text: Some("here".to_string())
+            })]
+        );
         let err =
-            prepare_code(&json!({ "files": [{ "path": "a.txt", "line": 99 }] }), &dir).unwrap_err();
-        assert!(err.contains("has 1 lines"), "{err}");
-        assert!(prepare_code(&json!({ "files": [] }), &dir).is_err());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn marks_are_checked_and_carried() {
-        let dir = branch_with_history("mcp-marks");
-        let (_, view, what) = prepare_code(
-            &json!({ "files": [{ "path": "a.txt", "marks": [{ "lines": "1", "text": " here " }] }] }),
-            &dir,
-        )
-        .unwrap();
-        assert_eq!(
-            view.marks,
-            [crate::proto::MarkSpec {
-                path: "a.txt".into(),
-                start: 1,
-                end: 1,
-                text: Some("here".into()),
-            }]
-        );
-        assert_eq!(
-            what,
-            "a.txt; marks, lettered in this order in the viewer: a.txt 1"
-        );
-        let err = prepare_code(
-            &json!({ "files": [{ "path": "a.txt", "marks": [{ "lines": "1-5" }] }] }),
-            &dir,
-        )
+            show_args(&json!({ "location": at(&dir, ""), "files": ["nope.rs"] })).unwrap_err();
+        assert!(err.contains("nope.rs"), "{err}");
+        let err = show_args(&json!({
+            "location": at(&dir, ""),
+            "files": [{ "path": "a.txt", "lines": "1-400" }]
+        }))
         .unwrap_err();
         assert!(err.contains("do not exist"), "{err}");
-
-        let (_, view, what) = prepare_diff(
-            &json!({ "marks": [{ "path": "src/deep/one.rs", "lines": "2–3" }, { "path": "a.txt", "lines": 1 }] }),
-            &dir,
-        )
-        .unwrap();
-        assert_eq!(view.marks.len(), 2);
-        assert_eq!((view.marks[1].start, view.marks[1].end), (2, 3));
-        assert!(
-            what.ends_with(
-                "; marks, lettered in this order in the viewer: a.txt 1, src/deep/one.rs 2-3"
-            ),
-            "{what}"
-        );
-        for bad in ["0-2", "5-3", "x"] {
-            assert!(
-                prepare_diff(
-                    &json!({ "marks": [{ "path": "a.txt", "lines": bad }] }),
-                    &dir
-                )
-                .is_err(),
-                "{bad}"
-            );
-        }
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn marks_are_numbered_by_where_they_sit() {
-        let dir = branch_with_history("mcp-numbering");
-        // show_code: by file in the order listed, then by line.
-        let (_, view, what) = prepare_code(
-            &json!({ "files": [
-                { "path": "b.txt", "marks": [{ "lines": "1", "text": "b" }] },
-                { "path": "a.txt", "marks": [{ "lines": "1", "text": "a" }] },
-            ], "rev": "HEAD~2" }),
-            &dir,
-        )
-        .unwrap();
-        assert_eq!(
-            what,
-            "b.txt, a.txt as of HEAD~2; marks, lettered in this order in the viewer: b.txt 1, a.txt 1"
-        );
-        let notes: Vec<_> = view.marks.iter().map(|h| h.text.as_deref()).collect();
-        assert_eq!(notes, [Some("b"), Some("a")]);
-
-        // show_diff: by path, as the diff orders its files, then by line.
-        let (_, view, what) = prepare_diff(
-            &json!({ "marks": [
-                { "path": "src/deep/one.rs", "lines": "9" },
-                { "path": "b.txt", "lines": "7-8" },
-                { "path": "src/deep/one.rs", "lines": "3" },
-                { "path": "a.txt", "lines": "5" },
-            ] }),
-            &dir,
-        )
-        .unwrap();
-        assert!(
-            what.ends_with(
-                "; marks, lettered in this order in the viewer: a.txt 5, b.txt 7-8, src/deep/one.rs 3, src/deep/one.rs 9"
-            ),
-            "{what}"
-        );
-        let starts: Vec<_> = view.marks.iter().map(|h| h.start).collect();
-        assert_eq!(starts, [5, 7, 3, 9]);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn at_most_twenty_marks_per_call() {
-        let dir = branch_with_history("mcp-cap");
-        let many = |n: usize| -> Vec<Value> {
-            (0..n)
-                .map(|_| json!({ "path": "a.txt", "lines": "1" }))
-                .collect()
-        };
-        let (_, view, what) = prepare_diff(&json!({ "marks": many(20) }), &dir).unwrap();
-        assert_eq!(view.marks.len(), 20);
-        assert_eq!(what.matches("a.txt 1").count(), 20, "{what}");
-        let err = prepare_diff(&json!({ "marks": many(21) }), &dir).unwrap_err();
-        assert_eq!(
-            err,
-            "at most 20 marks per call (got 21); keep the ones that matter most"
-        );
-        let err = prepare_code(
-            &json!({ "files": [{ "path": "a.txt", "marks": many(21) }] }),
-            &dir,
-        )
+        let err = show_args(&json!({
+            "location": at(&dir, ""),
+            "files": [{ "path": "a.txt", "lines": "1-2" }],
+            "marks": [{ "path": "a.txt", "lines": "3" }]
+        }))
         .unwrap_err();
+        assert!(err.contains("show that region too"), "{err}");
+        let err = show_args(&json!({
+            "location": at(&dir, ""),
+            "marks": [{ "path": "a.txt", "lines": "900" }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("do not exist"), "{err}");
+        let a = show_args(&json!({
+            "location": at(&dir, ""),
+            "marks": [{ "path": "a.txt", "lines": "1" }]
+        }))
+        .unwrap();
         assert!(
-            err.starts_with("at most 20 marks per call (got 21)"),
-            "{err}"
+            a.files.is_empty(),
+            "the marked files are shown for the marks' sake"
         );
+        let err = show_args(&json!({
+            "location": at(&dir, "#nope"),
+            "files": ["a.txt"]
+        }))
+        .unwrap_err();
+        assert!(err.contains("nope"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn excerpts_are_carried_per_file() {
-        let dir = branch_with_history("mcp-excerpts");
-        let (_, view, _) = prepare_code(
-            &json!({ "files": [{ "path": "a.txt", "excerpts": true }, { "path": "b.txt" }] }),
-            &dir,
-        )
-        .unwrap();
-        let files = view.code.unwrap().files;
-        assert_eq!(files[0].excerpts, Some(true));
-        assert_eq!(files[1].excerpts, None);
-        let err = prepare_code(
-            &json!({ "files": [{ "path": "a.txt", "excerpts": "yes" }] }),
-            &dir,
-        )
-        .unwrap_err();
-        assert_eq!(err, "excerpts is true or false");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn a_show_reply_names_the_letters_the_location_and_unread_comments() {
-        let mut r = crate::proto::ShowResult {
-            repo: true,
-            viewer: "v1".to_string(),
-            workspace: None,
-            picked_by: "first".to_string(),
-            ack: Some(crate::proto::ShowAck {
-                location: "/r".to_string(),
-                dir: PathBuf::from("/r"),
-                marks: vec![
-                    crate::proto::MarkInfo {
-                        label: "C".to_string(),
-                        path: "a.txt".to_string(),
-                        start: 5,
-                        end: 5,
-                        ..Default::default()
-                    },
-                    crate::proto::MarkInfo {
-                        label: "D".to_string(),
-                        path: "b.txt".to_string(),
-                        start: 7,
-                        end: 8,
-                        old_side: true,
-                        ..Default::default()
-                    },
-                ],
-                mine: vec![
-                    crate::proto::MarkInfo {
-                        label: "A".to_string(),
-                        path: "a.txt".to_string(),
-                        ..Default::default()
-                    },
-                    crate::proto::MarkInfo {
-                        label: "C".to_string(),
-                        path: "a.txt".to_string(),
-                        ..Default::default()
-                    },
-                    crate::proto::MarkInfo {
-                        label: "D".to_string(),
-                        path: "b.txt".to_string(),
-                        ..Default::default()
-                    },
-                ],
-                unread: 2,
-                applied: true,
-            }),
-        };
-        assert_eq!(
-            shown(
-                &r,
-                "a.txt, b.txt; marks, lettered in this order in the viewer: a.txt 5, b.txt 7-8"
-            ),
-            "shown in viewer v1: a.txt, b.txt; marks [C] a.txt 5, [D] b.txt old 7-8; location /r; the user has 2 unread comments on /r, call get_review; your marks on /r: [A] [C] a.txt, [D] b.txt; remember to remove any marks that are not needed any more; the user gets back to their previous view with Esc"
-        );
-        r.ack.as_mut().unwrap().applied = false;
-        assert!(
-            shown(&r, "x").contains("holds this until"),
-            "{}",
-            shown(&r, "x")
-        );
-        r.ack = None;
-        assert!(
-            shown(&r, "x").contains("did not say which letters"),
-            "{}",
-            shown(&r, "x")
-        );
-    }
-
-    #[test]
-    fn clear_arguments_are_checked() {
-        let (which, letters) = clear_args(&json!({})).unwrap();
-        assert_eq!((which.as_str(), letters.as_slice()), ("mine", &[][..]));
-        let (which, letters) =
-            clear_args(&json!({ "which": "all", "letters": [" c", "[D]", "aa"] })).unwrap();
-        assert_eq!(which, "all");
-        assert_eq!(letters, ["C", "D", "AA"]);
-        let err = clear_args(&json!({ "which": "theirs" })).unwrap_err();
-        assert_eq!(err, "which must be mine, user or all, not theirs");
-        let err = clear_args(&json!({ "letters": ["3"] })).unwrap_err();
-        assert_eq!(
-            err,
-            "\"3\" is not a mark's letter; replies have no letters of their own, name the mark they are under"
-        );
-        let err = clear_args(&json!({ "letters": ["c12"] })).unwrap_err();
-        assert!(
-            err.starts_with("\"c12\" is not a mark's letter; replies"),
-            "{err}"
-        );
-        let err = clear_args(&json!({ "letters": "C" })).unwrap_err();
-        assert_eq!(err, "letters must be a list");
-    }
-
-    #[test]
-    fn marks_are_checked_and_their_paths_made_relative_to_the_checkout() {
-        let dir = branch_with_history("mcp-mark");
-        let sub = dir.join("deep");
-        std::fs::create_dir_all(&sub).unwrap();
-        let q = mark_args(
-            &json!({ "marks": [
-                { "path": "one.rs", "lines": "4-6", "text": " unused " },
-                { "path": "../a.txt", "lines": 1, "text": "and this" }
-            ], "repo": ".." }),
-            &sub,
-        )
+    fn mark_entries_add_move_or_delete() {
+        let dir = branch_with_history("mcp-entries");
+        let a = show_args(&json!({
+            "location": at(&dir, "#branch"),
+            "marks": [
+                { "letter": "c", "delete": true },
+                { "letter": "[D]", "path": "./src/deep/one.rs", "lines": "4-5" },
+                { "path": "a.txt", "lines": 1 }
+            ],
+            "replace": true,
+            "user_explicitly_asked_to_delete": true
+        }))
         .unwrap();
         assert_eq!(
-            q,
-            crate::proto::AgentQuery::Mark {
-                location: Some(crate::proto::LocationRef {
-                    repo: Some(dir.clone()),
-                    pr: None,
-                }),
-                marks: vec![
-                    crate::proto::MarkSpec {
-                        path: "deep/one.rs".to_string(),
-                        start: 4,
-                        end: 6,
-                        text: Some("unused".to_string()),
-                    },
-                    crate::proto::MarkSpec {
-                        path: "a.txt".to_string(),
-                        start: 1,
-                        end: 1,
-                        text: Some("and this".to_string()),
-                    },
-                ],
-            }
+            a.marks,
+            [
+                MarkEntry::Delete {
+                    letter: "C".to_string()
+                },
+                MarkEntry::Move {
+                    letter: "D".to_string(),
+                    path: "src/deep/one.rs".to_string(),
+                    start: 4,
+                    end: 5
+                },
+                MarkEntry::Add(crate::proto::MarkSpec {
+                    path: "a.txt".to_string(),
+                    start: 1,
+                    end: 1,
+                    text: None
+                })
+            ]
         );
-        let err = mark_args(&json!({}), &dir).unwrap_err();
-        assert_eq!(err, "marks must list at least one mark");
-        let err = mark_args(&json!({ "marks": [{ "lines": 9, "text": "x" }] }), &dir).unwrap_err();
-        assert_eq!(err, "each mark needs a path: the file it goes on");
-        let err = mark_args(
-            &json!({ "marks": [{ "path": "a.txt", "text": "x" }] }),
-            &dir,
-        )
+        assert!(a.replace && a.user_asked);
+        let err = show_args(&json!({
+            "location": at(&dir, "#branch"),
+            "marks": [{ "letter": "C", "path": "a.txt", "lines": "1", "text": "new words" }]
+        }))
         .unwrap_err();
-        assert_eq!(
-            err,
-            "a.txt: lines is required: where the mark goes, like \"40-42\""
-        );
-        let err = mark_args(
-            &json!({ "marks": [{ "path": "a.txt", "lines": 9, "text": " " }] }),
-            &dir,
-        )
+        assert!(err.contains("a move keeps the mark's words"), "{err}");
+        let err = show_args(&json!({
+            "location": at(&dir, "#branch"),
+            "marks": [{ "delete": true }]
+        }))
         .unwrap_err();
-        assert_eq!(err, "a.txt: text is required: the words on the mark");
-        let many: Vec<Value> = (1..=21)
-            .map(|i| json!({ "path": "a.txt", "lines": i, "text": "x" }))
-            .collect();
-        let err = mark_args(&json!({ "marks": many }), &dir).unwrap_err();
-        assert!(
-            err.starts_with("at most 20 marks per call (got 21)"),
-            "{err}"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn a_move_is_checked_and_its_path_made_relative_to_the_checkout() {
-        let dir = branch_with_history("mcp-move");
-        let sub = dir.join("deep");
-        std::fs::create_dir_all(&sub).unwrap();
-        let q = move_args(
-            &json!({ "letter": "[b]", "lines": "4-6", "path": "one.rs", "repo": ".." }),
-            &sub,
-        )
-        .unwrap();
-        assert_eq!(
-            q,
-            crate::proto::AgentQuery::MoveMark {
-                location: Some(crate::proto::LocationRef {
-                    repo: Some(dir.clone()),
-                    pr: None,
-                }),
-                letter: "B".to_string(),
-                path: Some("deep/one.rs".to_string()),
-                start: 4,
-                end: 6,
-            }
-        );
-        let q = move_args(&json!({ "letter": "B", "lines": 9 }), &dir).unwrap();
-        assert!(
-            matches!(
-                q,
-                crate::proto::AgentQuery::MoveMark {
-                    location: None,
-                    path: None,
-                    start: 9,
-                    end: 9,
-                    ..
-                }
-            ),
-            "{q:?}"
-        );
-        let q = move_args(&json!({ "letter": "B", "lines": 9, "pr": "#3" }), &dir).unwrap();
-        assert!(
-            matches!(
-                q,
-                crate::proto::AgentQuery::MoveMark {
-                    location: Some(crate::proto::LocationRef {
-                        repo: None,
-                        pr: Some(_)
-                    }),
-                    ..
-                }
-            ),
-            "{q:?}"
-        );
-        let err = move_args(&json!({ "letter": "B2", "lines": 9 }), &dir).unwrap_err();
+        assert!(err.contains("delete needs the letter"), "{err}");
+        let err = show_args(&json!({
+            "location": at(&dir, "#branch"),
+            "marks": [{ "letter": "C2", "delete": true }]
+        }))
+        .unwrap_err();
         assert!(err.contains("replies have no letters"), "{err}");
-        let err = move_args(&json!({ "lines": "4" }), &dir).unwrap_err();
-        assert!(err.starts_with("letter is required"), "{err}");
-        let err = move_args(&json!({ "letter": "B" }), &dir).unwrap_err();
-        assert!(err.starts_with("lines is required"), "{err}");
-        let err = move_args(&json!({ "letter": "B", "lines": "6-4" }), &dir).unwrap_err();
-        assert!(err.contains("run forward"), "{err}");
+        let err = show_args(&json!({
+            "location": at(&dir, "#branch"),
+            "marks": [{ "path": "a.txt" }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("lines is required"), "{err}");
+        let many: Vec<Value> = (1..=21)
+            .map(|i| json!({ "path": "a.txt", "lines": i.to_string() }))
+            .collect();
+        let err =
+            show_args(&json!({ "location": at(&dir, "#branch"), "marks": many })).unwrap_err();
+        assert!(err.contains("at most 20"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn the_review_tools_are_listed() {
+    fn a_pull_request_takes_relative_paths_and_no_view() {
+        let a = show_args(&json!({
+            "location": "Acme/Widget#7",
+            "files": ["src/lib.rs"],
+            "marks": [{ "path": "src/lib.rs", "lines": "3-4" }]
+        }))
+        .unwrap();
+        assert_eq!(a.location, "acme/widget#7");
+        let err = show_args(&json!({ "location": "acme/widget#7", "files": ["/abs/lib.rs"] }))
+            .unwrap_err();
+        assert!(err.contains("relative to its checkout"), "{err}");
+        let err = show_args(&json!({ "location": "#7" })).unwrap_err();
+        assert!(err.contains("owner/repo#7"), "{err}");
+    }
+
+    #[test]
+    fn the_three_tools_are_listed_with_a_location_each() {
         let tools = tools();
         let names: Vec<&str> = tools
             .as_array()
@@ -1292,73 +813,43 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            names,
-            [
-                "show_code",
-                "show_diff",
-                "list_locations",
-                "get_review",
-                "mark",
-                "reply",
-                "move_mark",
-                "clear_marks"
-            ]
-        );
-        let tool = |name: &str| {
-            tools
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|t| t["name"] == name)
-                .unwrap()
-                .clone()
-        };
-        assert!(tool("show_code")["inputSchema"]["properties"]["append"].is_null());
-        assert_eq!(
-            tool("list_locations")["inputSchema"]["properties"],
-            json!({})
-        );
-        assert_eq!(
-            tool("reply")["inputSchema"]["required"],
-            json!(["letter", "text"])
-        );
-        assert_eq!(tool("mark")["inputSchema"]["required"], json!(["marks"]));
-        assert_eq!(
-            tool("mark")["inputSchema"]["properties"]["marks"]["items"]["required"],
-            json!(["path", "lines", "text"])
-        );
-        for name in ["get_review", "mark", "reply", "move_mark", "clear_marks"] {
-            let props = &tool(name)["inputSchema"]["properties"];
+        assert_eq!(names, ["show", "review", "reply"]);
+        for t in tools.as_array().unwrap() {
+            let required = t["inputSchema"]["required"].as_array().unwrap();
+            assert!(required.contains(&json!("location")), "{}", t["name"]);
             assert!(
-                props["repo"].is_object() && props["pr"].is_object() && props["location"].is_null(),
-                "{name} names locations by repo or pr"
+                t["inputSchema"]["properties"]["location"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("#main...HEAD")
             );
         }
-        assert_eq!(
-            tool("move_mark")["inputSchema"]["required"],
-            json!(["letter", "lines"])
-        );
-        let clear = &tool("clear_marks")["inputSchema"]["properties"];
-        assert_eq!(clear["which"]["enum"], json!(["mine", "user", "all"]));
-        assert_eq!(
-            clear["user_explicitly_asked_to_delete_comments"]["type"],
-            "boolean"
-        );
+        let marks = &tools[0]["inputSchema"]["properties"]["marks"]["items"]["properties"];
+        for key in ["path", "lines", "text", "letter", "delete"] {
+            assert!(marks.get(key).is_some(), "{key}");
+        }
+        assert!(INSTRUCTIONS.contains("`review`") && INSTRUCTIONS.contains("replace"));
+        assert!(!INSTRUCTIONS.contains("show_code") && !INSTRUCTIONS.contains("list_locations"));
     }
 
     #[test]
-    fn show_code_schema_keeps_line_and_marks_apart() {
-        let tools = tools();
-        let schema = &tools[0]["inputSchema"];
-        assert_eq!(tools[0]["name"], "show_code");
+    fn paths_are_cleaned_without_escaping_the_checkout() {
+        let root = Path::new("/work/repo");
+        assert_eq!(relative_to(root, "./src/../src/a.rs").unwrap(), "src/a.rs");
         assert_eq!(
-            schema["if"]["properties"]["files"]["contains"]["required"],
-            json!(["marks"])
+            relative_to(root, "/work/repo/src/a.rs").unwrap(),
+            "src/a.rs"
         );
-        assert_eq!(
-            schema["then"]["properties"]["files"]["items"]["not"]["required"],
-            json!(["line"])
+        assert!(
+            relative_to(root, "../x.rs")
+                .unwrap_err()
+                .contains("outside")
         );
+        assert!(
+            relative_to(root, "/elsewhere/x.rs")
+                .unwrap_err()
+                .contains("outside")
+        );
+        assert!(relative_to(root, "").is_err());
     }
 }

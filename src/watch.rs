@@ -23,15 +23,9 @@ pub enum Msg {
         seq: u64,
         result: Box<Result<crate::loader::Load, String>>,
     },
-    /// The daemon asks this viewer to display a target; `reply` is the id
+    /// The daemon asks this viewer to show a location; `reply` is the id
     /// to answer under, when the daemon waits for one.
-    Show(crate::proto::Target, Option<String>),
-    /// An agent asks this viewer to show something particular in a target.
-    View(
-        crate::proto::Target,
-        Box<crate::proto::ViewSpec>,
-        Option<String>,
-    ),
+    Show(Box<crate::proto::ShowEvent>, Option<String>),
     /// The daemon says what a location's marks are now, after any change
     /// anywhere; `note` says what an agent did, for the user.
     Location {

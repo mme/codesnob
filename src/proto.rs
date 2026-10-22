@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_SOCKET_PATH: usize = 100;
 
@@ -72,8 +72,8 @@ pub fn own_binary() -> PathBuf {
 
 // ---- frames -----------------------------------------------------------------
 
-pub use crate::marks::{MAX_MARKS, MarkInfo, MarkSpec};
-pub use crate::registry::{LocationKey, LocationRef, LocationState};
+pub use crate::marks::{MAX_MARKS, MarkEntry, MarkInfo, MarkSpec};
+pub use crate::registry::{LocationKey, LocationState};
 
 /// What the daemon currently asks viewers to display.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,20 +85,43 @@ pub struct Target {
     pub repo: bool,
 }
 
-/// What an agent asks a viewer to show in a checkout. Fields are optional
-/// and unknown ones ignored, so older and newer versions can talk.
+/// A file to show, whole or one region of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSpec {
+    /// Relative to the checkout root.
+    pub path: String,
+    /// Only these lines, 1-based and inclusive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<(usize, usize)>,
+}
+
+impl FileSpec {
+    pub fn words(&self) -> String {
+        match self.lines {
+            Some((a, b)) if a == b => format!("{} {a}", self.path),
+            Some((a, b)) => format!("{} {a}-{b}", self.path),
+            None => self.path.clone(),
+        }
+    }
+}
+
+/// A show as relayed to a viewer: the location as the daemon has it, how
+/// to fetch it when it is a pull request, and what to put on screen.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShowEvent {
+    pub state: LocationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<crate::pr::Spec>,
+    #[serde(default)]
+    pub view: ViewSpec,
+}
+
+/// What a viewer shows for an agent: the files, and the marks to place.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewSpec {
-    /// A comparison in git syntax, `worktree`, `staged`, `unstaged`, or a
-    /// PR. None: everything since the branch point.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range: Option<String>,
-    /// Only these files, relative to the repository root.
+    /// The files, whole or in part; none means every file the view has.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub files: Vec<String>,
-    /// Show files as they are instead of a diff.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeSpec>,
+    pub files: Vec<FileSpec>,
     /// Marks to place, lettered in this order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub marks: Vec<MarkSpec>,
@@ -108,66 +131,29 @@ pub struct ViewSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentQuery {
-    /// Every location open, the one on screen first.
-    Locations,
-    /// Every mark on a location; the user's words count as read
-    /// afterwards.
+    /// Every mark on a location, or the ones `letters` names; the user's
+    /// words count as read afterwards.
     Review {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        location: Option<LocationRef>,
-    },
-    /// Remove marks: `letters` names them, else `which` of "mine" (the
-    /// agent's own), "user" or "all". A mark the user made or wrote under
-    /// goes whole, and only with `user_asked`: the user explicitly asked
-    /// for that.
-    ClearMarks {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        location: Option<LocationRef>,
-        which: String,
+        location: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         letters: Vec<String>,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        user_asked: bool,
-    },
-    /// Marks of the agent's with words on lines, without a show.
-    Mark {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        location: Option<LocationRef>,
-        marks: Vec<MarkSpec>,
     },
     /// Answer under a mark the user made or wrote under.
     Reply {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        location: Option<LocationRef>,
+        location: String,
         letter: String,
         text: String,
     },
-    /// Move a mark to other lines, of `path` or of its own file, keeping
-    /// its letter, text and thread.
-    MoveMark {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        location: Option<LocationRef>,
-        letter: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        path: Option<String>,
-        start: usize,
-        end: usize,
-    },
 }
 
-/// A location as listed for an agent.
+/// A location as listed for `codesnob status`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocationInfo {
-    /// How to name it: the checkout's path, or `owner/repo#142`.
+    /// How to name it.
     pub location: String,
     /// "#142 Fix the parser" for a pull request, else the directory's name.
     pub name: String,
     pub dir: PathBuf,
-    /// What it shows, in words; empty when no viewer has it open.
-    pub showing: String,
-    /// On screen in the viewer the agent's requests reach.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub on_screen: bool,
     /// The viewers it is open in, by id and workspace.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub viewers: Vec<String>,
@@ -184,15 +170,10 @@ impl LocationInfo {
             n if n == &self.location => self.location.clone(),
             n => format!("{n} · {}", self.location),
         };
-        if self.on_screen {
-            out.push_str(" · on screen");
-        } else if !self.viewers.is_empty() {
-            out.push_str(&format!(" · open in {}", self.viewers.join(", ")));
-        } else {
+        if self.viewers.is_empty() {
             out.push_str(" · not open in any viewer");
-        }
-        if !self.showing.is_empty() {
-            out.push_str(&format!(" · {}", self.showing));
+        } else {
+            out.push_str(&format!(" · open in {}", self.viewers.join(", ")));
         }
         out.push_str(&match self.marks {
             0 => " · no marks".to_string(),
@@ -209,250 +190,200 @@ impl LocationInfo {
     }
 }
 
-/// The locations open, as answered to an agent.
+/// The state of a location, closing every reply to an agent the same way.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LocationsResult {
-    /// The one on screen first.
-    pub locations: Vec<LocationInfo>,
+pub struct Report {
+    /// How to name the location, to copy into the next call.
+    pub location: String,
+    /// Every mark there.
+    pub total: usize,
+    /// The agent's own: the ones the user has not written under.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mine: Vec<MarkInfo>,
+    /// The user's words: the marks they made, and their turns.
+    pub by_user: usize,
+    /// Those the agent has not read.
+    pub unread: usize,
+    /// Anything out of the ordinary: a show held, a mark gone stale.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
-impl LocationsResult {
-    pub fn render(&self) -> String {
-        let n = self.locations.len();
-        if n == 0 {
-            return "no locations: nothing has been shown or commented on yet".to_string();
+impl Report {
+    pub fn of(location: &str, marks: &crate::marks::Marks) -> Self {
+        Self {
+            location: location.to_string(),
+            total: marks.marks.len(),
+            mine: marks.mine(),
+            by_user: marks.users_words(),
+            unread: marks.unread(),
+            notes: Vec::new(),
         }
-        let on_screen = self.locations.first().is_some_and(|l| l.on_screen);
-        let mut out = format!(
-            "{n} location{}{}",
-            if n == 1 { "" } else { "s" },
-            if on_screen {
-                ", the one on screen first"
-            } else {
-                ""
+    }
+
+    /// "[A] [D] src/marks.rs, [B] src/ui/diagram.rs".
+    pub fn mine_by_file(&self) -> String {
+        let mut files: Vec<(&str, Vec<String>)> = Vec::new();
+        for m in &self.mine {
+            let letter = format!("[{}]", m.label);
+            match files.iter_mut().find(|(p, _)| *p == m.path) {
+                Some((_, letters)) => letters.push(letter),
+                None => files.push((&m.path, vec![letter])),
             }
-        );
-        for l in &self.locations {
-            out.push('\n');
-            out.push_str(&l.render());
         }
-        let unread: usize = self.locations.iter().map(|l| l.unread).sum();
-        if unread > 0 {
-            out.push_str(
-                "\nread unread comments with get_review, naming the location by repo or pr",
-            );
+        files
+            .iter()
+            .map(|(p, letters)| format!("{} {p}", letters.join(" ")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The closing lines of every reply.
+    pub fn render(&self) -> String {
+        let mut out = format!("location: {}", self.location);
+        let mut marks = match self.total {
+            0 => "none".to_string(),
+            1 => "1 here".to_string(),
+            n => format!("{n} here"),
+        };
+        if !self.mine.is_empty() {
+            marks.push_str(&format!(" · yours {}", self.mine_by_file()));
+        }
+        if self.by_user > 0 {
+            marks.push_str(&format!(" · {} by the user", self.by_user));
+            if self.unread > 0 {
+                marks.push_str(&format!(", {} unread", self.unread));
+            }
+        }
+        out.push_str(&format!("\nmarks: {marks}"));
+        for n in &self.notes {
+            out.push_str(&format!("\nnote: {n}"));
         }
         out
     }
 }
 
-/// What `get_review` answers with.
+/// "[A] src/x.rs 1-2, [B] src/y.rs 3".
+pub fn lettered(marks: &[MarkInfo]) -> String {
+    marks
+        .iter()
+        .map(|m| format!("[{}] {} {}", m.label, m.path, m.lines_word()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What `review` answers with.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewResult {
-    /// How to name it: the checkout's path, or `owner/repo#142`.
-    pub location: String,
-    pub dir: PathBuf,
-    /// What the location shows, in words.
-    pub showing: String,
     pub marks: Vec<MarkInfo>,
     /// Words of the user's the agent had not read before this.
-    pub unread: usize,
+    pub new: usize,
+    pub report: Report,
 }
 
 impl ReviewResult {
     pub fn render(&self) -> String {
-        let mut out = format!("{} · {}", self.location, self.showing);
+        let mut out = String::new();
         if self.marks.is_empty() {
-            out.push_str("\nno marks");
-            return out;
-        }
-        let comments = self
-            .marks
-            .iter()
-            .filter(|m| m.author == crate::marks::Author::User)
-            .count();
-        let turns: usize = self.marks.iter().map(|m| m.thread.len()).sum();
-        out.push_str(&format!(
-            "\n{} mark{}, {comments} comment{} by the user{}{}",
-            self.marks.len(),
-            if self.marks.len() == 1 { "" } else { "s" },
-            if comments == 1 { "" } else { "s" },
-            match turns {
-                0 => String::new(),
-                1 => ", 1 reply".to_string(),
-                n => format!(", {n} replies"),
-            },
-            match self.unread {
-                0 => String::new(),
-                n => format!(", {n} new"),
-            }
-        ));
-        for m in &self.marks {
-            out.push('\n');
-            out.push_str(&m.render());
-        }
-        out
-    }
-}
-
-/// What a viewer answers a show request with, once it has applied it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShowAck {
-    /// How to name the location: the checkout's path, or `owner/repo#142`.
-    pub location: String,
-    pub dir: PathBuf,
-    /// The marks the call placed, with their letters.
-    pub marks: Vec<MarkInfo>,
-    /// Every mark of the agent's on the location afterwards.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mine: Vec<MarkInfo>,
-    /// The user's words the agent has not read.
-    pub unread: usize,
-    /// Whether the view changed now, or waits for the user.
-    pub applied: bool,
-}
-
-/// What `clear_marks` answers with.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClearResult {
-    pub location: String,
-    pub cleared: Vec<String>,
-    pub remaining: usize,
-    pub unread: usize,
-}
-
-impl ClearResult {
-    pub fn render(&self) -> String {
-        let what = if self.cleared.is_empty() {
-            "nothing to clear".to_string()
+            out.push_str("review: no marks");
         } else {
-            format!(
-                "cleared {}",
-                self.cleared
-                    .iter()
-                    .map(|l| format!("[{l}]"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            )
-        };
-        format!(
-            "{what} on {}; {} mark{} remain{}",
-            self.location,
-            self.remaining,
-            if self.remaining == 1 { "" } else { "s" },
-            if self.remaining == 1 { "s" } else { "" }
-        )
+            let comments = self
+                .marks
+                .iter()
+                .filter(|m| m.author == crate::marks::Author::User)
+                .count();
+            let turns: usize = self.marks.iter().map(|m| m.thread.len()).sum();
+            out.push_str(&format!(
+                "review: {} mark{}, {comments} by the user{}{}",
+                self.marks.len(),
+                if self.marks.len() == 1 { "" } else { "s" },
+                match turns {
+                    0 => String::new(),
+                    1 => ", 1 reply".to_string(),
+                    n => format!(", {n} replies"),
+                },
+                match self.new {
+                    0 => String::new(),
+                    n => format!(", {n} new"),
+                }
+            ));
+            for m in &self.marks {
+                out.push('\n');
+                out.push_str(&m.render());
+            }
+        }
+        out.push('\n');
+        out.push_str(&self.report.render());
+        out
     }
 }
 
 /// What a reply is answered with.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplyResult {
-    pub location: String,
     /// The letter of the mark the reply went under.
     pub letter: String,
-    pub unread: usize,
+    pub report: Report,
 }
 
 impl ReplyResult {
     pub fn render(&self) -> String {
-        format!("replied under [{}] on {}", self.letter, self.location)
+        format!("replied: under [{}]\n{}", self.letter, self.report.render())
     }
 }
 
-/// What marking is answered with.
+/// What a viewer answers a show request with, once it has applied it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MarkResult {
-    pub location: String,
-    /// The marks placed, with their letters, in the order given.
+pub struct ShowAck {
+    /// The marks the call placed, with their letters.
     pub marks: Vec<MarkInfo>,
-    /// Every mark of the agent's on the location afterwards.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mine: Vec<MarkInfo>,
-    pub unread: usize,
+    /// Whether the view changed now, or waits for the user.
+    pub applied: bool,
 }
 
-impl MarkResult {
-    /// "[A] src/x.rs 1-2, [B] src/y.rs 3".
-    pub fn placed(&self) -> String {
-        self.marks
-            .iter()
-            .map(|m| format!("[{}] {} {}", m.label, m.path, m.lines_word()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    pub fn render(&self) -> String {
-        format!("marked {} on {}", self.placed(), self.location)
-    }
-}
-
-/// What moving a mark is answered with.
+/// What a show is answered with.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MoveResult {
-    pub location: String,
-    pub label: String,
-    pub path: String,
-    pub start: usize,
-    pub end: usize,
-    pub unread: usize,
+pub struct ShowResult {
+    /// What is on screen now, in words; empty when the view did not change.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub shown: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marked: Vec<MarkInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub moved: Vec<MarkInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted: Vec<String>,
+    /// The viewer that was told to display it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub viewer: String,
+    pub report: Report,
 }
 
-impl MoveResult {
-    pub fn lines_word(&self) -> String {
-        if self.start == self.end {
-            self.start.to_string()
-        } else {
-            format!("{}-{}", self.start, self.end)
-        }
-    }
-
+impl ShowResult {
     pub fn render(&self) -> String {
-        format!(
-            "moved [{}] to {} {} on {}",
-            self.label,
-            self.path,
-            self.lines_word(),
-            self.location
-        )
-    }
-}
-
-/// The agent's own marks on a location, by file, with the reminder to
-/// clean up; for every reply that leaves some.
-pub fn mine_note(location: &str, mine: &[MarkInfo]) -> String {
-    if mine.is_empty() {
-        return String::new();
-    }
-    let mut files: Vec<(&str, Vec<String>)> = Vec::new();
-    for m in mine {
-        let letter = format!("[{}]", m.label);
-        match files.iter_mut().find(|(p, _)| *p == m.path) {
-            Some((_, letters)) => letters.push(letter),
-            None => files.push((&m.path, vec![letter])),
+        let mut out = Vec::new();
+        if !self.shown.is_empty() {
+            out.push(format!("shown: {}", self.shown));
         }
-    }
-    let each: Vec<String> = files
-        .iter()
-        .map(|(p, letters)| format!("{} {p}", letters.join(" ")))
-        .collect();
-    format!(
-        "; your marks on {location}: {}; remember to remove any marks that are not needed any more",
-        each.join(", ")
-    )
-}
-
-/// The agent's nudge about the user's words it has not read, for every
-/// reply.
-pub fn unread_note(location: &str, unread: usize) -> String {
-    match unread {
-        0 => String::new(),
-        1 => format!("; the user has 1 unread comment on {location}, call get_review"),
-        n => format!("; the user has {n} unread comments on {location}, call get_review"),
+        if !self.marked.is_empty() {
+            out.push(format!("marked: {}", lettered(&self.marked)));
+        }
+        if !self.moved.is_empty() {
+            out.push(format!("moved: {}", lettered(&self.moved)));
+        }
+        if !self.deleted.is_empty() {
+            let letters: Vec<String> = self.deleted.iter().map(|l| format!("[{l}]")).collect();
+            out.push(format!("deleted: {}", letters.join(" ")));
+        }
+        if out.is_empty() {
+            out.push("nothing to do".to_string());
+        }
+        out.push(self.report.render());
+        out.join("\n")
     }
 }
 
-/// Files to show as they are.
+/// Files to show as they are, as the viewer keeps the request.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeSpec {
     /// A revision to show them at; `None` is the working tree.
@@ -465,14 +396,12 @@ pub struct CodeSpec {
 pub struct CodeFile {
     /// Relative to the repository root.
     pub path: String,
-    /// Open at this line, marked.
+    /// Only these lines, 1-based and inclusive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line: Option<usize>,
-    /// Show only the line and marks with a few lines around them
-    /// (true), or the whole file (false). Unset: whole when it is the only
-    /// file, excerpts when there are several.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub excerpts: Option<bool>,
+    pub lines: Option<(usize, usize)>,
+    /// Only the marks, each with a few lines around it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub excerpts: bool,
 }
 
 /// A location a viewer has open, as it tells the daemon.
@@ -519,27 +448,29 @@ pub enum Method {
         protocol: u32,
         version: String,
     },
-    /// Display `dir` in one viewer: the first on `workspace`, else the
-    /// nearest workspace, else the first viewer. Errors when none is connected.
+    /// Show a location in one viewer: the first on `workspace`, else the
+    /// nearest workspace, else the first viewer. The marks are changed
+    /// first, by the daemon; the view changes when there are files or new
+    /// marks, or nothing at all to do to the marks. Errors when no viewer
+    /// is connected.
     Show {
-        dir: PathBuf,
-        #[serde(default)]
-        base: Option<String>,
+        location: String,
         /// The caller's own workspace, when it could be determined.
         #[serde(default)]
         workspace: Option<String>,
-        /// What to show there, for an agent's request.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        view: Option<ViewSpec>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<FileSpec>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        marks: Vec<MarkEntry>,
+        /// The agent's own marks on the location go first.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        replace: bool,
+        /// The user explicitly asked for their marks to be deleted.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        user_asked: bool,
     },
-    /// An agent's question about marks, answered by the daemon. Without a
-    /// location named, the one on screen in the viewer picked as for
-    /// `Show`, else the one for `cwd`.
+    /// An agent's question about marks, answered by the daemon.
     Query {
-        #[serde(default)]
-        workspace: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cwd: Option<PathBuf>,
         query: AgentQuery,
     },
     /// A viewer's answer to a `Show` event, by the event's id.
@@ -602,19 +533,6 @@ pub struct HelloResult {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ShowResult {
-    pub repo: bool,
-    /// The viewer that was told to display the target.
-    pub viewer: String,
-    pub workspace: Option<String>,
-    /// How the viewer was chosen: "same", "nearest" or "first".
-    pub picked_by: String,
-    /// What the viewer made of it; `None` when it did not answer in time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ack: Option<ShowAck>,
-}
-
-#[derive(Serialize, Deserialize)]
 pub struct StatusResult {
     pub target: Option<Target>,
     pub viewers: Vec<ViewerEntry>,
@@ -627,12 +545,12 @@ pub struct StatusResult {
 #[serde(tag = "event", content = "params", rename_all = "snake_case")]
 pub enum Event {
     /// Addressed to one viewer; others ignore it. The viewer answers with
-    /// `viewer.reply` under `id` when there is one.
+    /// `viewer.reply` under `id` when there is one. `state` is the
+    /// location as the daemon has it, for a viewer opening it now; `pr`
+    /// says how to fetch a pull request.
     Show {
         viewer: String,
-        target: Target,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        view: Option<ViewSpec>,
+        show: ShowEvent,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
     },
@@ -827,67 +745,35 @@ mod tests {
     use crate::marks::{Author, MarkInfo, TurnInfo};
 
     #[test]
-    fn locations_render_one_line_each_the_one_on_screen_first() {
-        let mut r = LocationsResult {
-            locations: vec![
-                LocationInfo {
-                    location: "acme/widget#142".to_string(),
-                    name: "#142 Fix the parser".to_string(),
-                    dir: PathBuf::from("/c/pr/142"),
-                    showing: "#142 Fix the parser · into main".to_string(),
-                    on_screen: true,
-                    ..Default::default()
-                },
-                LocationInfo {
-                    location: "/work/repo".to_string(),
-                    name: "repo".to_string(),
-                    dir: PathBuf::from("/work/repo"),
-                    showing: "feature · 2 commits since main".to_string(),
-                    viewers: vec!["v9 on workspace 2".to_string()],
-                    marks: 3,
-                    by_user: 2,
-                    unread: 1,
-                    ..Default::default()
-                },
-                LocationInfo {
-                    location: "/work/other".to_string(),
-                    name: "other".to_string(),
-                    dir: PathBuf::from("/work/other"),
-                    marks: 1,
-                    by_user: 1,
-                    ..Default::default()
-                },
-            ],
+    fn locations_render_one_line_each_for_status() {
+        let l = LocationInfo {
+            location: "/work/repo#branch".to_string(),
+            name: "repo".to_string(),
+            dir: PathBuf::from("/work/repo"),
+            viewers: vec!["v9 on workspace 2".to_string()],
+            marks: 3,
+            by_user: 2,
+            unread: 1,
         };
         assert_eq!(
-            r.render(),
-            "3 locations, the one on screen first\n\
-             #142 Fix the parser · acme/widget#142 · on screen · #142 Fix the parser · into main · no marks\n\
-             repo · /work/repo · open in v9 on workspace 2 · feature · 2 commits since main · 3 marks, 2 by the user, 1 unread\n\
-             other · /work/other · not open in any viewer · 1 mark, 1 by the user\n\
-             read unread comments with get_review, naming the location by repo or pr"
+            l.render(),
+            "repo · /work/repo#branch · open in v9 on workspace 2 · 3 marks, 2 by the user, 1 unread"
         );
-        r.locations.truncate(1);
-        assert!(
-            r.render()
-                .starts_with("1 location, the one on screen first"),
-            "{}",
-            r.render()
+        let l = LocationInfo {
+            location: "acme/widget#142".to_string(),
+            name: "#142 Fix the parser".to_string(),
+            dir: PathBuf::from("/c/pr/142"),
+            ..Default::default()
+        };
+        assert_eq!(
+            l.render(),
+            "#142 Fix the parser · acme/widget#142 · not open in any viewer · no marks"
         );
-        assert!(
-            !r.render().contains("get_review"),
-            "nothing unread, no nudge"
-        );
-        r.locations.clear();
-        assert!(r.render().starts_with("no locations"));
     }
 
     #[test]
     fn a_review_renders_one_line_per_mark_with_the_commented_code() {
         let r = ReviewResult {
-            location: "/work/repo".to_string(),
-            dir: PathBuf::from("/work/repo"),
-            showing: "src/x.rs · working tree".to_string(),
             marks: vec![
                 MarkInfo {
                     label: "A".to_string(),
@@ -929,54 +815,37 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            unread: 1,
+            new: 1,
+            report: Report {
+                location: "/work/repo".to_string(),
+                total: 3,
+                mine: vec![MarkInfo {
+                    label: "A".to_string(),
+                    path: "src/x.rs".to_string(),
+                    ..Default::default()
+                }],
+                by_user: 2,
+                unread: 0,
+                notes: Vec::new(),
+            },
         };
         assert_eq!(
             r.render(),
-            "/work/repo · src/x.rs · working tree\n\
-             3 marks, 2 comments by the user, 1 reply, 1 new\n\
+            "review: 3 marks, 2 by the user, 1 reply, 1 new\n\
              [A] agent mark src/x.rs 40-46: the loop\n\
              [C] user mark src/x.rs 42-43 (new, includes deleted lines): rename this\n    \
              42 | let a = 1;\n    \
              43 | let b = 2;\n\
              [D] user mark src/y.rs old 7 (stale)\n    \
-             agent: gone for good"
+             agent: gone for good\n\
+             location: /work/repo\n\
+             marks: 3 here · yours [A] src/x.rs · 2 by the user"
         );
     }
 
     #[test]
-    fn empty_reviews_and_clears_say_so() {
-        let r = ReviewResult {
-            location: "/r".to_string(),
-            dir: PathBuf::from("/r"),
-            showing: "all".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(r.render(), "/r · all\nno marks");
-        let c = ClearResult {
-            location: "/r".to_string(),
-            cleared: vec!["C".to_string(), "D".to_string()],
-            remaining: 1,
-            unread: 0,
-        };
-        assert_eq!(c.render(), "cleared [C] [D] on /r; 1 mark remains");
-        let c = ClearResult {
-            location: "/r".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(c.render(), "nothing to clear on /r; 0 marks remain");
-        assert_eq!(
-            unread_note("/r", 2),
-            "; the user has 2 unread comments on /r, call get_review"
-        );
-        assert_eq!(unread_note("/r", 0), "");
-        let r = ReplyResult {
-            location: "acme/widget#3".to_string(),
-            letter: "B".to_string(),
-            unread: 0,
-        };
-        assert_eq!(r.render(), "replied under [B] on acme/widget#3");
-        let mine = [
+    fn every_reply_closes_with_the_same_lines() {
+        let mine = vec![
             MarkInfo {
                 label: "A".to_string(),
                 path: "src/x.rs".to_string(),
@@ -985,59 +854,120 @@ mod tests {
             MarkInfo {
                 label: "E".to_string(),
                 path: "src/y.rs".to_string(),
+                start: 10,
+                end: 12,
                 ..Default::default()
             },
             MarkInfo {
                 label: "F".to_string(),
                 path: "src/x.rs".to_string(),
+                start: 3,
+                end: 3,
                 ..Default::default()
             },
         ];
+        let report = Report {
+            location: "/r#branch".to_string(),
+            total: 5,
+            mine: mine.clone(),
+            by_user: 2,
+            unread: 1,
+            notes: vec!["the user is busy here".to_string()],
+        };
         assert_eq!(
-            mine_note("/r", &mine),
-            "; your marks on /r: [A] [F] src/x.rs, [E] src/y.rs; remember to remove any marks that are not needed any more"
+            report.render(),
+            "location: /r#branch\n\
+             marks: 5 here · yours [A] [F] src/x.rs, [E] src/y.rs · 2 by the user, 1 unread\n\
+             note: the user is busy here"
         );
-        assert_eq!(mine_note("/r", &[]), "");
-        let r = MarkResult {
-            location: "/r".to_string(),
-            marks: vec![
-                MarkInfo {
-                    label: "E".to_string(),
-                    path: "src/y.rs".to_string(),
-                    start: 10,
-                    end: 12,
-                    ..Default::default()
-                },
-                MarkInfo {
-                    label: "F".to_string(),
-                    path: "src/z.rs".to_string(),
-                    start: 3,
-                    end: 3,
-                    ..Default::default()
-                },
-            ],
+        let empty = Report::of("/r", &crate::marks::Marks::default());
+        assert_eq!(empty.render(), "location: /r\nmarks: none");
+        let r = ReviewResult {
+            report: empty.clone(),
             ..Default::default()
+        };
+        assert_eq!(r.render(), "review: no marks\nlocation: /r\nmarks: none");
+        let r = ReplyResult {
+            letter: "B".to_string(),
+            report: empty.clone(),
+        };
+        assert_eq!(r.render(), "replied: under [B]\nlocation: /r\nmarks: none");
+        let r = ShowResult {
+            shown: "the working tree · src/y.rs 1-40".to_string(),
+            marked: mine[1..].to_vec(),
+            moved: mine[..1].to_vec(),
+            deleted: vec!["C".to_string(), "D".to_string()],
+            viewer: "v1".to_string(),
+            report: report.clone(),
         };
         assert_eq!(
             r.render(),
-            "marked [E] src/y.rs 10-12, [F] src/z.rs 3 on /r"
+            "shown: the working tree · src/y.rs 1-40\n\
+             marked: [E] src/y.rs 10-12, [F] src/x.rs 3\n\
+             moved: [A] src/x.rs 0\n\
+             deleted: [C] [D]\n\
+             location: /r#branch\n\
+             marks: 5 here · yours [A] [F] src/x.rs, [E] src/y.rs · 2 by the user, 1 unread\n\
+             note: the user is busy here"
         );
+        let r = ShowResult {
+            report: empty,
+            ..Default::default()
+        };
+        assert_eq!(r.render(), "nothing to do\nlocation: /r\nmarks: none");
     }
 
     #[test]
-    fn queries_name_locations_by_repo_or_pr() {
+    fn queries_and_shows_travel_as_json() {
         let q = AgentQuery::Review {
-            location: Some(LocationRef {
-                repo: Some(PathBuf::from("/work/repo")),
-                pr: None,
-            }),
+            location: "/work/repo#main...HEAD".to_string(),
+            letters: vec!["C".to_string()],
         };
         let json = serde_json::to_string(&q).unwrap();
         assert_eq!(
             json,
-            r#"{"kind":"review","location":{"repo":"/work/repo"}}"#
+            r#"{"kind":"review","location":"/work/repo#main...HEAD","letters":["C"]}"#
         );
         let back: AgentQuery = serde_json::from_str(&json).unwrap();
         assert_eq!(back, q);
+        let m = Method::Show {
+            location: "/work/repo".to_string(),
+            workspace: None,
+            files: vec![FileSpec {
+                path: "a.rs".to_string(),
+                lines: Some((1, 4)),
+            }],
+            marks: vec![
+                MarkEntry::Delete {
+                    letter: "A".to_string(),
+                },
+                MarkEntry::Add(MarkSpec {
+                    path: "a.rs".to_string(),
+                    start: 2,
+                    end: 2,
+                    text: None,
+                }),
+            ],
+            replace: true,
+            user_asked: false,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            json.contains(r#""do":"delete""#) && json.contains(r#""do":"add""#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""replace":true"#) && !json.contains("user_asked"),
+            "{json}"
+        );
+        let key = LocationKey::Repo {
+            dir: PathBuf::from("/work/repo"),
+            view: crate::location::View::parse("branch"),
+        };
+        let json = serde_json::to_string(&key).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"repo","dir":"/work/repo","view":{"kind":"branch"}}"#
+        );
     }
 }

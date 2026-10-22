@@ -26,12 +26,13 @@ use ratatui::layout::{Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::git::{self, Range};
+use crate::git::{self, Range, Side};
 use crate::highlight::Highlighter;
 use crate::link::Link;
 use crate::loader;
+use crate::location::View;
 use crate::marks::{self, Author, Mark, MarkSpec, Marks, Op};
-use crate::proto::Target;
+use crate::proto::{CodeFile, CodeSpec, ShowAck, ShowEvent, Target};
 use crate::registry::{LocationKey, LocationState, checkout_root};
 use crate::watch::{self, Mode, Msg};
 use commands::{Action, COMMANDS};
@@ -41,9 +42,6 @@ use panel::{Outcome, Panel};
 /// Nerd Font `md-source_commit`: a ring on a vertical line, matching how
 /// Alt-Up and Alt-Down walk the branch.
 const COMMIT_ICON: &str = "\u{f0718}";
-
-/// Lines shown above and below the target line of an excerpt.
-const EXCERPT: usize = 8;
 
 /// How long a load may take before the screen says it is loading.
 const LOADING_DELAY: Duration = Duration::from_millis(150);
@@ -224,8 +222,7 @@ enum Focus {
 
 /// A show request held back until the user is done reviewing.
 struct PendingShow {
-    target: Target,
-    view: Option<crate::proto::ViewSpec>,
+    show: ShowEvent,
     /// What it would show, in words.
     words: String,
 }
@@ -477,12 +474,56 @@ impl Location {
             .collect()
     }
 
-    /// How agents name it: the checkout's path, or `owner/repo#142`.
-    fn agent_name(&self) -> String {
-        match &self.key {
-            Some(k) => k.name(),
-            None => self.dir.display().to_string(),
+    /// What it shows, as a view of the checkout: the files as they are or
+    /// at a revision, or one of the comparisons.
+    fn view_now(&self) -> View {
+        if let Some(code) = &self.code {
+            return match &code.rev {
+                None => View::Files,
+                Some(rev) => View::Rev { rev: rev.clone() },
+            };
         }
+        match self.range {
+            Range::Everything => View::Branch,
+            Range::Uncommitted => View::Worktree,
+            Range::Compare(Side::Rev(_), Side::Index) => View::Staged,
+            Range::Compare(Side::Index, Side::Worktree) => View::Unstaged,
+            Range::Compare(..) => View::Compare {
+                spec: self
+                    .range_label
+                    .as_deref()
+                    .map(|l| l.split_whitespace().collect())
+                    .unwrap_or_else(|| "comparison".to_string()),
+            },
+            Range::Commit(id) => {
+                let short = id.to_hex_with_len(7).to_string();
+                View::Compare {
+                    spec: format!("{short}~..{short}"),
+                }
+            }
+        }
+    }
+
+    /// What it is to everyone else, from what it shows now: a pull
+    /// request once fetched, else a view of its checkout; nothing while it
+    /// is not a repository or a PR still being fetched.
+    fn key_now(&self) -> Option<LocationKey> {
+        if let Some(p) = &self.pr {
+            if !p.ready {
+                return None;
+            }
+            return p
+                .info
+                .as_ref()
+                .and_then(|i| i.repo().map(|r| LocationKey::pr(&r, i.number)));
+        }
+        if !self.repo || self.dir.as_os_str().is_empty() {
+            return None;
+        }
+        Some(LocationKey::Repo {
+            dir: self.dir.clone(),
+            view: self.view_now(),
+        })
     }
 
     /// What it shows, in words, without key hints: the files it is
@@ -733,6 +774,9 @@ pub struct App {
     /// An agent's request to show something else, held while the user is
     /// reviewing: applied with y, or once the agent reads the comments.
     pending_show: Option<PendingShow>,
+    /// The location as the daemon has it, for the view a show is about to
+    /// open: its marks come along instead of being asked for.
+    show_seed: Option<LocationState>,
     /// Where to return when a previewing list is closed with Esc.
     origin: Option<Origin>,
     /// Recently chosen panel entries per list, newest first.
@@ -781,6 +825,7 @@ impl App {
             compose_origin: None,
             confirm: None,
             pending_show: None,
+            show_seed: None,
             origin: None,
             recent: HashMap::new(),
             message: None,
@@ -816,9 +861,7 @@ impl App {
         self.next_id += 1;
         let loc = Location {
             id,
-            key: target.repo.then(|| LocationKey::Repo {
-                dir: target.dir.clone(),
-            }),
+            key: None,
             dir: target.dir.clone(),
             base: target.base.clone(),
             repo: target.repo,
@@ -857,7 +900,41 @@ impl App {
         self.deactivate();
         self.locations.insert(0, loc);
         self.activate();
-        self.share(0);
+    }
+
+    /// A location's key follows what it shows: when the view changed, the
+    /// old location is closed here and the new one opened, with the marks
+    /// the show brought along or the ones the daemon sends back. Keyed for
+    /// the first time, it keeps the marks made before, which `share`
+    /// replays.
+    fn rekey(&mut self, i: usize) {
+        let seed = self.show_seed.take();
+        let (target, tx) = (self.target(), self.tx.clone());
+        let Some(loc) = self.locations.get_mut(i) else {
+            return;
+        };
+        let key = loc.key_now();
+        if key == loc.key {
+            return;
+        }
+        let old = loc.key.take();
+        loc.key = key.clone();
+        let seeded = seed.filter(|s| Some(&s.key) == key.as_ref());
+        if old.is_some() || seeded.is_some() {
+            loc.marks = seeded.as_ref().map(|s| s.marks.clone()).unwrap_or_default();
+            loc.synced = seeded.is_some();
+            loc.syncing = false;
+            loc.published = None;
+            loc.jumped_to = None;
+            loc.pending_jump.clear();
+            let marks = loc.drawn(&target, &tx);
+            loc.view.set_marks(marks);
+        }
+        if let Some(old) = old {
+            self.link.send_close(old);
+        }
+        self.sync_link();
+        self.share(i);
     }
 
     /// Tell the daemon this viewer has location `i` open, so it hands
@@ -1305,13 +1382,6 @@ impl App {
                 loc.repo = true;
                 loc.error = None;
                 loc.desc_dirty = true;
-                if first {
-                    loc.key = loc
-                        .pr
-                        .as_ref()
-                        .and_then(|p| p.info.as_ref())
-                        .and_then(|i| i.repo().map(|r| LocationKey::pr(&r, i.number)));
-                }
                 // A fetch by hand ("fetching #N…") ends in a report: the note,
                 // or what the reload that follows finds.
                 if note.is_some() {
@@ -1320,15 +1390,15 @@ impl App {
                     self.message = None;
                     loc.manual = true;
                 }
+                if first {
+                    self.rekey(idx);
+                }
                 if idx == 0 {
                     if first {
                         self.activate();
                     } else {
                         self.request();
                     }
-                }
-                if first {
-                    self.share(idx);
                 }
             }
             Progress::Failed(e) => {
@@ -1625,6 +1695,7 @@ impl App {
 
     /// Ask the loader for the current location's view.
     fn request(&mut self) {
+        self.rekey(0);
         let Some(loc) = self.locations.first_mut() else {
             return;
         };
@@ -1715,10 +1786,8 @@ impl App {
             loc.published = Some(moved.clone());
             self.link.send_op(key, Op::Anchored { marks: moved });
         }
-        // A file shows whole or as excerpts around its line and marks,
-        // as asked; unasked, one file shows whole and several as excerpts.
-        // Marks get a diff's context around them.
-        let several = spec.files.len() > 1;
+        // A file shows whole, or the region asked for, or as excerpts
+        // around its marks, which get a diff's context around them.
         let context = self.opts.context;
         let marks = &loc.marks.marks;
         let files = code
@@ -1727,10 +1796,10 @@ impl App {
             .map(|(path, data)| {
                 let asked = spec.files.iter().find(|f| f.path == path);
                 let mut windows = Vec::new();
-                if asked.and_then(|f| f.excerpts).unwrap_or(several) {
-                    if let Some(l) = asked.and_then(|f| f.line) {
-                        windows.push((l.saturating_sub(EXCERPT).max(1), l + EXCERPT));
-                    }
+                if let Some(region) = asked.and_then(|f| f.lines) {
+                    windows.push(region);
+                }
+                if asked.is_some_and(|f| f.excerpts) {
                     for m in marks.iter().filter(|m| m.path == path) {
                         windows.push((m.start.saturating_sub(context).max(1), m.end + context));
                     }
@@ -1744,10 +1813,7 @@ impl App {
         if current && let Some(text) = gone_message(gone) {
             self.message = Some(text);
         }
-        loc.view.target = spec
-            .files
-            .iter()
-            .find_map(|f| f.line.map(|l| (f.path.clone(), l)));
+        loc.view.target = None;
         narrow_view(&mut loc.view, &loc.focus);
         let place = std::mem::take(&mut loc.place_pending);
         match anchor.or(pending) {
@@ -1928,22 +1994,11 @@ impl App {
                 }
             }
             Msg::Loaded { loc, seq, result } => self.apply_loaded(loc, seq, *result),
-            Msg::Show(target, reply) => {
-                let ack = if self.held(&target, None) {
-                    self.hold(target, None)
+            Msg::Show(show, reply) => {
+                let ack = if self.held(&show) {
+                    self.hold(*show)
                 } else {
-                    self.open(target);
-                    self.ack(Vec::new())
-                };
-                if let Some(id) = reply {
-                    self.link.reply(id, serde_json::json!(ack));
-                }
-            }
-            Msg::View(target, view, reply) => {
-                let ack = if self.held(&target, Some(&view)) {
-                    self.hold(target, Some(*view))
-                } else {
-                    self.show_view(target, *view)
+                    self.show_view(*show)
                 };
                 if let Some(id) = reply {
                     self.link.reply(id, serde_json::json!(ack));
@@ -2365,37 +2420,22 @@ impl App {
         self.request();
     }
 
-    /// An agent's view: update the location for that checkout in place, or
-    /// open one, remembering what was on screen so Esc can go back to it.
-    pub fn show_view(
-        &mut self,
-        target: Target,
-        view: crate::proto::ViewSpec,
-    ) -> crate::proto::ShowAck {
+    /// An agent's show: the location for that view in place, or opened,
+    /// remembering what was on screen so Esc can go back to it; then its
+    /// new marks, lettered in the order given.
+    pub fn show_view(&mut self, show: ShowEvent) -> ShowAck {
         // Whatever the last key said is old news once the agent shows something.
         self.message = None;
-        let mut fresh: Vec<crate::proto::MarkSpec> = view
+        let fresh: Vec<MarkSpec> = show
+            .view
             .marks
             .iter()
             .take(crate::proto::MAX_MARKS)
             .cloned()
             .collect();
-        // Lettered by where they sit: by file as the call lists them, then
-        // by line.
-        let order = |path: &str| {
-            view.code
-                .as_ref()
-                .and_then(|c| c.files.iter().position(|f| f.path == path))
-                .unwrap_or(usize::MAX)
-        };
-        fresh.sort_by_key(|h| (order(&h.path), h.path.clone(), h.start, h.end));
-        let placed = !fresh.is_empty()
-            || view
-                .code
-                .as_ref()
-                .is_some_and(|c| c.files.iter().any(|f| f.line.is_some()));
+        let placed = !fresh.is_empty();
         let before = self.cur().map(|l| l.id);
-        self.show_view_inner(target, view);
+        self.show_view_inner(&show);
         // An update while the user is reviewing here leaves their cursor
         // alone and says what came.
         let reviewing =
@@ -2424,33 +2464,25 @@ impl App {
         self.ack(added)
     }
 
-    /// What to tell an agent about the location on screen after its call.
-    fn ack(&self, marks: Vec<crate::proto::MarkInfo>) -> crate::proto::ShowAck {
-        let Some(loc) = self.cur() else {
-            return crate::proto::ShowAck {
-                applied: true,
-                ..Default::default()
-            };
-        };
-        crate::proto::ShowAck {
-            location: loc.agent_name(),
-            dir: loc.dir.clone(),
+    /// What to tell an agent after its show was applied.
+    fn ack(&self, marks: Vec<crate::proto::MarkInfo>) -> ShowAck {
+        ShowAck {
             marks,
-            mine: loc.marks.mine(),
-            unread: loc.unread(),
             applied: true,
         }
     }
 
-    fn show_view_inner(&mut self, target: Target, view: crate::proto::ViewSpec) {
+    fn show_view_inner(&mut self, show: &ShowEvent) {
         let before = self.cur().map(|l| l.id);
-        let focus = match view.files.as_slice() {
+        let paths: Vec<String> = show.view.files.iter().map(|f| f.path.clone()).collect();
+        let focus = match paths.as_slice() {
             [] => Focus::All,
             [one] => Focus::File(one.clone()),
             many => Focus::Files(many.to_vec()),
         };
-        if let Some(spec) = view.range.as_deref().and_then(crate::pr::parse) {
-            self.open_pr_from(spec, Some(target.dir.clone()));
+        self.show_seed = Some(show.state.clone());
+        if let Some(spec) = &show.pr {
+            self.open_pr_from(spec.clone(), None);
             if let Some(loc) = self.cur_mut() {
                 loc.focus = focus;
                 if loc.agent_return.is_none() && Some(loc.id) != before {
@@ -2460,11 +2492,7 @@ impl App {
             self.settle_view(None);
             return;
         }
-        let dir = if target.repo {
-            checkout_root(&target.dir)
-        } else {
-            target.dir.clone()
-        };
+        let dir = show.state.dir.clone();
         let here = self.cur().is_some_and(|l| l.dir == dir);
         if here {
             if let Some(loc) = self.cur_mut()
@@ -2480,7 +2508,11 @@ impl App {
                 })));
             }
         } else {
-            self.open(Target { dir, ..target });
+            self.open(Target {
+                dir,
+                base: None,
+                repo: true,
+            });
             if let Some(loc) = self.cur_mut()
                 && loc.agent_return.is_none()
                 && Some(loc.id) != before
@@ -2488,43 +2520,74 @@ impl App {
                 loc.agent_return = before.map(AgentReturn::Switch);
             }
         }
-        if let Some(code) = view.code {
-            // Files as they are; the location's diff stays as it was.
-            if let Some(loc) = self.cur_mut() {
-                loc.code = Some(code);
-                loc.focus = Focus::All;
-                loc.error = None;
+        let view = show.state.key.view().cloned().unwrap_or(View::Files);
+        let parsed = match (view.git_spec(), self.cur().filter(|l| l.repo)) {
+            (Some(spec), Some(loc)) => {
+                Some(git::parse_spec(&loc.dir, &spec).map_err(|e| e.to_string()))
             }
-            self.settle_view(None);
-            return;
-        }
-        let parsed = match &view.range {
-            Some(r) => self
-                .cur()
-                .filter(|l| l.repo)
-                .map(|l| git::parse_spec(&l.dir, r).map_err(|e| e.to_string())),
-            None => None,
+            _ => None,
         };
         let Some(loc) = self.cur_mut() else { return };
-        loc.focus = focus;
         loc.error = None;
-        loc.code = None;
-        match parsed {
-            Some(Ok(git::Spec::Range(range, label))) => {
-                loc.range = range;
-                loc.range_label = Some(label);
+        match view {
+            View::Files | View::Rev { .. } => {
+                // Files as they are: whole, in part, or around their marks.
+                let rev = match &view {
+                    View::Rev { rev } => Some(rev.clone()),
+                    _ => None,
+                };
+                let files: Vec<CodeFile> = if show.view.files.is_empty() {
+                    let mut paths: Vec<String> = Vec::new();
+                    for m in &show.view.marks {
+                        if !paths.contains(&m.path) {
+                            paths.push(m.path.clone());
+                        }
+                    }
+                    paths
+                        .into_iter()
+                        .map(|path| CodeFile {
+                            path,
+                            lines: None,
+                            excerpts: true,
+                        })
+                        .collect()
+                } else {
+                    show.view
+                        .files
+                        .iter()
+                        .map(|f| CodeFile {
+                            path: f.path.clone(),
+                            lines: f.lines,
+                            excerpts: false,
+                        })
+                        .collect()
+                };
+                loc.code = Some(CodeSpec { rev, files });
+                loc.focus = Focus::All;
             }
-            Some(Ok(git::Spec::Base(name))) => {
-                loc.base = Some(name);
-                loc.range = Range::Everything;
-                loc.range_label = None;
-            }
-            Some(Err(e)) => self.message = Some(e),
-            None => {
-                // No range: everything since the branch point.
+            View::Branch => {
+                loc.code = None;
+                loc.focus = focus;
                 loc.base = None;
                 loc.range = Range::Everything;
                 loc.range_label = None;
+            }
+            _ => {
+                loc.code = None;
+                loc.focus = focus;
+                match parsed {
+                    Some(Ok(git::Spec::Range(range, label))) => {
+                        loc.range = range;
+                        loc.range_label = Some(label);
+                    }
+                    Some(Ok(git::Spec::Base(name))) => {
+                        loc.base = Some(name);
+                        loc.range = Range::Everything;
+                        loc.range_label = None;
+                    }
+                    Some(Err(e)) => self.message = Some(e),
+                    None => {}
+                }
             }
         }
         self.settle_view(None);
@@ -3043,33 +3106,18 @@ impl App {
         self.marking.is_some() || self.composing.is_some() || self.confirm.is_some()
     }
 
-    /// Whether showing `target` would move away from the location on
-    /// screen, as `show_view_inner` would resolve it.
-    fn would_switch(&self, target: &Target, view: Option<&crate::proto::ViewSpec>) -> bool {
+    /// Whether a show would move away from the location on screen: another
+    /// checkout, another view of it, or a pull request.
+    fn would_switch(&self, show: &ShowEvent) -> bool {
         let Some(cur) = self.cur() else { return false };
-        if let Some(spec) = view
-            .and_then(|v| v.range.as_deref())
-            .and_then(crate::pr::parse)
-        {
-            return cur.pr.as_ref().is_none_or(|p| p.spec != spec);
-        }
-        let dir = if target.repo {
-            checkout_root(&target.dir)
-        } else {
-            target.dir.clone()
-        };
-        cur.dir != dir
+        cur.key.as_ref() != Some(&show.state.key)
     }
 
-    /// A request that would take the user away from a review they are in
-    /// the middle of waits: while they type, or hold comments no agent has
-    /// read.
     /// Whether a request has to wait: any while the user is typing or
     /// selecting, since it would take the rows under them away; one that
     /// would switch locations while they have words here no agent read.
-    fn held(&self, target: &Target, view: Option<&crate::proto::ViewSpec>) -> bool {
-        self.typing()
-            || self.would_switch(target, view) && self.cur().is_some_and(|l| l.unread() > 0)
+    fn held(&self, show: &ShowEvent) -> bool {
+        self.typing() || self.would_switch(show) && self.cur().is_some_and(|l| l.unread() > 0)
     }
 
     /// Let a waiting request through once nothing holds it any more.
@@ -3077,30 +3125,18 @@ impl App {
         let still = self
             .pending_show
             .as_ref()
-            .is_some_and(|p| self.held(&p.target, p.view.as_ref()));
+            .is_some_and(|p| self.held(&p.show));
         if self.pending_show.is_some() && !still {
             self.apply_pending();
         }
     }
 
-    fn hold(
-        &mut self,
-        target: Target,
-        view: Option<crate::proto::ViewSpec>,
-    ) -> crate::proto::ShowAck {
-        let words = describe_request(&target, view.as_ref());
+    fn hold(&mut self, show: ShowEvent) -> ShowAck {
+        let words = describe_request(&show);
         // Only the latest request waits.
-        self.pending_show = Some(PendingShow {
-            target: target.clone(),
-            view,
-            words,
-        });
-        crate::proto::ShowAck {
-            location: String::new(),
-            dir: target.dir,
+        self.pending_show = Some(PendingShow { show, words });
+        ShowAck {
             marks: Vec::new(),
-            mine: Vec::new(),
-            unread: self.cur().map_or(0, Location::unread),
             applied: false,
         }
     }
@@ -3110,12 +3146,7 @@ impl App {
         let Some(p) = self.pending_show.take() else {
             return;
         };
-        match p.view {
-            Some(view) => {
-                self.show_view(p.target, view);
-            }
-            None => self.open(p.target),
-        }
+        self.show_view(p.show);
         self.message = Some(format!("switched to {}, as the agent asked", p.words));
     }
 
@@ -3952,25 +3983,22 @@ fn focus_lost(focus: &Focus) -> String {
     }
 }
 
-/// An agent's request in a few words: the checkout, and the files, range
-/// or PR it asks for.
-fn describe_request(target: &Target, view: Option<&crate::proto::ViewSpec>) -> String {
-    let name = dir_name(&target.dir);
-    let Some(view) = view else {
-        return name;
+/// An agent's request in a few words: the location, and the files it
+/// asks for.
+fn describe_request(show: &ShowEvent) -> String {
+    let name = match &show.pr {
+        Some(p) => format!("#{}", p.number),
+        None => format!(
+            "{}{}",
+            dir_name(&show.state.dir),
+            show.state.key.view().map(View::suffix).unwrap_or_default()
+        ),
     };
-    if let Some(code) = &view.code {
-        return match code.files.as_slice() {
-            [one] => format!("{name}: {}", one.path),
-            many => format!("{name}: {} files", many.len()),
-        };
-    }
-    match (&view.range, view.files.as_slice()) {
-        (Some(r), _) if crate::pr::parse(r).is_some() => r.clone(),
-        (Some(r), _) => format!("{name}: {r}"),
-        (None, []) => format!("{name}: the diff"),
-        (None, [one]) => format!("{name}: {one}"),
-        (None, many) => format!("{name}: {} files", many.len()),
+    match show.view.files.as_slice() {
+        [] if show.view.marks.is_empty() => name,
+        [] => format!("{name}: the marked files"),
+        [one] => format!("{name}: {}", one.path),
+        many => format!("{name}: {} files", many.len()),
     }
 }
 

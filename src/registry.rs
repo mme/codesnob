@@ -1,28 +1,29 @@
-//! The locations that agents and viewers share: one per checkout and one
-//! per pull request, each with its marks. The daemon keeps the registry;
+//! The locations that agents and viewers share: a view of a checkout, or a
+//! pull request, each with its own marks. The daemon keeps the registry;
 //! viewers hold copies of the locations they have open and show them.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::location::{Named, View};
 use crate::marks::Marks;
 
 /// What a location is, and how it is told from every other.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LocationKey {
-    /// A checkout, by its root.
-    Repo { dir: PathBuf },
+    /// A view of a checkout, by its root.
+    Repo { dir: PathBuf, view: View },
     /// A pull request, by its repository's `owner/name` and number.
     Pr { repo: String, number: u64 },
 }
 
 impl LocationKey {
-    /// How agents name it: the checkout's path, or `owner/repo#142`.
+    /// How agents name it: `/dir`, `/dir#view`, or `owner/repo#142`.
     pub fn name(&self) -> String {
         match self {
-            LocationKey::Repo { dir } => dir.display().to_string(),
+            LocationKey::Repo { dir, view } => format!("{}{}", dir.display(), view.suffix()),
             LocationKey::Pr { repo, number } => format!("{repo}#{number}"),
         }
     }
@@ -33,27 +34,45 @@ impl LocationKey {
             number,
         }
     }
-}
 
-/// How an agent names a location: a directory in the checkout, or a pull
-/// request. Neither means the one on screen.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LocationRef {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pr: Option<String>,
+    /// The checkout's root, for a view of one.
+    pub fn dir(&self) -> Option<&Path> {
+        match self {
+            LocationKey::Repo { dir, .. } => Some(dir),
+            LocationKey::Pr { .. } => None,
+        }
+    }
+
+    pub fn view(&self) -> Option<&View> {
+        match self {
+            LocationKey::Repo { view, .. } => Some(view),
+            LocationKey::Pr { .. } => None,
+        }
+    }
 }
 
 /// A location as the daemon keeps it and viewers copy it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocationState {
     pub key: LocationKey,
-    /// The checkout shown: the repository's, or the PR's own.
+    /// The checkout shown: the repository's, or the PR's own; empty for a
+    /// PR nobody has fetched yet.
     pub dir: PathBuf,
     /// "#142 Fix the parser" for a pull request, else the directory's name.
     pub name: String,
     pub marks: Marks,
+}
+
+impl LocationState {
+    /// A location nobody has shown yet, as the daemon first records it.
+    pub fn fresh(key: LocationKey, dir: PathBuf, name: String) -> Self {
+        Self {
+            key,
+            dir,
+            name,
+            marks: Marks::default(),
+        }
+    }
 }
 
 /// The root of the checkout `dir` is in, so every way of naming a
@@ -64,6 +83,45 @@ pub fn checkout_root(dir: &Path) -> PathBuf {
         .and_then(|r| r.workdir().map(|w| w.to_path_buf()))
         .and_then(|w| std::fs::canonicalize(w).ok())
         .unwrap_or_else(|| dir.to_path_buf())
+}
+
+/// What a name an agent wrote stands for: its key, the checkout (empty for
+/// a PR not yet fetched), and its short name.
+pub fn resolve(named: &Named) -> Result<(LocationKey, PathBuf, String), String> {
+    match named {
+        Named::Repo { dir, view } => {
+            if !dir.is_dir() {
+                return Err(format!("{} is not a directory", dir.display()));
+            }
+            if gix::discover(dir).is_err() {
+                return Err(format!("{} is not inside a git repository", dir.display()));
+            }
+            let root = checkout_root(dir);
+            let name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.display().to_string());
+            Ok((
+                LocationKey::Repo {
+                    dir: root.clone(),
+                    view: view.clone(),
+                },
+                root,
+                name,
+            ))
+        }
+        Named::Pr(spec) => {
+            let repo = spec
+                .repo
+                .as_ref()
+                .ok_or_else(|| format!("#{} names no repository", spec.number))?;
+            Ok((
+                LocationKey::pr(repo, spec.number),
+                PathBuf::new(),
+                format!("#{}", spec.number),
+            ))
+        }
+    }
 }
 
 /// Every location anyone has open, or has marks on.
@@ -81,14 +139,29 @@ impl Registry {
         self.locations.iter_mut().find(|l| l.key == *key)
     }
 
+    /// The location for `key`, recorded now if it was not yet.
+    pub fn ensure(&mut self, key: LocationKey, dir: PathBuf, name: String) -> &mut LocationState {
+        let pos = match self.locations.iter().position(|l| l.key == key) {
+            Some(i) => i,
+            None => {
+                self.locations.push(LocationState::fresh(key, dir, name));
+                self.locations.len() - 1
+            }
+        };
+        &mut self.locations[pos]
+    }
+
     /// A viewer opened `state`: it is adopted when the location is new
     /// here. The location as the registry has it, and whether it was new.
     pub fn adopt(&mut self, state: LocationState) -> (&LocationState, bool) {
         let pos = self.locations.iter().position(|l| l.key == state.key);
         match pos {
             Some(i) => {
-                // Names can change: a PR's title, a renamed directory.
-                self.locations[i].dir = state.dir;
+                // Names can change: a PR's title, a renamed directory; and
+                // a PR's checkout is known once a viewer fetched it.
+                if !state.dir.as_os_str().is_empty() {
+                    self.locations[i].dir = state.dir;
+                }
                 self.locations[i].name = state.name;
                 (&self.locations[i], false)
             }
@@ -97,67 +170,6 @@ impl Registry {
                 (self.locations.last().expect("just pushed"), true)
             }
         }
-    }
-
-    /// The location an agent names, else the one on screen, else the one
-    /// for the agent's own directory.
-    pub fn resolve(
-        &self,
-        r: &LocationRef,
-        on_screen: Option<&LocationKey>,
-        cwd: Option<&Path>,
-    ) -> Result<LocationKey, String> {
-        if let Some(pr) = &r.pr {
-            if r.repo.is_some() {
-                return Err("name the location by repo or by pr, not both".to_string());
-            }
-            let spec = crate::pr::parse(pr).ok_or_else(|| {
-                format!("{pr} is not a pull request; they look like owner/repo#142")
-            })?;
-            let want = spec.repo.as_ref().map(|r| r.slug().to_ascii_lowercase());
-            let found: Vec<&LocationKey> = self
-                .locations
-                .iter()
-                .filter_map(|l| match &l.key {
-                    LocationKey::Pr { repo, number }
-                        if *number == spec.number && want.as_ref().is_none_or(|w| w == repo) =>
-                    {
-                        Some(&l.key)
-                    }
-                    _ => None,
-                })
-                .collect();
-            return match found.as_slice() {
-                [one] => Ok((*one).clone()),
-                [] => Err(format!("no pull request {pr} is open; show it first")),
-                many => Err(format!(
-                    "several pull requests are numbered {}; name one: {}",
-                    spec.number,
-                    many.iter().map(|k| k.name()).collect::<Vec<_>>().join(", ")
-                )),
-            };
-        }
-        if let Some(dir) = &r.repo {
-            let root = checkout_root(dir);
-            return self
-                .locations
-                .iter()
-                .find(|l| l.dir == root)
-                .map(|l| l.key.clone())
-                .ok_or_else(|| format!("nothing is open for {}; show it first", root.display()));
-        }
-        if let Some(key) = on_screen
-            && self.get(key).is_some()
-        {
-            return Ok(key.clone());
-        }
-        if let Some(cwd) = cwd {
-            let root = checkout_root(cwd);
-            if let Some(l) = self.locations.iter().find(|l| l.dir == root) {
-                return Ok(l.key.clone());
-            }
-        }
-        Err("no location is on screen; name one with repo or pr".to_string())
     }
 
     /// Locations nobody has open go once they carry no marks; the ones
@@ -179,34 +191,28 @@ mod tests {
     use super::*;
 
     fn repo(dir: &str) -> LocationState {
-        LocationState {
-            key: LocationKey::Repo {
+        LocationState::fresh(
+            LocationKey::Repo {
                 dir: PathBuf::from(dir),
+                view: View::Files,
             },
-            dir: PathBuf::from(dir),
-            name: dir.rsplit('/').next().unwrap().to_string(),
-            marks: Marks::default(),
-        }
-    }
-
-    fn pr(slug: &str, number: u64, dir: &str) -> LocationState {
-        LocationState {
-            key: LocationKey::Pr {
-                repo: slug.to_string(),
-                number,
-            },
-            dir: PathBuf::from(dir),
-            name: format!("#{number} Fix it"),
-            marks: Marks::default(),
-        }
+            PathBuf::from(dir),
+            dir.rsplit('/').next().unwrap().to_string(),
+        )
     }
 
     #[test]
     fn locations_are_named_by_what_they_are() {
         let k = LocationKey::Repo {
             dir: PathBuf::from("/work/repo"),
+            view: View::Files,
         };
         assert_eq!(k.name(), "/work/repo");
+        let k = LocationKey::Repo {
+            dir: PathBuf::from("/work/repo"),
+            view: View::parse("main...HEAD"),
+        };
+        assert_eq!(k.name(), "/work/repo#main...HEAD");
         let k = LocationKey::Pr {
             repo: "acme/widget".to_string(),
             number: 7,
@@ -215,100 +221,28 @@ mod tests {
     }
 
     #[test]
-    fn a_reference_finds_a_location_by_pr_or_directory() {
-        let mut r = Registry::default();
-        // Scratch directories that are not repositories resolve to themselves.
-        let a = crate::testutil::fresh_dir("registry-a");
-        let b = crate::testutil::fresh_dir("registry-b");
-        r.adopt(repo(a.to_str().unwrap()));
-        r.adopt(pr("acme/widget", 7, b.to_str().unwrap()));
-        r.adopt(pr("other/widget", 7, "/c/pr/other/7"));
-        let by = |rf: LocationRef| r.resolve(&rf, None, None);
-        assert_eq!(
-            by(LocationRef {
-                repo: Some(a.clone()),
-                pr: None
-            })
-            .unwrap(),
-            LocationKey::Repo { dir: a.clone() }
-        );
-        assert_eq!(
-            by(LocationRef {
-                repo: Some(b.clone()),
-                pr: None
-            })
-            .unwrap()
-            .name(),
-            "acme/widget#7",
-            "a PR's checkout names the PR"
-        );
-        assert_eq!(
-            by(LocationRef {
-                repo: None,
-                pr: Some("Acme/Widget#7".to_string())
-            })
-            .unwrap()
-            .name(),
-            "acme/widget#7"
-        );
-        let err = by(LocationRef {
-            repo: None,
-            pr: Some("#7".to_string()),
-        })
-        .unwrap_err();
-        assert!(
-            err.starts_with(
-                "several pull requests are numbered 7; name one: acme/widget#7, other/widget#7"
-            ),
-            "{err}"
-        );
-        let err = by(LocationRef {
-            repo: None,
-            pr: Some("#9".to_string()),
-        })
-        .unwrap_err();
-        assert_eq!(err, "no pull request #9 is open; show it first");
-        let err = by(LocationRef {
-            repo: Some(PathBuf::from("/nowhere")),
-            pr: None,
-        })
-        .unwrap_err();
-        assert_eq!(err, "nothing is open for /nowhere; show it first");
-        let _ = std::fs::remove_dir_all(a);
-        let _ = std::fs::remove_dir_all(b);
-    }
-
-    #[test]
-    fn without_a_name_the_one_on_screen_comes_first_then_the_callers_own() {
-        let mut r = Registry::default();
-        let a = crate::testutil::fresh_dir("registry-screen-a");
-        let b = crate::testutil::fresh_dir("registry-screen-b");
-        r.adopt(repo(a.to_str().unwrap()));
-        r.adopt(repo(b.to_str().unwrap()));
-        let none = LocationRef::default();
-        let on_screen = LocationKey::Repo { dir: b.clone() };
-        assert_eq!(
-            r.resolve(&none, Some(&on_screen), Some(&a)).unwrap(),
-            on_screen
-        );
-        assert_eq!(
-            r.resolve(&none, None, Some(&a)).unwrap(),
-            LocationKey::Repo { dir: a.clone() }
-        );
-        let gone = LocationKey::Repo {
-            dir: PathBuf::from("/gone"),
-        };
-        assert_eq!(
-            r.resolve(&none, Some(&gone), Some(&a)).unwrap().name(),
-            a.display().to_string(),
-            "a location no longer open is skipped"
-        );
-        assert_eq!(
-            r.resolve(&none, None, None).unwrap_err(),
-            "no location is on screen; name one with repo or pr"
-        );
-        let _ = std::fs::remove_dir_all(a);
-        let _ = std::fs::remove_dir_all(b);
+    fn a_name_resolves_to_the_checkout_root_or_refuses() {
+        let dir = crate::testutil::branch_with_history("registry-resolve");
+        let sub = dir.join("src");
+        let named = crate::location::parse(&format!("{}#branch", sub.display())).unwrap();
+        let (key, root, name) = resolve(&named).unwrap();
+        assert_eq!(root, dir);
+        assert_eq!(name, dir.file_name().unwrap().to_string_lossy());
+        assert_eq!(key.name(), format!("{}#branch", dir.display()));
+        let scratch = crate::testutil::fresh_dir("registry-plain");
+        let named = crate::location::parse(scratch.to_str().unwrap()).unwrap();
+        let err = resolve(&named).unwrap_err();
+        assert!(err.contains("not inside a git repository"), "{err}");
+        let named = crate::location::parse("/nowhere/at/all").unwrap();
+        let err = resolve(&named).unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+        let named = crate::location::parse("Acme/Widget#7").unwrap();
+        let (key, root, name) = resolve(&named).unwrap();
+        assert_eq!(key.name(), "acme/widget#7");
+        assert!(root.as_os_str().is_empty());
+        assert_eq!(name, "#7");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(scratch);
     }
 
     #[test]
@@ -321,6 +255,7 @@ mod tests {
         assert!(!new);
         r.get_mut(&LocationKey::Repo {
             dir: PathBuf::from("/b"),
+            view: View::Files,
         })
         .unwrap()
         .marks
@@ -338,5 +273,24 @@ mod tests {
         assert_eq!(gone.len(), 1);
         assert_eq!(r.locations.len(), 1);
         assert_eq!(r.locations[0].name, "b");
+    }
+
+    #[test]
+    fn ensure_records_a_location_once_and_adopt_fills_in_a_prs_checkout() {
+        let mut r = Registry::default();
+        let key = LocationKey::Pr {
+            repo: "acme/widget".to_string(),
+            number: 7,
+        };
+        r.ensure(key.clone(), PathBuf::new(), "#7".to_string());
+        r.ensure(key.clone(), PathBuf::new(), "#7".to_string());
+        assert_eq!(r.locations.len(), 1);
+        let mut fetched = LocationState::fresh(key.clone(), "/cache/pr/7".into(), "#7 Fix".into());
+        fetched.marks.made = 9;
+        let (got, new) = r.adopt(fetched);
+        assert!(!new);
+        assert_eq!(got.dir, PathBuf::from("/cache/pr/7"));
+        assert_eq!(got.name, "#7 Fix");
+        assert_eq!(got.marks.made, 0, "the registry's marks count");
     }
 }

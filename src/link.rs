@@ -6,14 +6,13 @@
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::proto::{
-    self, AgentQuery, Event, LocationKey, LocationRef, LocationState, Method, OpenLocation,
-    Request, ServerFrame, Target, ViewerEntry, to_line,
+    self, AgentQuery, Event, LocationKey, LocationState, Method, OpenLocation, Request,
+    ServerFrame, Target, ViewerEntry, to_line,
 };
 use crate::watch::Msg;
 use crate::wm;
@@ -196,15 +195,9 @@ fn session(tx: &Sender<Msg>, link: &Link) -> Result<(), String> {
             return Err("daemon closed".to_string());
         }
         let msg = match ServerFrame::parse(&line) {
-            Ok(ServerFrame::Event(Event::Show {
-                viewer,
-                target,
-                view,
-                id,
-            })) if viewer == my_id => match view {
-                Some(view) => Msg::View(target, Box::new(view), id),
-                None => Msg::Show(target, id),
-            },
+            Ok(ServerFrame::Event(Event::Show { viewer, show, id })) if viewer == my_id => {
+                Msg::Show(Box::new(show), id)
+            }
             Ok(ServerFrame::Event(Event::Location { state, note })) => Msg::Location {
                 state: Box::new(state),
                 note,
@@ -215,49 +208,34 @@ fn session(tx: &Sender<Msg>, link: &Link) -> Result<(), String> {
     }
 }
 
-/// Ask the daemon to display `dir`, preferring a viewer on our workspace.
+/// Ask the daemon to show a location, preferring a viewer on our
+/// workspace: the files, and what to do to the marks.
 pub fn request_show(
     client: &mut proto::Client,
-    dir: PathBuf,
-    view: Option<proto::ViewSpec>,
+    location: String,
+    files: Vec<proto::FileSpec>,
+    marks: Vec<proto::MarkEntry>,
+    replace: bool,
+    user_asked: bool,
 ) -> Result<proto::ShowResult, String> {
     let workspace = wm::own_workspace();
     let v = client.call(Method::Show {
-        dir,
-        base: None,
+        location,
         workspace,
-        view,
+        files,
+        marks,
+        replace,
+        user_asked,
     })?;
     serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
-/// Ask the daemon about marks; without a location named, it answers for
-/// the one on screen in the viewer on our workspace.
+/// Ask the daemon about marks.
 pub fn request_query(
     client: &mut proto::Client,
     query: AgentQuery,
 ) -> Result<serde_json::Value, String> {
-    let workspace = wm::own_workspace();
-    let cwd = std::env::current_dir().ok();
-    client.call(Method::Query {
-        workspace,
-        cwd,
-        query,
-    })
-}
-
-pub fn describe(r: &proto::ShowResult) -> String {
-    let Some(ws) = r.workspace.as_deref() else {
-        return format!("shown in viewer {}", r.viewer);
-    };
-    match r.picked_by.as_str() {
-        "same" => format!("shown in viewer {} on your workspace {ws}", r.viewer),
-        "nearest" => format!(
-            "shown in viewer {} on workspace {ws}, the nearest to yours",
-            r.viewer
-        ),
-        _ => format!("shown in viewer {} (workspace {ws})", r.viewer),
-    }
+    client.call(Method::Query { query })
 }
 
 fn one_shot() -> Result<proto::Client, String> {
@@ -272,25 +250,22 @@ pub fn connect() -> Result<proto::Client, String> {
     one_shot()
 }
 
-/// `codesnob show PATH [--range R]`: display in the best viewer and report.
-pub fn show(dir: PathBuf, range: Option<String>) -> Result<(), String> {
+/// `codesnob show LOCATION [FILES]`: display in the best viewer and report.
+pub fn show(location: String, files: Vec<String>) -> Result<(), String> {
     let mut client = one_shot()?;
-    let view = range.map(|r| proto::ViewSpec {
-        range: Some(r),
-        ..Default::default()
-    });
-    let r = request_show(&mut client, dir.clone(), view)?;
-    if !r.repo {
-        eprintln!("codesnob: {} is not inside a git repository", dir.display());
-    }
-    println!("{}", describe(&r));
+    let files = files
+        .into_iter()
+        .map(|path| proto::FileSpec { path, lines: None })
+        .collect();
+    let r = request_show(&mut client, location, files, Vec::new(), false, false)?;
+    println!("{}", r.render());
     Ok(())
 }
 
 /// `codesnob review`: the marks on a location, as an agent sees them.
-pub fn review(location: Option<LocationRef>, json: bool) -> Result<(), String> {
+pub fn review(location: String, letters: Vec<String>, json: bool) -> Result<(), String> {
     let mut client = one_shot()?;
-    let v = request_query(&mut client, AgentQuery::Review { location })?;
+    let v = request_query(&mut client, AgentQuery::Review { location, letters })?;
     if json {
         println!(
             "{}",
@@ -303,61 +278,8 @@ pub fn review(location: Option<LocationRef>, json: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// `codesnob clear`: remove marks on a location.
-pub fn clear(
-    location: Option<LocationRef>,
-    which: String,
-    letters: Vec<String>,
-    user_asked: bool,
-) -> Result<(), String> {
-    let mut client = one_shot()?;
-    let v = request_query(
-        &mut client,
-        AgentQuery::ClearMarks {
-            location,
-            which,
-            letters,
-            user_asked,
-        },
-    )?;
-    let r: proto::ClearResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
-    println!("{}", r.render());
-    Ok(())
-}
-
-/// Every location, with its marks and unread comments.
-pub fn request_locations(client: &mut proto::Client) -> Result<String, String> {
-    let v = request_query(client, AgentQuery::Locations)?;
-    let r: proto::LocationsResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
-    Ok(r.render())
-}
-
-/// `codesnob locations`: what the viewer has open.
-pub fn locations(json: bool) -> Result<(), String> {
-    let mut client = one_shot()?;
-    if json {
-        let v = request_query(&mut client, AgentQuery::Locations)?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?
-        );
-        return Ok(());
-    }
-    println!("{}", request_locations(&mut client)?);
-    Ok(())
-}
-
-/// `codesnob mark`: a mark of the agent's with words on lines of a file.
-pub fn mark(query: AgentQuery) -> Result<(), String> {
-    let mut client = one_shot()?;
-    let v = request_query(&mut client, query)?;
-    let r: proto::MarkResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
-    println!("{}{}", r.render(), proto::mine_note(&r.location, &r.mine));
-    Ok(())
-}
-
 /// `codesnob reply`: answer in the thread under a mark.
-pub fn reply(location: Option<LocationRef>, letter: String, text: String) -> Result<(), String> {
+pub fn reply(location: String, letter: String, text: String) -> Result<(), String> {
     let mut client = one_shot()?;
     let v = request_query(
         &mut client,
@@ -368,15 +290,6 @@ pub fn reply(location: Option<LocationRef>, letter: String, text: String) -> Res
         },
     )?;
     let r: proto::ReplyResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
-    println!("{}", r.render());
-    Ok(())
-}
-
-/// `codesnob move`: put a mark on other lines.
-pub fn move_mark(query: AgentQuery) -> Result<(), String> {
-    let mut client = one_shot()?;
-    let v = request_query(&mut client, query)?;
-    let r: proto::MoveResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
     println!("{}", r.render());
     Ok(())
 }

@@ -4,6 +4,7 @@ mod git;
 mod highlight;
 mod link;
 mod loader;
+mod location;
 mod marks;
 mod mcp;
 mod pr;
@@ -62,104 +63,40 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Ask the running viewer(s) to display this directory's repository.
+    /// Ask the running viewer to show a location: an absolute directory,
+    /// optionally with #view (main, main...HEAD, branch, worktree, staged,
+    /// unstaged), or a pull request as owner/repo#142.
     Show {
-        path: PathBuf,
-        /// What to compare, in git syntax ("main...feature", "HEAD~3..HEAD",
-        /// a commit), "worktree", "staged", "unstaged", or a PR.
-        #[arg(long)]
-        range: Option<String>,
+        location: String,
+        /// Only these files, relative to the checkout root.
+        files: Vec<String>,
     },
-    /// Show the daemon's current target and the connected viewers.
+    /// Show the daemon's current target, the connected viewers and the
+    /// locations they have open.
     Status {
         /// Print the raw JSON reply.
         #[arg(long)]
         json: bool,
     },
-    /// List the locations open in the viewer, with their marks and unread
-    /// comments, and the other viewers running.
-    Locations {
-        /// Print the raw JSON reply.
-        #[arg(long)]
-        json: bool,
-    },
-    /// List the marks on a location in the viewer, the agent's and the
-    /// user's; the user's words count as read afterwards.
+    /// List the marks on a location, the agent's and the user's; the
+    /// user's words count as read afterwards.
     Review {
-        /// The location: a directory in its checkout; default: the one on screen.
-        #[arg(long)]
-        repo: Option<PathBuf>,
-        /// The location: a pull request, like owner/repo#142.
-        #[arg(long)]
-        pr: Option<String>,
+        /// The location, as for show.
+        location: String,
+        /// Only these marks, by letter.
+        letters: Vec<String>,
         /// Print the raw JSON reply.
         #[arg(long)]
         json: bool,
-    },
-    /// Remove marks from a location in the viewer.
-    Clear {
-        /// The location: a directory in its checkout; default: the one on screen.
-        #[arg(long)]
-        repo: Option<PathBuf>,
-        /// The location: a pull request, like owner/repo#142.
-        #[arg(long)]
-        pr: Option<String>,
-        /// Which marks: the agent's own (mine), the marks the user made or
-        /// wrote under (user), or every mark (all). Default: mine.
-        #[arg(long, value_parser = ["mine", "user", "all"])]
-        which: Option<String>,
-        /// Letters of the marks to remove instead, e.g. C D. A mark goes
-        /// with its whole thread.
-        letters: Vec<String>,
-        /// Allow removing the user's marks, threads and all. Only when the
-        /// user explicitly asked for them to be deleted.
-        #[arg(long)]
-        user_explicitly_asked_to_delete_comments: bool,
-    },
-    /// Mark lines of a file with words, as the agent, without changing
-    /// what the viewer shows.
-    Mark {
-        /// The file, relative to the current directory.
-        path: String,
-        /// The lines: 40-42, or 42.
-        lines: String,
-        /// The words on the mark.
-        text: String,
-        /// The location: a directory in its checkout; default: the one on screen.
-        #[arg(long)]
-        repo: Option<PathBuf>,
-        /// The location: a pull request, like owner/repo#142.
-        #[arg(long)]
-        pr: Option<String>,
     },
     /// Answer in the thread under a mark the user made or wrote under.
     Reply {
+        /// The location, as for show.
+        location: String,
         /// The mark's letter, e.g. C.
         letter: String,
         /// The reply.
         text: String,
-        /// The location: a directory in its checkout; default: the one on screen.
-        #[arg(long)]
-        repo: Option<PathBuf>,
-        /// The location: a pull request, like owner/repo#142.
-        #[arg(long)]
-        pr: Option<String>,
-    },
-    /// Move a mark to other lines, keeping its letter, text and thread.
-    Move {
-        /// The mark's letter, e.g. C.
-        letter: String,
-        /// Where it goes: 40-42, or 42.
-        lines: String,
-        /// The file it goes to (default: the one it is on).
-        #[arg(long)]
-        path: Option<String>,
-        /// The location: a directory in its checkout; default: the one on screen.
-        #[arg(long)]
-        repo: Option<PathBuf>,
-        /// The location: a pull request, like owner/repo#142.
-        #[arg(long)]
-        pr: Option<String>,
     },
     /// Run the daemon in the foreground (it normally starts on demand).
     Daemon,
@@ -167,17 +104,6 @@ enum Cmd {
     Mcp,
     /// Remove PR checkouts that no viewer has open.
     Prune,
-}
-
-/// The location `--repo` or `--pr` names, if either was given.
-fn location_ref(repo: Option<PathBuf>, pr: Option<String>) -> Option<proto::LocationRef> {
-    if repo.is_none() && pr.is_none() {
-        return None;
-    }
-    Some(proto::LocationRef {
-        repo: repo.map(|r| std::fs::canonicalize(&r).unwrap_or(r)),
-        pr,
-    })
 }
 
 fn canonical(path: &std::path::Path) -> Result<PathBuf> {
@@ -188,75 +114,23 @@ fn main() -> Result<()> {
     let args = Args::parse();
     match args.cmd {
         Some(Cmd::Daemon) => return daemon::run(),
-        Some(Cmd::Show { path, range }) => {
-            let dir = canonical(&path)?;
-            return link::show(dir, range).map_err(|e| anyhow::anyhow!(e));
+        Some(Cmd::Show { location, files }) => {
+            return link::show(location, files).map_err(|e| anyhow::anyhow!(e));
         }
         Some(Cmd::Status { json }) => return link::status(json).map_err(|e| anyhow::anyhow!(e)),
-        Some(Cmd::Locations { json }) => {
-            return link::locations(json).map_err(|e| anyhow::anyhow!(e));
-        }
-        Some(Cmd::Review { repo, pr, json }) => {
-            return link::review(location_ref(repo, pr), json).map_err(|e| anyhow::anyhow!(e));
-        }
-        Some(Cmd::Clear {
-            repo,
-            pr,
-            which,
+        Some(Cmd::Review {
+            location,
             letters,
-            user_explicitly_asked_to_delete_comments,
+            json,
         }) => {
-            let which = which.unwrap_or_else(|| "mine".to_string());
-            return link::clear(
-                location_ref(repo, pr),
-                which,
-                letters,
-                user_explicitly_asked_to_delete_comments,
-            )
-            .map_err(|e| anyhow::anyhow!(e));
+            return link::review(location, letters, json).map_err(|e| anyhow::anyhow!(e));
         }
         Some(Cmd::Reply {
+            location,
             letter,
             text,
-            repo,
-            pr,
         }) => {
-            return link::reply(location_ref(repo, pr), letter, text)
-                .map_err(|e| anyhow::anyhow!(e));
-        }
-        Some(Cmd::Mark {
-            path,
-            lines,
-            text,
-            repo,
-            pr,
-        }) => {
-            let args = serde_json::json!({
-                "marks": [{ "path": path, "lines": lines, "text": text }],
-                "repo": repo,
-                "pr": pr,
-            });
-            let cwd = std::env::current_dir()?;
-            let query = mcp::mark_args(&args, &cwd).map_err(|e| anyhow::anyhow!(e))?;
-            return link::mark(query).map_err(|e| anyhow::anyhow!(e));
-        }
-        Some(Cmd::Move {
-            letter,
-            lines,
-            path,
-            repo,
-            pr,
-        }) => {
-            let args = serde_json::json!({
-                "letter": letter,
-                "lines": lines,
-                "path": path,
-                "repo": repo,
-                "pr": pr,
-            });
-            let cwd = std::env::current_dir()?;
-            let query = mcp::move_args(&args, &cwd).map_err(|e| anyhow::anyhow!(e))?;
-            return link::move_mark(query).map_err(|e| anyhow::anyhow!(e));
+            return link::reply(location, letter, text).map_err(|e| anyhow::anyhow!(e));
         }
         Some(Cmd::Mcp) => return mcp::serve(),
         Some(Cmd::Prune) => {

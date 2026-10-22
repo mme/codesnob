@@ -13,8 +13,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::location::Named;
 use crate::proto::{
-    self, AgentQuery, Event, HelloResult, LocationInfo, LocationKey, LocationRef, Method, Response,
+    self, AgentQuery, Event, HelloResult, LocationInfo, LocationKey, Method, Report, Response,
     RpcError, ShowResult, StatusResult, Target, ViewerEntry, to_line,
 };
 use crate::registry::Registry;
@@ -68,29 +69,9 @@ impl State {
         }
     }
 
-    /// What `key` shows, in words: in the viewer `prefer` first, else in
-    /// any viewer that has it open.
-    fn showing(&self, key: &LocationKey, prefer: Option<&str>) -> Option<String> {
-        let in_viewer = |id: &str| {
-            self.viewers
-                .iter()
-                .find(|(_, v)| v.id == id)
-                .and_then(|(_, v)| v.open.iter().find(|o| o.key == *key))
-                .map(|o| o.showing.clone())
-        };
-        prefer.and_then(in_viewer).or_else(|| {
-            self.viewers
-                .iter()
-                .find_map(|(_, v)| v.open.iter().find(|o| o.key == *key))
-                .map(|o| o.showing.clone())
-        })
-    }
-
-    /// Every location, for an agent whose requests reach `picked`.
-    fn locations_info(&self, picked: Option<&ViewerEntry>) -> Vec<LocationInfo> {
-        let on_screen = picked.and_then(|v| v.location.as_ref());
-        let mut infos: Vec<LocationInfo> = self
-            .registry
+    /// Every location, for `codesnob status`.
+    fn locations_info(&self) -> Vec<LocationInfo> {
+        self.registry
             .locations
             .iter()
             .map(|l| {
@@ -107,83 +88,40 @@ impl State {
                     location: l.key.name(),
                     name: l.name.clone(),
                     dir: l.dir.clone(),
-                    showing: self
-                        .showing(&l.key, picked.map(|v| v.id.as_str()))
-                        .unwrap_or_default(),
-                    on_screen: on_screen == Some(&l.key),
                     viewers,
                     marks: l.marks.marks.len(),
                     by_user: l.marks.users_words(),
                     unread: l.marks.unread(),
                 }
             })
-            .collect();
-        infos.sort_by_key(|i| !i.on_screen);
-        infos
+            .collect()
     }
 
     /// Answer an agent's question about marks.
-    fn answer(
-        &mut self,
-        workspace: Option<&str>,
-        cwd: Option<&std::path::Path>,
-        query: AgentQuery,
-    ) -> Result<Value, String> {
-        let picked = pick_viewer(&self.viewers, workspace).map(|(v, _)| v.clone());
-        let on_screen = picked.as_ref().and_then(|v| v.location.clone());
-        let viewer_id = picked.as_ref().map(|v| v.id.clone());
-        let resolve = |st: &Self, location: Option<LocationRef>| {
-            st.registry
-                .resolve(&location.unwrap_or_default(), on_screen.as_ref(), cwd)
-        };
+    fn answer(&mut self, query: AgentQuery) -> Result<Value, String> {
         match query {
-            AgentQuery::Locations => Ok(json!(proto::LocationsResult {
-                locations: self.locations_info(picked.as_ref()),
-            })),
-            AgentQuery::Review { location } => {
-                let key = resolve(self, location)?;
-                let showing = self
-                    .showing(&key, viewer_id.as_deref())
-                    .unwrap_or_else(|| "not open in any viewer".to_string());
-                let loc = self.registry.get_mut(&key).expect("resolved");
-                let unread = loc.marks.unread();
+            AgentQuery::Review { location, letters } => {
+                let (key, ..) = locate(&location)?;
+                let name = key.name();
+                let Some(loc) = self.registry.get_mut(&key) else {
+                    if !letters.is_empty() {
+                        return Err(format!("no marks on {name}"));
+                    }
+                    return Ok(json!(proto::ReviewResult {
+                        marks: Vec::new(),
+                        new: 0,
+                        report: Report::of(&name, &Default::default()),
+                    }));
+                };
+                let new = loc.marks.unread();
+                let marks = loc.marks.read(&letters)?;
                 let result = proto::ReviewResult {
-                    location: key.name(),
-                    dir: loc.dir.clone(),
-                    showing,
-                    marks: loc.marks.read(),
-                    unread,
+                    marks,
+                    new,
+                    report: Report::of(&name, &loc.marks),
                 };
                 // Read, the comments no longer hold an agent's request back.
                 self.announce(&key, None);
-                Ok(json!(result))
-            }
-            AgentQuery::ClearMarks {
-                location,
-                which,
-                letters,
-                user_asked,
-            } => {
-                let key = resolve(self, location)?;
-                let loc = self.registry.get_mut(&key).expect("resolved");
-                let cleared = loc.marks.clear(&which, &letters, user_asked)?;
-                let result = proto::ClearResult {
-                    location: key.name(),
-                    cleared: cleared.clone(),
-                    remaining: loc.marks.marks.len(),
-                    unread: loc.marks.unread(),
-                };
-                let note = (!cleared.is_empty()).then(|| {
-                    format!(
-                        "agent cleared {}",
-                        cleared
-                            .iter()
-                            .map(|l| format!("[{l}]"))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    )
-                });
-                self.announce(&key, note);
                 Ok(json!(result))
             }
             AgentQuery::Reply {
@@ -191,56 +129,18 @@ impl State {
                 letter,
                 text,
             } => {
-                let key = resolve(self, location)?;
-                let loc = self.registry.get_mut(&key).expect("resolved");
+                let (key, ..) = locate(&location)?;
+                let name = key.name();
+                let loc = self
+                    .registry
+                    .get_mut(&key)
+                    .ok_or_else(|| format!("no marks on {name}"))?;
                 let letter = loc.marks.reply(&letter, &text)?;
                 let result = proto::ReplyResult {
-                    location: key.name(),
                     letter: letter.clone(),
-                    unread: loc.marks.unread(),
+                    report: Report::of(&name, &loc.marks),
                 };
                 self.announce(&key, Some(format!("agent replied under [{letter}]")));
-                Ok(json!(result))
-            }
-            AgentQuery::Mark { location, marks } => {
-                let key = resolve(self, location)?;
-                let loc = self.registry.get_mut(&key).expect("resolved");
-                let placed = loc.marks.mark(&marks)?;
-                let result = proto::MarkResult {
-                    location: key.name(),
-                    marks: placed,
-                    mine: loc.marks.mine(),
-                    unread: loc.marks.unread(),
-                };
-                let note = format!("agent marked {}", result.placed());
-                self.announce(&key, Some(note));
-                Ok(json!(result))
-            }
-            AgentQuery::MoveMark {
-                location,
-                letter,
-                path,
-                start,
-                end,
-            } => {
-                let key = resolve(self, location)?;
-                let loc = self.registry.get_mut(&key).expect("resolved");
-                let m = loc.marks.move_to(&letter, path, start, end)?;
-                let result = proto::MoveResult {
-                    location: key.name(),
-                    label: m.label.clone(),
-                    path: m.path.clone(),
-                    start,
-                    end,
-                    unread: loc.marks.unread(),
-                };
-                let note = format!(
-                    "agent moved [{}] to {} {}",
-                    result.label,
-                    result.path,
-                    result.lines_word()
-                );
-                self.announce(&key, Some(note));
                 Ok(json!(result))
             }
         }
@@ -276,6 +176,34 @@ impl State {
         }
         self.drop_unused();
     }
+}
+
+/// What a location an agent named is: its key, checkout and short name.
+fn locate(location: &str) -> Result<(LocationKey, std::path::PathBuf, String, Named), String> {
+    let named = crate::location::parse(location)?;
+    let (key, dir, name) = crate::registry::resolve(&named)?;
+    Ok((key, dir, name, named))
+}
+
+/// What a show puts on screen, in words.
+fn shown_words(key: &LocationKey, files: &[proto::FileSpec], adds: bool) -> String {
+    let what = match key {
+        LocationKey::Repo { view, .. } => view.words(),
+        LocationKey::Pr { number, .. } => format!("#{number}"),
+    };
+    let diff = key.view().is_none_or(|v| v.is_diff());
+    let which = if !files.is_empty() {
+        files
+            .iter()
+            .map(proto::FileSpec::words)
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else if adds && !diff {
+        "the marked lines, with a few around them".to_string()
+    } else {
+        "all files".to_string()
+    };
+    format!("{what} · {which}")
 }
 
 struct Shared {
@@ -554,88 +482,168 @@ fn handle(
             })
         }
         Method::Show {
-            dir,
-            base,
+            location,
             workspace,
-            view,
+            files,
+            marks,
+            replace,
+            user_asked,
         } => {
-            let repo = gix::discover(&dir).is_ok();
-            let target = Target { dir, base, repo };
-            let (mut result, rx) = {
-                let mut st = shared.state.lock().unwrap();
-                let Some((viewer, picked_by)) = pick_viewer(&st.viewers, workspace.as_deref())
-                else {
-                    return Err(no_viewer());
-                };
-                let result = ShowResult {
-                    repo,
-                    viewer: viewer.id.clone(),
-                    workspace: viewer.workspace.clone(),
-                    picked_by: picked_by.to_string(),
-                    ack: None,
-                };
-                st.target = Some(target.clone());
-                eprintln!(
-                    "show {} in {} (workspace {:?}, {picked_by}; caller on {:?})",
-                    target.dir.display(),
-                    result.viewer,
-                    result.workspace,
-                    workspace
-                );
-                let (id, rx) = st.expect_reply();
-                st.broadcast(Event::Show {
-                    viewer: result.viewer.clone(),
-                    target,
-                    view,
-                    id: Some(id.clone()),
-                });
-                (result, (id, rx))
+            let query_error = |message: String| RpcError {
+                code: "query_error".to_string(),
+                message,
             };
-            let (id, rx) = rx;
-            // An older viewer never answers; the result then says less.
-            result.ack = rx
-                .recv_timeout(REPLY_TIMEOUT)
-                .ok()
-                .and_then(|v| serde_json::from_value(v).ok());
-            let mut st = shared.state.lock().unwrap();
-            st.forget_reply(&id);
-            // The viewer lettered the marks from its own copy, which may
-            // have been behind the daemon's: the letters that count are the
-            // ones the daemon gave, when it applied the viewer's op just
-            // before this answer.
-            if let Some(ack) = result.ack.as_mut()
-                && !ack.marks.is_empty()
-                && let Some(loc) = st
-                    .registry
-                    .locations
-                    .iter()
-                    .find(|l| l.key.name() == ack.location)
-            {
-                let n = ack.marks.len();
-                let fresh: Vec<proto::MarkInfo> = loc
-                    .marks
-                    .marks
-                    .iter()
-                    .rev()
-                    .take(n)
-                    .rev()
-                    .map(crate::marks::Mark::info)
-                    .collect();
-                if fresh.len() == n {
-                    ack.marks = fresh;
+            let (key, dir, name, named) = locate(&location).map_err(query_error)?;
+            let pr = match &named {
+                Named::Pr(spec) => Some(spec.clone()),
+                Named::Repo { .. } => None,
+            };
+            // The view changes for files or new marks, or when there is
+            // nothing else to do: a plain "go there".
+            let go = !files.is_empty()
+                || marks.iter().any(|m| matches!(m, proto::MarkEntry::Add(_)))
+                || marks.is_empty() && !replace;
+            // The marks first, by the daemon, all or nothing.
+            let (edited, state) = {
+                let mut st = shared.state.lock().unwrap();
+                if go && pick_viewer(&st.viewers, workspace.as_deref()).is_none() {
+                    return Err(no_viewer());
                 }
-                ack.mine = loc.marks.mine();
+                let loc = st.registry.ensure(key.clone(), dir.clone(), name.clone());
+                let edited = match loc.marks.edit(&marks, replace, user_asked) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        // Recorded for nothing: an empty location goes.
+                        st.drop_unused();
+                        return Err(query_error(e));
+                    }
+                };
+                let state = loc.clone();
+                let mut notes = Vec::new();
+                if !edited.deleted.is_empty() {
+                    let letters: Vec<String> =
+                        edited.deleted.iter().map(|l| format!("[{l}]")).collect();
+                    notes.push(format!("agent deleted {}", letters.join(" ")));
+                }
+                if !edited.moved.is_empty() {
+                    notes.push(format!("agent moved {}", proto::lettered(&edited.moved)));
+                }
+                if !notes.is_empty() {
+                    st.announce(&key, Some(notes.join("; ")));
+                }
+                (edited, state)
+            };
+            let mut result = ShowResult {
+                shown: String::new(),
+                marked: Vec::new(),
+                moved: edited.moved.clone(),
+                deleted: edited.deleted.clone(),
+                viewer: String::new(),
+                report: Report::default(),
+            };
+            let mut notes = Vec::new();
+            if go {
+                let (viewer, id, rx) = {
+                    let mut st = shared.state.lock().unwrap();
+                    let Some((viewer, picked_by)) = pick_viewer(&st.viewers, workspace.as_deref())
+                    else {
+                        return Err(no_viewer());
+                    };
+                    let viewer = viewer.id.clone();
+                    if let Some(d) = key.dir() {
+                        st.target = Some(Target {
+                            dir: d.to_path_buf(),
+                            base: None,
+                            repo: true,
+                        });
+                    }
+                    eprintln!(
+                        "show {} in {viewer} ({picked_by}; caller on {:?})",
+                        key.name(),
+                        workspace
+                    );
+                    let (id, rx) = st.expect_reply();
+                    st.broadcast(Event::Show {
+                        viewer: viewer.clone(),
+                        show: proto::ShowEvent {
+                            state,
+                            pr,
+                            view: proto::ViewSpec {
+                                files: files.clone(),
+                                marks: edited.adds.clone(),
+                            },
+                        },
+                        id: Some(id.clone()),
+                    });
+                    (viewer, id, rx)
+                };
+                result.viewer = viewer;
+                result.shown = shown_words(&key, &files, !edited.adds.is_empty());
+                // An older viewer never answers; the result then says less.
+                let ack: Option<proto::ShowAck> = rx
+                    .recv_timeout(REPLY_TIMEOUT)
+                    .ok()
+                    .and_then(|v| serde_json::from_value(v).ok());
+                let mut st = shared.state.lock().unwrap();
+                st.forget_reply(&id);
+                match ack {
+                    Some(ack) => {
+                        if !ack.applied {
+                            notes.push(
+                                "the user is busy here; the view and the new marks wait until they are done or you call review"
+                                    .to_string(),
+                            );
+                        }
+                        // The viewer lettered the marks from its own copy,
+                        // which may have been behind the daemon's: the
+                        // letters that count are the ones the daemon gave,
+                        // when it applied the viewer's op just before this
+                        // answer.
+                        let n = ack.marks.len();
+                        result.marked = ack.marks;
+                        if n > 0
+                            && let Some(loc) = st.registry.get(&key)
+                        {
+                            let fresh: Vec<proto::MarkInfo> = loc
+                                .marks
+                                .marks
+                                .iter()
+                                .rev()
+                                .take(n)
+                                .rev()
+                                .map(crate::marks::Mark::info)
+                                .collect();
+                            if fresh.len() == n {
+                                result.marked = fresh;
+                            }
+                        }
+                    }
+                    None => {
+                        if !edited.adds.is_empty() {
+                            notes.push(
+                                "the viewer did not say which letters it gave; call review to see them"
+                                    .to_string(),
+                            );
+                        } else {
+                            notes.push(
+                                "the viewer did not answer; it may be an older version".to_string(),
+                            );
+                        }
+                    }
+                }
             }
+            let st = shared.state.lock().unwrap();
+            result.report = match st.registry.get(&key) {
+                Some(loc) => Report::of(&key.name(), &loc.marks),
+                None => Report::of(&key.name(), &Default::default()),
+            };
+            result.report.notes = notes;
             drop(st);
             json!(result)
         }
-        Method::Query {
-            workspace,
-            cwd,
-            query,
-        } => {
+        Method::Query { query } => {
             let mut st = shared.state.lock().unwrap();
-            match st.answer(workspace.as_deref(), cwd.as_deref(), query) {
+            match st.answer(query) {
                 Ok(v) => v,
                 Err(message) => {
                     return Err(RpcError {
@@ -658,7 +666,7 @@ fn handle(
             json!(StatusResult {
                 target: st.target.clone(),
                 viewers: st.viewers.iter().map(|(_, v)| v.clone()).collect(),
-                locations: st.locations_info(None),
+                locations: st.locations_info(),
             })
         }
         Method::ViewerRegister(entry) => {
@@ -734,8 +742,9 @@ fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::marks::{Author, Marks, Op};
-    use crate::proto::{Client, LocationState, OpenLocation, Request};
+    use crate::location::View;
+    use crate::marks::{Author, Op};
+    use crate::proto::{Client, LocationState, MarkEntry, OpenLocation, Request};
 
     /// A daemon on a socket of its own, and clients for it.
     struct Daemon {
@@ -783,10 +792,32 @@ mod tests {
 
         fn query(&self, query: AgentQuery) -> Result<Value, String> {
             let mut c = self.client("c");
-            c.call(Method::Query {
-                workspace: None,
-                cwd: None,
-                query,
+            c.call(Method::Query { query })
+        }
+
+        /// A show from an agent, in a thread of its own since the daemon
+        /// waits for the viewer's answer.
+        fn show(
+            &self,
+            location: &str,
+            files: Vec<proto::FileSpec>,
+            marks: Vec<MarkEntry>,
+            replace: bool,
+        ) -> std::thread::JoinHandle<Result<Value, String>> {
+            let socket = self.socket.clone();
+            let location = location.to_string();
+            std::thread::spawn(move || {
+                let stream = UnixStream::connect(&socket).unwrap();
+                let mut c = Client::new(stream, "c").unwrap();
+                c.hello().unwrap();
+                c.call(Method::Show {
+                    location,
+                    workspace: None,
+                    files,
+                    marks,
+                    replace,
+                    user_asked: false,
+                })
             })
         }
     }
@@ -812,13 +843,16 @@ mod tests {
         }
     }
 
-    fn repo(dir: &str) -> LocationState {
-        LocationState {
-            key: LocationKey::Repo { dir: dir.into() },
-            dir: dir.into(),
-            name: dir.rsplit('/').next().unwrap().to_string(),
-            marks: Marks::default(),
-        }
+    /// A checkout's branch view, as a viewer has it open.
+    fn repo(dir: &std::path::Path) -> LocationState {
+        LocationState::fresh(
+            LocationKey::Repo {
+                dir: dir.to_path_buf(),
+                view: View::Branch,
+            },
+            dir.to_path_buf(),
+            dir.file_name().unwrap().to_string_lossy().into_owned(),
+        )
     }
 
     fn with_comment(mut l: LocationState, text: &str) -> LocationState {
@@ -886,17 +920,24 @@ mod tests {
     #[test]
     fn a_viewers_location_is_shared_and_an_agent_reads_it_through_the_daemon() {
         let d = Daemon::start("share");
-        let loc = with_comment(repo("/work/repo"), "rename this");
+        let checkout = crate::testutil::branch_with_history("checkout-share");
+        let at = format!("{}#branch", checkout.display());
+        let loc = with_comment(repo(&checkout), "rename this");
         let viewer = d.viewer("v1", &[&loc]);
         let (_, mut reader) = viewer.into_parts();
         // Opening a location gets its shared state back: its own, being new.
         let (state, _) = location_event(&mut reader);
         assert_eq!(state.marks.marks[0].label, "A");
 
-        let v = d.query(AgentQuery::Review { location: None }).unwrap();
+        let v = d
+            .query(AgentQuery::Review {
+                location: format!("{}/src#branch", checkout.display()),
+                letters: Vec::new(),
+            })
+            .unwrap();
         let r: proto::ReviewResult = serde_json::from_value(v).unwrap();
-        assert_eq!((r.location.as_str(), r.unread), ("/work/repo", 1));
-        assert_eq!(r.showing, "repo · everything");
+        assert_eq!(r.report.location, at, "named by the root");
+        assert_eq!((r.new, r.report.unread), (1, 0));
         assert!(r.marks[0].new);
         // Read, the viewer hears that the comment is no longer unread.
         let (state, note) = location_event(&mut reader);
@@ -904,10 +945,7 @@ mod tests {
 
         let v = d
             .query(AgentQuery::Reply {
-                location: Some(LocationRef {
-                    repo: Some("/work/repo".into()),
-                    pr: None,
-                }),
+                location: at.clone(),
                 letter: "a".to_string(),
                 text: "done".to_string(),
             })
@@ -917,76 +955,48 @@ mod tests {
         assert_eq!(state.marks.marks[0].thread[0].author, Author::Agent);
         assert_eq!(note.as_deref(), Some("agent replied under [A]"));
 
-        // The agent's own mark without a show, lettered on.
+        // Another view of the same checkout is a location of its own.
         let v = d
-            .query(AgentQuery::Mark {
-                location: None,
-                marks: vec![
-                    proto::MarkSpec {
-                        path: "a.rs".to_string(),
-                        start: 5,
-                        end: 6,
-                        text: Some("unused".to_string()),
-                    },
-                    proto::MarkSpec {
-                        path: "b.rs".to_string(),
-                        start: 1,
-                        end: 1,
-                        text: Some("this too".to_string()),
-                    },
-                ],
+            .query(AgentQuery::Review {
+                location: checkout.display().to_string(),
+                letters: Vec::new(),
             })
             .unwrap();
-        assert_eq!(v["marks"][0]["label"], "B");
-        assert_eq!(v["marks"][1]["label"], "C");
-        assert_eq!(v["mine"][0]["label"], "B", "the agent's marks come back");
-        let (state, note) = location_event(&mut reader);
-        let b = &state.marks.marks[1];
-        assert!(b.author == Author::Agent && b.text.is_none());
-        assert_eq!(
-            note.as_deref(),
-            Some("agent marked [B] a.rs 5-6, [C] b.rs 1"),
-            "one event for all of them"
-        );
-        let err = d
-            .query(AgentQuery::Mark {
-                location: None,
-                marks: vec![proto::MarkSpec {
-                    path: "a.rs".to_string(),
-                    start: 0,
-                    end: 0,
-                    text: Some("nowhere".to_string()),
-                }],
-            })
-            .unwrap_err();
-        assert!(err.contains("lines start at 1"), "{err}");
-
-        let err = d
-            .query(AgentQuery::ClearMarks {
-                location: None,
-                which: "user".to_string(),
-                letters: Vec::new(),
-                user_asked: false,
-            })
-            .unwrap_err();
-        assert!(err.starts_with("[A] is the user's"), "{err}");
+        let r: proto::ReviewResult = serde_json::from_value(v).unwrap();
+        assert!(r.marks.is_empty() && r.report.total == 0);
+        assert_eq!(r.report.location, checkout.display().to_string());
         let err = d
             .query(AgentQuery::Review {
-                location: Some(LocationRef {
-                    repo: Some("/elsewhere".into()),
-                    pr: None,
-                }),
+                location: checkout.display().to_string(),
+                letters: vec!["A".to_string()],
             })
             .unwrap_err();
-        assert_eq!(err, "nothing is open for /elsewhere; show it first");
+        assert!(err.starts_with("no marks on"), "{err}");
+        let err = d
+            .query(AgentQuery::Reply {
+                location: "/nowhere/at/all".to_string(),
+                letter: "A".to_string(),
+                text: "x".to_string(),
+            })
+            .unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+        let err = d
+            .query(AgentQuery::Review {
+                location: "src".to_string(),
+                letters: Vec::new(),
+            })
+            .unwrap_err();
+        assert!(err.contains("absolute directory"), "{err}");
+        let _ = std::fs::remove_dir_all(checkout);
     }
 
     #[test]
     fn a_second_viewer_opening_the_same_location_gets_the_marks_already_there() {
         let d = Daemon::start("second");
-        let loc = with_comment(repo("/work/repo"), "mine");
+        let checkout = crate::testutil::branch_with_history("checkout-second");
+        let loc = with_comment(repo(&checkout), "mine");
         let _first = d.viewer("v1", &[&loc]);
-        let second = d.viewer("v2", &[&repo("/work/repo")]);
+        let second = d.viewer("v2", &[&repo(&checkout)]);
         let (_, mut reader) = second.into_parts();
         let (state, _) = location_event(&mut reader);
         assert_eq!(
@@ -994,31 +1004,34 @@ mod tests {
             1,
             "the second viewer takes over the first's marks"
         );
-        let v = d.query(AgentQuery::Locations).unwrap();
-        let r: proto::LocationsResult = serde_json::from_value(v).unwrap();
-        assert_eq!(r.locations.len(), 1);
-        assert_eq!(r.locations[0].viewers, ["v1", "v2"]);
-        assert!(r.locations[0].on_screen);
+        let mut c = d.client("c");
+        let v = c.call(Method::Status).unwrap();
+        let st: StatusResult = serde_json::from_value(v).unwrap();
+        assert_eq!(st.locations.len(), 1);
+        assert_eq!(st.locations[0].viewers, ["v1", "v2"]);
+        let _ = std::fs::remove_dir_all(checkout);
     }
 
     #[test]
     fn marks_survive_their_viewer_and_empty_locations_do_not() {
         let d = Daemon::start("survive");
-        let kept = with_comment(repo("/work/kept"), "still here");
-        let empty = repo("/work/empty");
+        let kept_dir = crate::testutil::branch_with_history("checkout-kept");
+        let kept = with_comment(repo(&kept_dir), "still here");
+        let empty = repo(std::path::Path::new("/work/empty"));
         let viewer = d.viewer("v1", &[&kept, &empty]);
         drop(viewer);
         for _ in 0..50 {
-            let v = d.query(AgentQuery::Locations).unwrap();
-            let r: proto::LocationsResult = serde_json::from_value(v).unwrap();
-            if r.locations.len() == 1 {
-                assert_eq!(r.locations[0].location, "/work/kept");
-                assert!(r.locations[0].viewers.is_empty());
+            let mut c = d.client("c");
+            let st: StatusResult = serde_json::from_value(c.call(Method::Status).unwrap()).unwrap();
+            if st.locations.len() == 1 {
+                assert_eq!(st.locations[0].location, kept.key.name());
+                assert!(st.locations[0].viewers.is_empty());
                 assert!(
-                    r.render().contains("not open in any viewer"),
+                    st.locations[0].render().contains("not open in any viewer"),
                     "{}",
-                    r.render()
+                    st.locations[0].render()
                 );
+                let _ = std::fs::remove_dir_all(kept_dir);
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1029,7 +1042,7 @@ mod tests {
     #[test]
     fn a_viewers_op_reaches_the_other_viewer() {
         let d = Daemon::start("op");
-        let loc = repo("/work/repo");
+        let loc = repo(std::path::Path::new("/work/repo"));
         let a = d.viewer("v1", &[&loc]);
         let b = d.viewer("v2", &[&loc]);
         let (mut aw, _) = a.into_parts();
@@ -1057,44 +1070,87 @@ mod tests {
     }
 
     #[test]
-    fn a_show_carries_the_viewers_answer_when_it_gives_one() {
+    fn a_show_edits_the_marks_first_then_relays_the_view_and_carries_the_answer() {
         let d = Daemon::start("relay-show");
-        // The daemon already holds a mark here that the viewer never saw.
-        let loc = with_comment(repo("/x"), "kept");
+        let checkout = crate::testutil::branch_with_history("checkout-relay");
+        let at = format!("{}#branch", checkout.display());
+        // The daemon already holds the user's mark and one of the agent's
+        // that the viewer never saw.
+        let mut loc = with_comment(repo(&checkout), "kept");
+        loc.marks.apply(&Op::Marks {
+            marks: vec![proto::MarkSpec {
+                path: "a.rs".to_string(),
+                start: 9,
+                end: 9,
+                text: None,
+            }],
+        });
         let viewer = d.viewer("v1", &[&loc]);
         let (mut writer, mut reader) = viewer.into_parts();
         let _ = location_event(&mut reader);
-        let dir = d.dir.clone();
-        let caller = std::thread::spawn({
-            let socket = d.socket.clone();
-            move || {
-                let stream = UnixStream::connect(&socket).unwrap();
-                let mut c = Client::new(stream, "c").unwrap();
-                c.hello().unwrap();
-                c.call(Method::Show {
-                    dir,
-                    base: None,
-                    workspace: None,
-                    view: None,
-                })
-            }
-        });
-        let Event::Show { id: Some(id), .. } = next_event(&mut reader) else {
+        let caller = d.show(
+            &at,
+            vec![proto::FileSpec {
+                path: "a.rs".to_string(),
+                lines: None,
+            }],
+            vec![
+                MarkEntry::Add(proto::MarkSpec {
+                    path: "b.rs".to_string(),
+                    start: 2,
+                    end: 2,
+                    text: None,
+                }),
+                MarkEntry::Move {
+                    letter: "A".to_string(),
+                    path: "a.rs".to_string(),
+                    start: 5,
+                    end: 5,
+                },
+            ],
+            true,
+        );
+        // Replacing its own took [B]; the move changed [A]; both announced
+        // before the view is relayed.
+        let (state, note) = location_event(&mut reader);
+        assert_eq!(state.marks.marks.len(), 1);
+        assert_eq!(
+            (
+                state.marks.marks[0].start,
+                state.marks.marks[0].label.as_str()
+            ),
+            (5, "A")
+        );
+        assert_eq!(
+            note.as_deref(),
+            Some("agent deleted [B]; agent moved [A] a.rs 5")
+        );
+        let Event::Show {
+            show, id: Some(id), ..
+        } = next_event(&mut reader)
+        else {
             panic!("a show event with an id");
         };
-        // The viewer, lettering from an empty copy, calls its new mark [A]
-        // and says so right after its op; the daemon knows it as [B].
+        assert_eq!(show.state.key.name(), at);
+        assert_eq!(
+            show.state.marks.marks.len(),
+            1,
+            "the daemon's copy comes along"
+        );
+        assert_eq!(show.view.files[0].path, "a.rs");
+        assert_eq!(
+            show.view.marks.len(),
+            1,
+            "the new mark is the viewer's to place"
+        );
+        // The viewer, lettering from a copy that was behind, calls its new
+        // mark [B] and says so right after its op; the daemon knows it as [C].
         let op = Request {
             id: "v".to_string(),
             method: Method::ViewerOp {
                 key: loc.key.clone(),
                 op: Op::Marks {
-                    marks: vec![proto::MarkSpec {
-                        path: "b.rs".to_string(),
-                        start: 2,
-                        end: 2,
-                        text: None,
-                    }],
+                    marks: show.view.marks.clone(),
                 },
             },
         };
@@ -1103,37 +1159,127 @@ mod tests {
             id: "v".to_string(),
             method: Method::ViewerReply {
                 id,
-                result: json!({ "location": "/x", "dir": "/x", "marks": [{ "label": "A", "author": "agent", "path": "b.rs", "start": 2, "end": 2 }], "unread": 1, "applied": true }),
+                result: json!({ "marks": [{ "label": "B", "author": "agent", "path": "b.rs", "start": 2, "end": 2 }], "applied": true }),
             },
         };
         writer.write_all(to_line(&reply).as_bytes()).unwrap();
         let r: ShowResult = serde_json::from_value(caller.join().unwrap().unwrap()).unwrap();
-        let ack = r.ack.expect("the viewer's answer");
-        assert_eq!((ack.location.as_str(), ack.unread), ("/x", 1));
+        assert_eq!(r.shown, "everything since the branch point · a.rs");
         assert_eq!(
-            ack.marks[0].label, "B",
+            r.marked[0].label, "C",
             "the daemon's letter, not the viewer's"
         );
-        assert_eq!(ack.mine.len(), 1);
+        assert_eq!(r.moved[0].label, "A");
+        assert_eq!(r.deleted, ["B"]);
+        assert_eq!(r.viewer, "v1");
+        assert_eq!(r.report.location, at);
+        assert_eq!(
+            (r.report.total, r.report.by_user, r.report.unread),
+            (2, 1, 1)
+        );
+        assert_eq!(r.report.mine[0].label, "C");
+        assert!(r.report.notes.is_empty(), "{:?}", r.report.notes);
+        let text = r.render();
+        assert!(text.starts_with("shown: everything since the branch point · a.rs\nmarked: [C] b.rs 2\nmoved: [A] a.rs 5\ndeleted: [B]\nlocation: "), "{text}");
+
+        // The viewer's op was announced too.
+        let (state, _) = location_event(&mut reader);
+        assert_eq!(state.marks.marks.len(), 2);
+        // Only deletions: the marks change, the view does not.
+        let caller = d.show(
+            &at,
+            Vec::new(),
+            vec![MarkEntry::Delete {
+                letter: "C".to_string(),
+            }],
+            false,
+        );
+        let (state, note) = location_event(&mut reader);
+        assert_eq!(state.marks.marks.len(), 1);
+        assert_eq!(note.as_deref(), Some("agent deleted [C]"));
+        let r: ShowResult = serde_json::from_value(caller.join().unwrap().unwrap()).unwrap();
+        assert!(r.shown.is_empty() && r.viewer.is_empty());
+        assert_eq!(r.deleted, ["C"]);
+        // The user's mark needs the flag: nothing changes.
+        let caller = d.show(
+            &at,
+            Vec::new(),
+            vec![MarkEntry::Delete {
+                letter: "A".to_string(),
+            }],
+            false,
+        );
+        let err = caller.join().unwrap().unwrap_err();
+        assert!(err.starts_with("[A] is the user's"), "{err}");
+        let _ = std::fs::remove_dir_all(checkout);
     }
 
     #[test]
-    fn a_show_with_no_viewer_fails_at_once_and_a_query_needs_a_location() {
+    fn a_show_opens_a_location_the_daemon_never_saw() {
+        let d = Daemon::start("relay-new");
+        let checkout = crate::testutil::branch_with_history("checkout-new");
+        let other = repo(std::path::Path::new("/work/other"));
+        let viewer = d.viewer("v1", &[&other]);
+        let (mut writer, mut reader) = viewer.into_parts();
+        let _ = location_event(&mut reader);
+        let caller = d.show(
+            &format!("{}/src", checkout.display()),
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        let Event::Show {
+            show, id: Some(id), ..
+        } = next_event(&mut reader)
+        else {
+            panic!("a show event with an id");
+        };
+        assert_eq!(
+            show.state.key.name(),
+            checkout.display().to_string(),
+            "the root, as the files are"
+        );
+        assert_eq!(show.state.dir, checkout);
+        assert!(show.pr.is_none() && show.view.files.is_empty());
+        let reply = Request {
+            id: "v".to_string(),
+            method: Method::ViewerReply {
+                id,
+                result: json!({ "marks": [], "applied": false }),
+            },
+        };
+        writer.write_all(to_line(&reply).as_bytes()).unwrap();
+        let r: ShowResult = serde_json::from_value(caller.join().unwrap().unwrap()).unwrap();
+        assert_eq!(r.shown, "the working tree · all files");
+        assert!(
+            r.report.notes[0].starts_with("the user is busy"),
+            "{:?}",
+            r.report.notes
+        );
+        let _ = std::fs::remove_dir_all(checkout);
+    }
+
+    #[test]
+    fn a_show_with_no_viewer_fails_at_once() {
         let d = Daemon::start("relay-none");
-        let mut c = d.client("c");
-        let err = c
-            .call(Method::Show {
-                dir: d.dir.clone(),
-                base: None,
-                workspace: None,
-                view: None,
-            })
+        let checkout = crate::testutil::branch_with_history("checkout-none");
+        let err = d
+            .show(
+                &checkout.display().to_string(),
+                Vec::new(),
+                Vec::new(),
+                false,
+            )
+            .join()
+            .unwrap()
             .unwrap_err();
         assert!(err.contains("no codesnob viewer"), "{err}");
-        let err = d.query(AgentQuery::Review { location: None }).unwrap_err();
-        assert_eq!(err, "no location is on screen; name one with repo or pr");
-        let v = d.query(AgentQuery::Locations).unwrap();
-        let r: proto::LocationsResult = serde_json::from_value(v).unwrap();
-        assert!(r.locations.is_empty());
+        let mut c = d.client("c");
+        let st: StatusResult = serde_json::from_value(c.call(Method::Status).unwrap()).unwrap();
+        assert!(
+            st.locations.is_empty(),
+            "nothing recorded for a show that went nowhere"
+        );
+        let _ = std::fs::remove_dir_all(checkout);
     }
 }
