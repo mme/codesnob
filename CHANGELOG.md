@@ -10,11 +10,14 @@ the machinery, not decoration.
 
 ## Unreleased
 
-- **Locations are named by what they are.** The `L3` ids are gone. A
-  location is a repository or a pull request, and agents name it by the
-  repository's path (`repo`) or as `owner/repo#123` (`pr`); the review
-  tools default to the location on screen. With several locations open,
-  the status bar shows the name of the one on screen.
+- **Locations are named by what they are.** The `L3` ids are gone. To an
+  agent, a location is a checkout and a view of it in one name
+  (`/home/u/repo`, `/home/u/repo#main`, `/home/u/repo#main...HEAD`,
+  `/home/u/repo#branch`, `#worktree`, `#staged`, `#unstaged`) or a pull
+  request (`owner/repo#123`), never relative to the agent's directory,
+  and every call names one. The marks belong to that exact view. With
+  several locations open, the status bar shows the name of the one on
+  screen.
 - **Marks are shared.** The daemon keeps every location's marks. Two
   viewers on the same repository show the same marks, reading and
   answering comments needs no viewer, and comments survive closing the
@@ -45,15 +48,22 @@ the machinery, not decoration.
   it. A mark's tint now covers its lines even where the diff coloured
   them, and the bar beside the lines is gone: the letter marks the first
   line, the tint says how far it runs.
-- **The agent marks without showing.** A new `mark` tool (and `codesnob
-  mark`) puts marks with words on lines, up to 20 in one call, without
-  changing the view, for comments on code you are already looking at. Its
-  marks are lettered top to bottom, as a show's are. New marks or a reply
-  of the agent's take the cursor to the topmost of them, unless you are
-  typing or have not moved since the last jump. The show tools
-  take `marks` with `text` instead of `highlights` with `note`; `reply`
-  (was `reply_to_comment`) answers under any mark, `move_mark` (was
-  `move_comment`) moves any mark, and `get_review` says who made each.
+- **Three tools.** `show` puts a location on screen, whole files or
+  regions of them, and sets its marks in one call: entries add new marks,
+  lettered in the order given, move one by letter, or delete one;
+  `replace` removes the agent's own marks first. `review` (was
+  `get_review`) reads the marks, or only some by letter, and says who
+  made each; `reply` answers under any mark. `show_code`, `show_diff`,
+  `mark`, `move_mark`, `clear_marks` and `list_locations` are gone, as
+  are the `line` and `excerpts` options: a file shows whole or by `lines`,
+  and marks without files show the marked lines with a few around them.
+  Every reply closes with the same lines: the location, the marks there
+  with the agent's own by file and your unread words, and a note when
+  something is held or stale. New marks or a reply of the agent's take
+  the cursor to the topmost of them, unless you are typing or have not
+  moved since the last jump. The CLI follows: `codesnob show LOCATION
+  [FILES]`, `codesnob review LOCATION [LETTERS]`, `codesnob reply
+  LOCATION LETTER TEXT`.
 - **Diagrams in marks.** A ```mermaid fence in a mark's text, the
   agent's or yours, is drawn as a diagram where the fence was: a picture
   on the mark's colour in a terminal that shows images, box-drawing text
@@ -62,7 +72,7 @@ the machinery, not decoration.
   Pictures are lettered in Inter, which codesnob carries with it, so a
   diagram looks the same on every machine; a fence's own `fontFamily`
   still wins.
-- The protocol version is now 3. Viewers, agents and the daemon must be
+- The protocol version is now 4. Viewers, agents and the daemon must be
   on the same build.
 
 ## v0.1.0

@@ -137,28 +137,25 @@ Most other agents take a JSON configuration in this form:
 }
 ```
 
-The server gives the agent eight tools:
+The server gives the agent three tools, and every call names its
+[location](#locations):
 
 | Tool | Does |
 |---|---|
-| `show_code` | show whole files or excerpts, as they are or as of a revision, with marks on lines and optional text |
-| `show_diff` | show any comparison from [the range table](#what-is-compared), optionally limited to some files, with marks on lines |
-| `list_locations` | list every location: each repository or pull request, what it shows, which viewer has it on screen, and how many of your words it has that the agent has not read |
-| `get_review` | read every mark on a location, the agent's and yours, with the threads under them, the code under your marks and what is new |
-| `mark` | mark lines with words, up to 20 in one call, without changing the view: for comments on code you are already looking at. A ```mermaid fence in the words is drawn as a diagram |
+| `show` | put a location on screen: whole files, regions of them, or every file a comparison touches, and set the marks on it. New marks are lettered in the order given, up to 20 per call; an entry with a letter moves that mark or, with `delete`, removes it; `replace` removes the agent's own marks first. A ```mermaid fence in a mark's words is drawn as a diagram |
+| `review` | read the marks on a location, the agent's and yours, or only some by letter, with the threads under them, the code under your marks and what is new |
 | `reply` | answer in the thread under a mark |
-| `move_mark` | put a mark on other lines after the agent changed the code under it; it keeps its letter, text and thread |
-| `clear_marks` | remove the agent's own marks. A mark you made or wrote under goes whole, thread and all, and only when the call says you explicitly asked for that (`user_explicitly_asked_to_delete_comments`); otherwise it is refused |
 
-Every reply tells the agent the letters of the marks it placed and whether
-you have comments it has not read yet. A reply that leaves marks of the
-agent's also lists them all, with a reminder to remove the ones no longer
-needed. The review tools work on the
-location on screen unless the agent names another, by the repository's
-path (`repo`) or as `owner/repo#123` (`pr`). The tool descriptions tell the
-agent when to use them, so you don't need to mention codesnob in your
-prompts: "show me", "what changed on this branch" and "I left some
-comments" are enough.
+A mark you made or wrote under goes whole, thread and all, and only when
+the call says you explicitly asked for that
+(`user_explicitly_asked_to_delete`); otherwise the show is refused and
+nothing changes. Every reply closes the same way: the location it acted
+on, to copy into the next call; how many marks are there, which are the
+agent's own, by file, and how many of your words it has not read; and a
+note when something is out of the ordinary, such as a show held while you
+type. The tool descriptions tell the agent when to use them, so you don't
+need to mention codesnob in your prompts: "show me", "what changed on this
+branch" and "I left some comments" are enough.
 
 The viewer must already be running for the agent to show anything; the
 agent does not start one. If you have more than one viewer open, the
@@ -208,14 +205,29 @@ repository, one per pull request. A location holds its own range, cursor
 and marks. `Alt-←` and `Alt-→` (or `-`) move between them, and `L` lists
 them. With several open, the status bar names the one on screen.
 
-Agents name a location by what it is: the repository's path, or
-`owner/repo#123` for a pull request. When an agent shows you something in a
-repository you already have open, it replaces what that repository's
-location was showing. Esc brings back what you had before.
+To an agent, a location is a checkout and a view of it in one name, or a
+pull request:
 
-The marks on a location belong to the location, not to a viewer. The daemon
-keeps them: a second viewer opening the same repository shows the same
-marks, and they survive closing the viewer until the daemon exits.
+| Location | Shows |
+|---|---|
+| `/home/u/repo` | the files as they are in the working tree |
+| `/home/u/repo#main` | the files as of a revision |
+| `/home/u/repo#main...HEAD`, `#a..b` | a comparison, as in [the range table](#what-is-compared); a commit's changes are `#abc~..abc` |
+| `/home/u/repo#branch` | everything since the branch point, uncommitted work included |
+| `/home/u/repo#worktree`, `#staged`, `#unstaged` | as in the range table |
+| `owner/repo#123`, a PR URL | a pull request |
+
+Any directory inside the checkout names it; the reply names it by its
+root. The name is never relative to anything, so an agent working in
+another directory still means what it says. The marks belong to that
+exact view: a mark made on the branch diff is not on the file as it is,
+and a worktree is a checkout of its own. When an agent shows you a view of
+a repository you already have open, it replaces what that repository's
+location was showing, and Esc brings back what you had before.
+
+The daemon keeps every location's marks: a second viewer opening the same
+view shows the same marks, and they survive closing the viewer until the
+daemon exits.
 
 ### Marks
 
@@ -227,9 +239,10 @@ since Enter is how you make one; the agent's carry words when you asked it
 to explain, review or comment, and are bare when it is only pointing.
 
 Every mark stays until someone removes it. A show adds marks and removes
-none, so the agent is told to clear its own once they have served; `x`
-removes the mark under the cursor, whoever made it, and `X` clears the
-location after asking.
+none unless told to, so the agent is told to pass `replace` when it points
+somewhere new and to delete its own once they have served; `x` removes the
+mark under the cursor, whoever made it, and `X` clears the location after
+asking.
 
 A mark's text sits under the lines it is about, and its thread under
 that. Enter on a marked line, on a mark's row, or on any turn in its
@@ -376,13 +389,9 @@ The subcommands talk to viewers that are already running:
 
 | Command | Does |
 |---|---|
-| `codesnob show PATH [--range R]` | show the repository at `PATH` in the viewer, optionally a specific range |
-| `codesnob locations [--json]` | list every location, with its marks and unread comments and the viewers it is open in |
-| `codesnob review [--repo DIR \| --pr REF] [--json]` | print the marks on a location (default: the one on screen); the user's words count as read afterwards |
-| `codesnob mark PATH LINES TEXT [--repo DIR \| --pr REF]` | mark lines of a file with words, as the agent, e.g. `codesnob mark src/x.rs 40-42 "unused"` |
-| `codesnob reply LETTER TEXT [--repo DIR \| --pr REF]` | answer in the thread under a mark |
-| `codesnob move LETTER LINES [--path P] [--repo DIR \| --pr REF]` | put a mark on other lines, e.g. `codesnob move C 40-42` |
-| `codesnob clear [LETTERS…] [--which mine\|user\|all] [--repo DIR \| --pr REF]` | remove marks by letter, or by owner: `mine` is the agent's own (the default), `user` is every mark the user made or wrote under. Removing the user's marks needs `--user-explicitly-asked-to-delete-comments` |
+| `codesnob show LOCATION [FILES…]` | show a location in the viewer, as an agent names one: `codesnob show /home/u/repo#main...HEAD src/x.rs` |
+| `codesnob review LOCATION [LETTERS…] [--json]` | print the marks on a location, or only some by letter; the user's words count as read afterwards |
+| `codesnob reply LOCATION LETTER TEXT` | answer in the thread under a mark |
 | `codesnob status [--json]` | list the connected viewers, with their workspace and directory, and every location |
 | `codesnob mcp` | run the MCP server on stdin and stdout |
 | `codesnob prune` | remove PR checkouts that no viewer has open |
@@ -391,8 +400,7 @@ The subcommands talk to viewers that are already running:
 Viewers and agents talk through a small per-user daemon over a Unix socket.
 It starts when it is first needed and you don't have to manage it. The
 daemon keeps every location's marks, so the review commands work without a
-viewer, and a location that is not on screen is named with `--repo` or
-`--pr`.
+viewer.
 
 ## Files it keeps
 

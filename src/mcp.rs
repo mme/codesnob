@@ -97,7 +97,7 @@ fn tools() -> Value {
                 "location": location,
                 "files": {
                     "type": "array",
-                    "description": "The files to show, in this order, relative to the checkout root. A file may appear more than once with different lines.",
+                    "description": "The files to show, in this order, relative to the checkout root. A file may appear more than once with different lines. In a comparison, a file's lines are not yet honoured: it shows with all its changes.",
                     "items": {
                         "type": "object",
                         "properties": {
