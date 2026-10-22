@@ -14,6 +14,12 @@ the machinery, not decoration.
   break at the width, at a space where there is one, instead of running
   off the screen; a resize wraps them again. A block that fits is still
   one stop for the cursor, and jumps land on the marks as before.
+- **Letters run down the screen.** The marks one `show` adds are lettered
+  as they stand in the viewer, file by file and top down, whatever order
+  the agent gave them in.
+- **A mark with something to say.** The agent is asked to put a sentence,
+  or a diagram, on a mark where the lines alone do not tell the story,
+  and to leave one bare where they do.
 
 ## v0.2.0
 

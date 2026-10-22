@@ -164,6 +164,33 @@ pub struct MarkSpec {
 /// The most marks one show call can place.
 pub const MAX_MARKS: usize = 20;
 
+/// Put new marks in the order the viewer shows them, so their letters run
+/// down the screen: file by file as the view lists files, then by line. A
+/// comparison lists its files by path; files as they are come in the order
+/// asked for (`files`), or, when none was asked for, as the marks first
+/// name them.
+pub fn in_view_order(adds: &mut [MarkSpec], files: &[String], diff: bool) {
+    let mut order: Vec<String> = files.to_vec();
+    if order.is_empty() {
+        for a in adds.iter() {
+            if !order.contains(&a.path) {
+                order.push(a.path.clone());
+            }
+        }
+    }
+    let rank = |p: &str| order.iter().position(|o| o == p).unwrap_or(usize::MAX);
+    adds.sort_by(|a, b| {
+        let by_file = if diff {
+            a.path.cmp(&b.path)
+        } else {
+            rank(&a.path)
+                .cmp(&rank(&b.path))
+                .then_with(|| a.path.cmp(&b.path))
+        };
+        by_file.then(a.start.cmp(&b.start)).then(a.end.cmp(&b.end))
+    });
+}
+
 /// One thing a show does to a location's marks.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "do", rename_all = "snake_case")]
@@ -207,8 +234,9 @@ pub struct Anchored {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
-    /// A show call's marks, in the order they are lettered. Nothing else
-    /// changes: every mark stays until removed.
+    /// A show call's marks, in the order they are lettered: as the daemon
+    /// sorted them, file by file down the screen. Nothing else changes:
+    /// every mark stays until removed.
     Marks { marks: Vec<MarkSpec> },
     /// A mark with words on lines: the user's from the viewer, with the
     /// lines' text, or an agent's, whose text the viewer takes at its next
@@ -853,6 +881,62 @@ mod tests {
 
     fn labels(m: &Marks) -> Vec<String> {
         m.marks.iter().map(|m| m.label.clone()).collect()
+    }
+
+    #[test]
+    fn new_marks_are_ordered_as_the_viewer_shows_them() {
+        let paths = |adds: &[MarkSpec]| -> Vec<(String, usize)> {
+            adds.iter().map(|a| (a.path.clone(), a.start)).collect()
+        };
+        // A comparison lists files by path.
+        let mut adds = vec![
+            hl("src/z.rs", 3, 3, None),
+            hl("a.rs", 9, 9, None),
+            hl("src/z.rs", 1, 2, None),
+        ];
+        in_view_order(&mut adds, &["src/z.rs".to_string()], true);
+        assert_eq!(
+            paths(&adds),
+            [
+                ("a.rs".to_string(), 9),
+                ("src/z.rs".to_string(), 1),
+                ("src/z.rs".to_string(), 3)
+            ]
+        );
+        // Files as they are come as asked for, then by line.
+        let mut adds = vec![
+            hl("a.rs", 9, 9, None),
+            hl("src/z.rs", 3, 3, None),
+            hl("src/z.rs", 1, 2, None),
+        ];
+        in_view_order(
+            &mut adds,
+            &["src/z.rs".to_string(), "a.rs".to_string()],
+            false,
+        );
+        assert_eq!(
+            paths(&adds),
+            [
+                ("src/z.rs".to_string(), 1),
+                ("src/z.rs".to_string(), 3),
+                ("a.rs".to_string(), 9)
+            ]
+        );
+        // Without files, as the marks first name them.
+        let mut adds = vec![
+            hl("src/z.rs", 3, 3, None),
+            hl("a.rs", 9, 9, None),
+            hl("src/z.rs", 1, 2, None),
+        ];
+        in_view_order(&mut adds, &[], false);
+        assert_eq!(
+            paths(&adds),
+            [
+                ("src/z.rs".to_string(), 1),
+                ("src/z.rs".to_string(), 3),
+                ("a.rs".to_string(), 9)
+            ]
+        );
     }
 
     #[test]
