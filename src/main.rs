@@ -4,10 +4,13 @@ mod git;
 mod highlight;
 mod link;
 mod loader;
+mod location;
+mod marks;
 mod mcp;
 mod pr;
 mod proto;
 mod recent;
+mod registry;
 #[cfg(test)]
 mod testutil;
 mod ui;
@@ -60,77 +63,40 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Ask the running viewer(s) to display this directory's repository.
+    /// Ask the running viewer to show a location: an absolute directory,
+    /// optionally with #view (main, main...HEAD, branch, worktree, staged,
+    /// unstaged), or a pull request as owner/repo#142.
     Show {
-        path: PathBuf,
-        /// What to compare, in git syntax ("main...feature", "HEAD~3..HEAD",
-        /// a commit), "worktree", "staged", "unstaged", or a PR.
-        #[arg(long)]
-        range: Option<String>,
+        location: String,
+        /// Only these files, relative to the checkout root.
+        files: Vec<String>,
     },
-    /// Show the daemon's current target and the connected viewers.
+    /// Show the daemon's current target, the connected viewers and the
+    /// locations they have open.
     Status {
         /// Print the raw JSON reply.
         #[arg(long)]
         json: bool,
     },
-    /// List the locations open in the viewer, with their marks and unread
-    /// comments, and the other viewers running.
-    Locations {
-        /// Print the raw JSON reply.
-        #[arg(long)]
-        json: bool,
-    },
-    /// List the marks on a location in the viewer: the agent's highlights
-    /// and the user's comments, which count as read afterwards.
+    /// List the marks on a location, the agent's and the user's; the
+    /// user's words count as read afterwards.
     Review {
-        /// The location, as the viewer names it (L3); default: the one on screen.
-        #[arg(long)]
-        location: Option<String>,
+        /// The location, as for show.
+        location: String,
+        /// Only these marks, by letter.
+        letters: Vec<String>,
         /// Print the raw JSON reply.
         #[arg(long)]
         json: bool,
     },
-    /// Remove marks from a location in the viewer.
-    Clear {
-        /// The location, as the viewer names it (L3); default: the one on screen.
-        #[arg(long)]
-        location: Option<String>,
-        /// Which marks: the agent's highlights (mine), the user's comments
-        /// (user), or every mark (all). Default: mine.
-        #[arg(long, value_parser = ["mine", "user", "all"])]
-        which: Option<String>,
-        /// Letters of the marks to remove instead, e.g. C D, or replies,
-        /// e.g. C1.
-        letters: Vec<String>,
-        /// Allow removing the user's comments and replies. Only when the
-        /// user explicitly asked for them to be deleted.
-        #[arg(long)]
-        user_explicitly_asked_to_delete_comments: bool,
-    },
-    /// Answer one of the user's comments, under it: C1, C2…
+    /// Answer in the thread under a mark the user made or wrote under.
     Reply {
-        /// The comment's letter, e.g. C.
+        /// The location, as for show.
+        location: String,
+        /// The mark's letter, e.g. C.
         letter: String,
         /// The reply.
         text: String,
-        /// The location, as the viewer names it (L3); default: the one on screen.
-        #[arg(long)]
-        location: Option<String>,
-    },
-    /// Move one of the user's comments to other lines, keeping its letter,
-    /// text and replies.
-    Move {
-        /// The comment's letter, e.g. C.
-        letter: String,
-        /// Where it goes: 40-42, or 42.
-        lines: String,
-        /// The file it goes to (default: the one it is on).
-        #[arg(long)]
-        path: Option<String>,
-        /// The location, as the viewer names it (L3); default: the one on screen.
-        #[arg(long)]
-        location: Option<String>,
     },
     /// Run the daemon in the foreground (it normally starts on demand).
     Daemon,
@@ -148,54 +114,23 @@ fn main() -> Result<()> {
     let args = Args::parse();
     match args.cmd {
         Some(Cmd::Daemon) => return daemon::run(),
-        Some(Cmd::Show { path, range }) => {
-            let dir = canonical(&path)?;
-            return link::show(dir, range).map_err(|e| anyhow::anyhow!(e));
+        Some(Cmd::Show { location, files }) => {
+            return link::show(location, files).map_err(|e| anyhow::anyhow!(e));
         }
         Some(Cmd::Status { json }) => return link::status(json).map_err(|e| anyhow::anyhow!(e)),
-        Some(Cmd::Locations { json }) => {
-            return link::locations(json).map_err(|e| anyhow::anyhow!(e));
-        }
-        Some(Cmd::Review { location, json }) => {
-            return link::review(location, json).map_err(|e| anyhow::anyhow!(e));
-        }
-        Some(Cmd::Clear {
+        Some(Cmd::Review {
             location,
-            which,
             letters,
-            user_explicitly_asked_to_delete_comments,
+            json,
         }) => {
-            let which = which.unwrap_or_else(|| "mine".to_string());
-            return link::clear(
-                location,
-                which,
-                letters,
-                user_explicitly_asked_to_delete_comments,
-            )
-            .map_err(|e| anyhow::anyhow!(e));
+            return link::review(location, letters, json).map_err(|e| anyhow::anyhow!(e));
         }
         Some(Cmd::Reply {
+            location,
             letter,
             text,
-            location,
         }) => {
             return link::reply(location, letter, text).map_err(|e| anyhow::anyhow!(e));
-        }
-        Some(Cmd::Move {
-            letter,
-            lines,
-            path,
-            location,
-        }) => {
-            let args = serde_json::json!({
-                "letter": letter,
-                "lines": lines,
-                "path": path,
-                "location": location,
-            });
-            let cwd = std::env::current_dir()?;
-            let query = mcp::move_args(&args, &cwd).map_err(|e| anyhow::anyhow!(e))?;
-            return link::move_comment(query).map_err(|e| anyhow::anyhow!(e));
         }
         Some(Cmd::Mcp) => return mcp::serve(),
         Some(Cmd::Prune) => {

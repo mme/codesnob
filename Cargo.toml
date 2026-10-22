@@ -15,6 +15,13 @@ imara-diff = "0.2"
 # Decodes the sticker drawn on the empty screen.
 image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2.190"
+# Mermaid diagrams in marks, drawn as box-drawing text. Pinned: it builds
+# on an alpha parser, and its output is part of what the tests see.
+mermansi = "=0.1.6"
+# The same diagrams as pictures, where the terminal shows them: Mermaid to
+# SVG, SVG to pixels.
+mermaid-svg = "=0.7.0"
+resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts"] }
 # FSEvents on macOS; without it notify falls back to 30-second polling there.
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 nucleo-matcher = "0.3.1"

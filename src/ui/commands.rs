@@ -19,8 +19,8 @@ pub enum Action {
     MarkRegion,
     EditComment,
     DeleteComment,
-    /// Remove every comment of the user's on this location.
-    ClearComments,
+    /// Remove every mark on this location, after asking.
+    ClearMarks,
     Commits,
     OlderCommit,
     NewerCommit,
@@ -70,12 +70,12 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         action: Action::DeleteComment,
-        name: "Delete comment",
+        name: "Delete mark",
         keys: "x",
     },
     Command {
-        action: Action::ClearComments,
-        name: "Clear your comments here",
+        action: Action::ClearMarks,
+        name: "Clear all marks here",
         keys: "X",
     },
     Command {

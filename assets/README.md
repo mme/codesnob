@@ -28,3 +28,11 @@ used for commit `b6bec05`: render the critic at 4× resolution, expand its alpha
 mask by 12 SVG units, fill enclosed areas, smooth the outline, and trace it back
 to a vector path. The black illustration and red mark stay unchanged; only the
 wordmark switches to light ink. PNGs are rendered with `rsvg-convert`.
+
+## Fonts
+
+`fonts/Inter-Regular.ttf` is compiled into the binary and letters the
+diagrams drawn in marks, so they look the same on every machine. Inter is by
+Rasmus Andersson and others, under the SIL Open Font License 1.1, copied in
+`fonts/Inter-LICENSE.txt`. Replace the file to change the face; the family
+name is set in `src/ui/diagram.rs`.

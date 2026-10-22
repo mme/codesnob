@@ -8,6 +8,73 @@ the machinery, not decoration.
 
 <!-- next -->
 
+## Unreleased
+
+- **Locations are named by what they are.** The `L3` ids are gone. To an
+  agent, a location is a checkout and a view of it in one name
+  (`/home/u/repo`, `/home/u/repo#main`, `/home/u/repo#main...HEAD`,
+  `/home/u/repo#branch`, `#worktree`, `#staged`, `#unstaged`) or a pull
+  request (`owner/repo#123`), never relative to the agent's directory,
+  and every call names one. The marks belong to that exact view. With
+  several locations open, the status bar shows the name of the one on
+  screen.
+- **Marks are shared.** The daemon keeps every location's marks. Two
+  viewers on the same repository show the same marks, reading and
+  answering comments needs no viewer, and comments survive closing the
+  viewer until the daemon exits.
+- **Threads instead of numbered replies.** Replies no longer have labels
+  like `[C1]`; every mark has a thread under it. Enter on a mark or
+  anywhere in its thread adds to the thread, and what you type appears
+  where it will go. Answering an agent's mark starts the thread under it.
+  `e` edits your own words.
+- **Your threads are yours.** A mark you made or wrote under cannot be
+  touched by the agent, not even its own turns, unless you explicitly ask
+  for it to be deleted, and then it goes whole.
+- **One kind of mark.** Yours and the agent's are the same thing: a
+  lettered line range with an author, words on it or not, and a thread.
+  Every mark stays until someone removes it; a show adds marks and removes
+  none (the `append` option is gone with the rule it softened). The agent
+  is told to clear its own once they have served, and every reply that
+  leaves marks of its own lists them with a reminder to do so. `x` removes
+  the mark under the cursor whoever made it, `X` clears the location after
+  asking. Your marks are drawn in teal.
+- **Text under the lines, over several rows.** A mark's text and its
+  thread now sit below the lines they are about, as in a review on the
+  web, and a jump puts the first marked line at the top. Shift-Enter (or
+  Alt-Enter) breaks the line while you type, and text with several lines
+  is drawn on several rows. Enter on a line that already carries a mark
+  adds to that mark's thread instead of starting another; `v` still marks
+  the same lines again on purpose. Saving a comment leaves the cursor on
+  it. A mark's tint now covers its lines even where the diff coloured
+  them, and the bar beside the lines is gone: the letter marks the first
+  line, the tint says how far it runs.
+- **Three tools.** `show` puts a location on screen, whole files or
+  regions of them, and sets its marks in one call: entries add new marks,
+  lettered in the order given, move one by letter, or delete one;
+  `replace` removes the agent's own marks first. `review` (was
+  `get_review`) reads the marks, or only some by letter, and says who
+  made each; `reply` answers under any mark. `show_code`, `show_diff`,
+  `mark`, `move_mark`, `clear_marks` and `list_locations` are gone, as
+  are the `line` and `excerpts` options: a file shows whole or by `lines`,
+  and marks without files show the marked lines with a few around them.
+  Every reply closes with the same lines: the location, the marks there
+  with the agent's own by file and your unread words, and a note when
+  something is held or stale. New marks or a reply of the agent's take
+  the cursor to the topmost of them, unless you are typing or have not
+  moved since the last jump. The CLI follows: `codesnob show LOCATION
+  [FILES]`, `codesnob review LOCATION [LETTERS]`, `codesnob reply
+  LOCATION LETTER TEXT`.
+- **Diagrams in marks.** A ```mermaid fence in a mark's text, the
+  agent's or yours, is drawn as a diagram where the fence was: a picture
+  on the mark's colour in a terminal that shows images, box-drawing text
+  anywhere else. All Mermaid kinds; drawn off the main thread, cached,
+  and given up on after a few seconds with the source shown instead.
+  Pictures are lettered in Inter, which codesnob carries with it, so a
+  diagram looks the same on every machine; a fence's own `fontFamily`
+  still wins.
+- The protocol version is now 4. Viewers, agents and the daemon must be
+  on the same build.
+
 ## v0.1.0
 
 The first release.

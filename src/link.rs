@@ -1,16 +1,19 @@
 //! The TUI's long-lived connection to the daemon: register this viewer,
-//! announce what it shows, follow target changes, reconnect with backoff.
+//! announce what it shows, share its locations' marks, follow what agents
+//! ask, reconnect with backoff.
 //! Placement comes from the desktop backend in `wm` and is re-registered
 //! whenever it changes.
 
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::proto::{self, Event, Method, Request, ServerFrame, Target, ViewerEntry, to_line};
+use crate::proto::{
+    self, AgentQuery, Event, LocationKey, LocationState, Method, OpenLocation, Request,
+    ServerFrame, Target, ViewerEntry, to_line,
+};
 use crate::watch::Msg;
 use crate::wm;
 
@@ -46,6 +49,8 @@ impl Link {
             workspace: None,
             position: None,
             target: None,
+            location: None,
+            open: Vec::new(),
         };
         Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -55,8 +60,46 @@ impl Link {
         }
     }
 
-    pub fn set_target(&self, target: Target) {
-        self.update(|e| e.target = Some(target));
+    /// What this viewer shows: the target and location on screen, and
+    /// every location open.
+    pub fn set_showing(
+        &self,
+        target: Option<Target>,
+        location: Option<LocationKey>,
+        open: Vec<OpenLocation>,
+    ) {
+        self.update(|e| {
+            e.target = target;
+            e.location = location;
+            e.open = open;
+        });
+    }
+
+    /// What the daemon knows about this viewer.
+    #[cfg(test)]
+    pub fn entry(&self) -> ViewerEntry {
+        self.inner.lock().unwrap().entry.clone()
+    }
+
+    /// This viewer opened a location, or reconnected with it open.
+    pub fn send_location(&self, state: LocationState) {
+        self.inner
+            .lock()
+            .unwrap()
+            .send(Method::ViewerLocation(state));
+    }
+
+    /// This viewer changed a location's marks.
+    pub fn send_op(&self, key: LocationKey, op: crate::marks::Op) {
+        self.inner
+            .lock()
+            .unwrap()
+            .send(Method::ViewerOp { key, op });
+    }
+
+    /// This viewer closed a location.
+    pub fn send_close(&self, key: LocationKey) {
+        self.inner.lock().unwrap().send(Method::ViewerClose { key });
     }
 
     /// Answer a show or query event the daemon relays, under its id.
@@ -152,61 +195,47 @@ fn session(tx: &Sender<Msg>, link: &Link) -> Result<(), String> {
             return Err("daemon closed".to_string());
         }
         let msg = match ServerFrame::parse(&line) {
-            Ok(ServerFrame::Event(Event::Show {
-                viewer,
-                target,
-                view,
-                id,
-            })) if viewer == my_id => match view {
-                Some(view) => Msg::View(target, Box::new(view), id),
-                None => Msg::Show(target, id),
-            },
-            Ok(ServerFrame::Event(Event::Query { viewer, id, query })) if viewer == my_id => {
-                Msg::Query { id, query }
+            Ok(ServerFrame::Event(Event::Show { viewer, show, id })) if viewer == my_id => {
+                Msg::Show(Box::new(show), id)
             }
+            Ok(ServerFrame::Event(Event::Location { state, note })) => Msg::Location {
+                state: Box::new(state),
+                note,
+            },
             _ => continue,
         };
         tx.send(msg).map_err(|_| "ui gone")?;
     }
 }
 
-/// Ask the daemon to display `dir`, preferring a viewer on our workspace.
+/// Ask the daemon to show a location, preferring a viewer on our
+/// workspace: the files, and what to do to the marks.
 pub fn request_show(
     client: &mut proto::Client,
-    dir: PathBuf,
-    view: Option<proto::ViewSpec>,
+    location: String,
+    files: Vec<proto::FileSpec>,
+    marks: Vec<proto::MarkEntry>,
+    replace: bool,
+    user_asked: bool,
 ) -> Result<proto::ShowResult, String> {
     let workspace = wm::own_workspace();
     let v = client.call(Method::Show {
-        dir,
-        base: None,
+        location,
         workspace,
-        view,
+        files,
+        marks,
+        replace,
+        user_asked,
     })?;
     serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
-/// Ask the viewer on our workspace something and get its answer.
+/// Ask the daemon about marks.
 pub fn request_query(
     client: &mut proto::Client,
-    query: proto::ViewerQuery,
+    query: AgentQuery,
 ) -> Result<serde_json::Value, String> {
-    let workspace = wm::own_workspace();
-    client.call(Method::Query { workspace, query })
-}
-
-pub fn describe(r: &proto::ShowResult) -> String {
-    let Some(ws) = r.workspace.as_deref() else {
-        return format!("shown in viewer {}", r.viewer);
-    };
-    match r.picked_by.as_str() {
-        "same" => format!("shown in viewer {} on your workspace {ws}", r.viewer),
-        "nearest" => format!(
-            "shown in viewer {} on workspace {ws}, the nearest to yours",
-            r.viewer
-        ),
-        _ => format!("shown in viewer {} (workspace {ws})", r.viewer),
-    }
+    client.call(Method::Query { query })
 }
 
 fn one_shot() -> Result<proto::Client, String> {
@@ -221,25 +250,22 @@ pub fn connect() -> Result<proto::Client, String> {
     one_shot()
 }
 
-/// `codesnob show PATH [--range R]`: display in the best viewer and report.
-pub fn show(dir: PathBuf, range: Option<String>) -> Result<(), String> {
+/// `codesnob show LOCATION [FILES]`: display in the best viewer and report.
+pub fn show(location: String, files: Vec<String>) -> Result<(), String> {
     let mut client = one_shot()?;
-    let view = range.map(|r| proto::ViewSpec {
-        range: Some(r),
-        ..Default::default()
-    });
-    let r = request_show(&mut client, dir.clone(), view)?;
-    if !r.repo {
-        eprintln!("codesnob: {} is not inside a git repository", dir.display());
-    }
-    println!("{}", describe(&r));
+    let files = files
+        .into_iter()
+        .map(|path| proto::FileSpec { path, lines: None })
+        .collect();
+    let r = request_show(&mut client, location, files, Vec::new(), false, false)?;
+    println!("{}", r.render());
     Ok(())
 }
 
 /// `codesnob review`: the marks on a location, as an agent sees them.
-pub fn review(location: Option<String>, json: bool) -> Result<(), String> {
+pub fn review(location: String, letters: Vec<String>, json: bool) -> Result<(), String> {
     let mut client = one_shot()?;
-    let v = request_query(&mut client, proto::ViewerQuery::Review { location })?;
+    let v = request_query(&mut client, AgentQuery::Review { location, letters })?;
     if json {
         println!(
             "{}",
@@ -252,103 +278,18 @@ pub fn review(location: Option<String>, json: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// `codesnob clear`: remove marks on a location.
-pub fn clear(
-    location: Option<String>,
-    which: String,
-    letters: Vec<String>,
-    user_asked: bool,
-) -> Result<(), String> {
+/// `codesnob reply`: answer in the thread under a mark.
+pub fn reply(location: String, letter: String, text: String) -> Result<(), String> {
     let mut client = one_shot()?;
     let v = request_query(
         &mut client,
-        proto::ViewerQuery::ClearMarks {
-            location,
-            which,
-            letters,
-            user_asked,
-        },
-    )?;
-    let r: proto::ClearResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
-    println!("{}", r.render());
-    Ok(())
-}
-
-/// The locations of the viewer our requests reach, and the other viewers
-/// running, which they do not.
-pub fn describe_locations(r: &proto::LocationsResult, viewers: &[proto::ViewerEntry]) -> String {
-    let mut text = r.render();
-    let others: Vec<String> = viewers
-        .iter()
-        .filter(|v| v.id != r.viewer)
-        .map(|v| {
-            let ws = v
-                .workspace
-                .as_deref()
-                .map(|w| format!(" on workspace {w}"))
-                .unwrap_or_default();
-            let dir = v
-                .target
-                .as_ref()
-                .map(|t| format!(" ({})", t.dir.display()))
-                .unwrap_or_default();
-            format!("{}{ws}{dir}", v.id)
-        })
-        .collect();
-    if !others.is_empty() {
-        text.push_str(&format!(
-            "\nother viewers, which these requests do not reach: {}",
-            others.join(", ")
-        ));
-    }
-    text
-}
-
-/// Every location in the viewer our requests reach, and the other viewers.
-pub fn request_locations(client: &mut proto::Client) -> Result<String, String> {
-    let st: proto::StatusResult =
-        serde_json::from_value(client.call(Method::Status)?).map_err(|e| e.to_string())?;
-    let v = request_query(client, proto::ViewerQuery::Locations)?;
-    let r: proto::LocationsResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
-    Ok(describe_locations(&r, &st.viewers))
-}
-
-/// `codesnob locations`: what the viewer has open.
-pub fn locations(json: bool) -> Result<(), String> {
-    let mut client = one_shot()?;
-    if json {
-        let v = request_query(&mut client, proto::ViewerQuery::Locations)?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?
-        );
-        return Ok(());
-    }
-    println!("{}", request_locations(&mut client)?);
-    Ok(())
-}
-
-/// `codesnob reply`: answer one of the user's comments, under it.
-pub fn reply(location: Option<String>, letter: String, text: String) -> Result<(), String> {
-    let mut client = one_shot()?;
-    let v = request_query(
-        &mut client,
-        proto::ViewerQuery::Reply {
+        AgentQuery::Reply {
             location,
             letter,
             text,
         },
     )?;
     let r: proto::ReplyResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
-    println!("{}", r.render());
-    Ok(())
-}
-
-/// `codesnob move`: put one of the user's comments on other lines.
-pub fn move_comment(query: proto::ViewerQuery) -> Result<(), String> {
-    let mut client = one_shot()?;
-    let v = request_query(&mut client, query)?;
-    let r: proto::MoveResult = serde_json::from_value(v).map_err(|e| e.to_string())?;
     println!("{}", r.render());
     Ok(())
 }
@@ -397,6 +338,12 @@ pub fn status(json: bool) -> Result<(), String> {
                     .map(|t| t.dir.display().to_string())
                     .unwrap_or_default(),
             );
+        }
+    }
+    if !st.locations.is_empty() {
+        println!("locations:");
+        for l in &st.locations {
+            println!("  {}", l.render());
         }
     }
     Ok(())

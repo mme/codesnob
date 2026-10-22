@@ -1,38 +1,97 @@
 //! The flat diff: files, hunks and lines as one scrollable list of rows,
 //! with a sticky file header, line numbers, syntax and intra-line highlights.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Widget;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image, Resize};
 
 use super::Palette;
+use super::diagram::Picture;
 use crate::diff::{self, FileDiff, Kind, Status};
 use crate::git::FileChange;
 use crate::highlight::Highlighter;
+use crate::marks::Author;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Row {
     /// A line of the description block above the files.
     Desc(usize),
-    /// A highlight's number and note, above its lines.
+    /// A mark's letter and the first line of its text, below its lines.
     Mark(usize),
-    /// A reply under a mark's row: the mark's index, the reply's index.
-    Reply(usize, usize),
+    /// Line `k` (from 1) of a mark's text.
+    MarkLine(usize, usize),
+    /// A turn of the thread under a mark's row: the mark's index, the
+    /// turn's index.
+    Turn(usize, usize),
+    /// Line `k` (from 1) of a turn's text.
+    TurnLine(usize, usize, usize),
     File(usize),
     Hunk(usize, usize),
     Line(usize, usize, usize),
     Note(&'static str),
     Blank,
+    /// The comment or turn being typed, where it will go.
+    Compose,
+    /// Line `k` (from 1) of what is being typed.
+    ComposeLine(usize),
 }
 
-/// Who placed a mark.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Author {
-    /// A highlight an agent placed.
-    Agent,
-    /// A comment the user wrote.
-    User,
+impl Row {
+    /// Rows the cursor may rest on: not the spacing, nor what is being
+    /// typed. The continuation of some text rests it only when the text is
+    /// taller than the screen; see [`DiffView::move_cursor`].
+    fn rests(self) -> bool {
+        !matches!(self, Row::Blank | Row::Compose | Row::ComposeLine(_))
+    }
+
+    /// A row of some text after its first.
+    fn continues(self) -> bool {
+        matches!(self, Row::MarkLine(..) | Row::TurnLine(..))
+    }
+}
+
+/// A block of text rows placed after a line: a mark with its thread, or a
+/// comment being typed where no mark is yet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Block {
+    Mark(usize),
+    Compose,
+}
+
+/// The lines of some text: at least one, even when empty.
+fn text_lines(text: &str) -> std::str::Split<'_, char> {
+    text.split('\n')
+}
+
+/// A picture in some text, the same one as long as it is the same
+/// drawing.
+#[derive(Clone, Debug)]
+pub struct Pic(pub Arc<Picture>);
+
+impl PartialEq for Pic {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Pic {}
+
+/// The picture line `k` of some text falls in, if any, and how many lines
+/// into it.
+fn picture_at(pictures: &[(usize, Pic)], k: usize) -> Option<(&Pic, usize)> {
+    pictures
+        .iter()
+        .find(|(at, p)| (*at..*at + usize::from(p.0.rows)).contains(&k))
+        .map(|(at, p)| (p, k - at))
 }
 
 /// A mark as drawn: its file, its lines, its letter and text.
@@ -46,24 +105,54 @@ pub struct Mark {
     /// Its place in the order marks were made; a later mark wins the gutter.
     pub seq: usize,
     pub author: Author,
-    pub note: Option<String>,
+    /// The words on it.
+    pub comment: Option<String>,
+    /// Pictures among the words, each at the line it starts on; the lines
+    /// it takes are blank in `comment`.
+    pub pictures: Vec<(usize, Pic)>,
     /// Its lines no longer exist; drawn near where they were, untinted.
     pub stale: bool,
     /// Its lines are the old side's: deleted lines in a diff.
     pub old_side: bool,
-    /// The letter of the mark this one answers.
-    pub re: Option<String>,
-    /// The answers under it, oldest first.
-    pub replies: Vec<Reply>,
+    /// The thread under it, oldest first.
+    pub thread: Vec<Turn>,
 }
 
-/// An answer under a comment, drawn on a row of its own below it.
+/// A turn in the thread under a mark, drawn on a row of its own below it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Reply {
-    /// The comment's letter and its number under it: A1, A2…
-    pub label: String,
+pub struct Turn {
+    /// Its number under the mark.
+    pub n: usize,
     pub author: Author,
     pub text: String,
+    /// Pictures among the words, as on a mark.
+    pub pictures: Vec<(usize, Pic)>,
+}
+
+/// Text being typed, shown where it will go once saved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Composing {
+    pub at: ComposeAt,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComposeAt {
+    /// A new comment on lines `line` to `end` of `path`, with the letter
+    /// it will get.
+    Comment {
+        path: String,
+        line: usize,
+        end: usize,
+        old_side: bool,
+        label: String,
+    },
+    /// New text for the row of the mark `seq` names.
+    EditMark(usize),
+    /// A new turn at the end of the thread under mark `seq`.
+    Turn(usize),
+    /// New text for turn `n` under mark `seq`.
+    EditTurn(usize, usize),
 }
 
 /// Lines the user marked for a comment, in the terms marks are kept in.
@@ -78,11 +167,10 @@ pub struct Region {
     pub with_deletions: bool,
     /// The marked lines as they are now.
     pub text: Vec<String>,
-    /// The letter of the mark this comment answers, when made on its row.
-    pub re: Option<String>,
 }
 
 /// Where the cursor is, expressed in terms that survive a reload.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Anchor {
     path: String,
     /// (side, line number): side 0 is the old file, 1 the new file.
@@ -92,10 +180,26 @@ pub struct Anchor {
     /// The cursor was on a mark's own row: the mark, by its place in the
     /// order marks were made.
     at_mark: Option<usize>,
-    /// The cursor was on a reply under that mark: the reply, by index.
-    at_reply: Option<usize>,
+    /// The cursor was on a turn under that mark: the turn, by index and
+    /// by its number, which stays when turns before it go.
+    at_turn: Option<(usize, usize)>,
+    /// How many rows into that text the cursor was, for text taller than
+    /// the screen.
+    at_line: usize,
     /// How many rows below the top of the view the cursor sat.
     offset: usize,
+}
+
+impl Anchor {
+    /// The same place, wherever on the screen it sits.
+    pub fn same_place(&self, other: &Anchor) -> bool {
+        self.path == other.path
+            && self.line == other.line
+            && self.at_hunk == other.at_hunk
+            && self.at_mark == other.at_mark
+            && self.at_turn.map(|(_, n)| n) == other.at_turn.map(|(_, n)| n)
+            && self.at_line == other.at_line
+    }
 }
 
 #[derive(Default)]
@@ -121,14 +225,27 @@ pub struct DiffView {
     pub target: Option<(String, usize)>,
     /// Scroll to `target` at the next draw, once the screen height is known.
     pub place_target: bool,
-    /// Highlights, drawn over their lines.
+    /// The mark to open at then, by its place in the order marks were
+    /// made: the first one a show call placed. Else the first shown.
+    pub place_seq: Option<usize>,
+    /// Marks, drawn over their lines.
     marks: Vec<Mark>,
-    /// The row of each highlight's note, by number; `None` when not shown.
+    /// The row of each mark, by index; `None` when not shown.
     mark_rows: Vec<Option<usize>>,
-    /// The highlight last jumped to, by index; `<` and `>` go on from here.
+    /// The row of each mark's first line shown, by index; `None` when none
+    /// is, as for a stale mark.
+    mark_line_rows: Vec<Option<usize>>,
+    /// The mark last jumped to, by index; `<` and `>` go on from here.
     current_mark: Option<usize>,
     /// Rows being marked for a comment, drawn as a would-be mark.
     pub marking: Option<(usize, usize)>,
+    /// What is being typed, drawn where it will go.
+    compose: Option<Composing>,
+    /// The row showing it, when it has one of its own.
+    compose_row: Option<usize>,
+    /// Pictures encoded for the terminal, by picture, the rows of it shown
+    /// and how many, and where it starts on screen.
+    encoded: RefCell<HashMap<(usize, usize, u16, u16), Protocol>>,
 }
 
 impl DiffView {
@@ -169,10 +286,10 @@ impl DiffView {
         marks.sort_by_key(|m| (at(&m.path), m.start, m.end, m.seq));
         if self.marks != marks {
             let anchor = self.anchor();
-            // The same marks after a reload keep their place in order.
-            if self.marks.len() != marks.len() {
-                self.current_mark = None;
-            }
+            // The mark last jumped to stays that mark, wherever it now
+            // sorts; gone, there is none.
+            let current = self.current_mark.map(|i| self.marks[i].seq);
+            self.current_mark = current.and_then(|seq| marks.iter().position(|m| m.seq == seq));
             self.marks = marks;
             self.build_rows();
             if let Some(a) = anchor {
@@ -185,20 +302,131 @@ impl DiffView {
         self.mark_rows.iter().any(Option::is_some)
     }
 
-    /// Jump to highlight `i` (by index): its note comes into view and the
-    /// cursor lands on its first line.
+    /// Show what is being typed where it will go, and keep it in sight.
+    /// The rows change only when where it goes does.
+    pub fn set_compose(&mut self, compose: Option<Composing>) {
+        let shape = |c: Option<&Composing>| c.map(|c| (c.at.clone(), text_lines(&c.text).count()));
+        let moved = shape(self.compose.as_ref()) != shape(compose.as_ref());
+        if moved {
+            // Taken while the rows, and what is typed on them, still stand.
+            let anchor = self.anchor();
+            self.compose = compose;
+            self.build_rows();
+            if let Some(a) = anchor {
+                self.restore(a);
+            }
+        } else {
+            self.compose = compose;
+        }
+        let shown = match self.compose.as_ref().map(|c| &c.at) {
+            Some(ComposeAt::Comment { .. } | ComposeAt::Turn(_)) => self.compose_row,
+            Some(ComposeAt::EditMark(seq)) => self.row_of_mark(*seq),
+            Some(ComposeAt::EditTurn(seq, n)) => self.row_of_turn(*seq, *n),
+            None => None,
+        };
+        if let Some(row) = shown {
+            // The cursor sits on what is being typed, and the view shows
+            // its last line, scrolling just enough.
+            self.cursor = row;
+            let lines = self
+                .compose
+                .as_ref()
+                .map_or(1, |c| text_lines(&c.text).count());
+            let last = row + lines - 1;
+            for _ in 0..2 {
+                let visible = self.visible_at(self.scroll);
+                if last + 1 > self.scroll + visible {
+                    self.scroll = (last + 1).saturating_sub(visible);
+                }
+            }
+            if row < self.scroll {
+                self.scroll = row;
+            }
+        }
+    }
+
+    fn row_of_mark(&self, seq: usize) -> Option<usize> {
+        self.marks
+            .iter()
+            .position(|m| m.seq == seq)
+            .and_then(|i| self.mark_rows.get(i).copied().flatten())
+    }
+
+    fn row_of_turn(&self, seq: usize, n: usize) -> Option<usize> {
+        let i = self.marks.iter().position(|m| m.seq == seq)?;
+        let t = self.marks[i].thread.iter().position(|t| t.n == n)?;
+        self.rows.iter().position(|r| *r == Row::Turn(i, t))
+    }
+
+    /// Where the terminal's cursor belongs while typing: after the text,
+    /// on the last row that shows it. `area` is where the view was drawn.
+    pub fn compose_cursor(&self, area: Rect) -> Option<(u16, u16)> {
+        let c = self.compose.as_ref()?;
+        let (row, prefix) = match &c.at {
+            ComposeAt::Comment { label, .. } => (self.compose_row?, 2 + label.len() + 3 + 5),
+            ComposeAt::Turn(_) => (self.compose_row?, 6 + 5),
+            ComposeAt::EditMark(seq) => {
+                let row = self.row_of_mark(*seq)?;
+                let m = &self.marks[self.marks.iter().position(|m| m.seq == *seq)?];
+                let who = if m.author == Author::User { 5 } else { 0 };
+                (row, 2 + m.label.len() + 3 + who)
+            }
+            ComposeAt::EditTurn(seq, n) => {
+                let row = self.row_of_turn(*seq, *n)?;
+                let m = &self.marks[self.marks.iter().position(|m| m.seq == *seq)?];
+                let t = m.thread.iter().find(|t| t.n == *n)?;
+                let who = match t.author {
+                    Author::User => "you: ".len(),
+                    Author::Agent => "agent: ".len(),
+                };
+                (row, 6 + who)
+            }
+        };
+        let lines: Vec<&str> = text_lines(&c.text).collect();
+        let row = row + lines.len() - 1;
+        let last = lines.last().map_or(0, |l| l.chars().count());
+        if row < self.scroll {
+            return None;
+        }
+        let sticky =
+            self.top_file().is_some() && !matches!(self.rows.get(self.scroll), Some(Row::File(_)));
+        let y = area.y + (row - self.scroll) as u16 + u16::from(sticky);
+        if y >= area.bottom() {
+            return None;
+        }
+        let x = area.x + (prefix + last) as u16;
+        Some((x.min(area.right().saturating_sub(1)), y))
+    }
+
+    /// Jump to mark `i` (by index): its first line comes to the top, with
+    /// its text below the lines, and the cursor lands on that first line.
+    /// A mark with no line shown, as a stale one, is opened at its text.
     fn go_to_mark(&mut self, i: usize) -> bool {
-        match self.mark_rows.get(i).copied().flatten() {
+        let row = self.mark_rows.get(i).copied().flatten();
+        let line = self.mark_line_rows.get(i).copied().flatten();
+        match line.or(row) {
             Some(row) => {
                 self.jump_to(row);
-                let below = self.below_mark(row);
-                if matches!(self.rows.get(below), Some(Row::Line(..))) {
-                    self.cursor = below;
-                }
                 self.current_mark = Some(i);
                 true
             }
             None => false,
+        }
+    }
+
+    /// The row the mark `seq` names starts at: its first line shown, else
+    /// its text; `None` when it is not shown.
+    pub fn start_row(&self, seq: usize) -> Option<usize> {
+        let i = self.marks.iter().position(|m| m.seq == seq)?;
+        self.mark_line_rows[i].or(self.mark_rows[i])
+    }
+
+    /// Put the cursor on the row of the mark `seq` names, scrolling only as
+    /// far as needed.
+    pub fn rest_on_mark(&mut self, seq: usize) {
+        if let Some(row) = self.row_of_mark(seq) {
+            self.cursor = row;
+            self.follow();
         }
     }
 
@@ -207,7 +435,36 @@ impl DiffView {
         (0..self.mark_rows.len()).any(|i| self.go_to_mark(i))
     }
 
-    /// Jump to the highlight covering `line` of `path`, if one is shown.
+    /// Jump to turn `n` under the mark `seq` names, if it is shown: the
+    /// mark's row at the top, the cursor on the turn.
+    pub fn go_to_turn(&mut self, seq: usize, n: usize) -> bool {
+        let Some(i) = self.marks.iter().position(|m| m.seq == seq) else {
+            return false;
+        };
+        let top = self.mark_line_rows.get(i).copied().flatten().or(self
+            .mark_rows
+            .get(i)
+            .copied()
+            .flatten());
+        let (Some(top), Some(turn_row)) = (top, self.row_of_turn(seq, n)) else {
+            return false;
+        };
+        self.jump_to(top);
+        self.cursor = turn_row;
+        self.follow();
+        self.current_mark = Some(i);
+        true
+    }
+
+    /// Open at the mark `seq` names, if it is shown.
+    pub fn go_to_seq(&mut self, seq: usize) -> bool {
+        self.marks
+            .iter()
+            .position(|m| m.seq == seq)
+            .is_some_and(|i| self.go_to_mark(i))
+    }
+
+    /// Jump to the mark covering `line` of `path`, if one is shown.
     pub fn mark_at(&mut self, path: &str, line: usize) -> bool {
         self.marks
             .iter()
@@ -244,39 +501,79 @@ impl DiffView {
     }
 
     /// The marks shown, as (row, index), top to bottom.
+    /// The marks shown, as (the row each starts at, its index), top to
+    /// bottom. A mark starts at its first line, or at its text when no
+    /// line of its is shown.
     fn shown_marks(&self) -> Vec<(usize, usize)> {
-        let mut rows: Vec<(usize, usize)> = self
-            .mark_rows
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| r.map(|r| (r, i)))
+        let mut rows: Vec<(usize, usize)> = (0..self.marks.len())
+            .filter_map(|i| self.mark_line_rows[i].or(self.mark_rows[i]).map(|r| (r, i)))
             .collect();
         rows.sort_unstable();
         rows
     }
 
-    /// The next mark below the cursor.
+    /// Where the cursor is among the marks shown: the mark it was last
+    /// taken to, when it is still on that mark's first row.
+    fn at_mark(&self, marks: &[(usize, usize)]) -> Option<usize> {
+        let current = self.current_mark?;
+        marks
+            .iter()
+            .position(|(r, i)| *i == current && *r == self.cursor)
+    }
+
+    /// The next mark below the cursor; from a mark, the one after it,
+    /// though it start on the same line.
     pub fn next_mark(&mut self) {
-        let next = self
-            .shown_marks()
-            .into_iter()
-            .find(|(r, _)| *r > self.cursor);
+        let marks = self.shown_marks();
+        let next = match self.at_mark(&marks) {
+            Some(pos) => marks.get(pos + 1).copied(),
+            None => marks.iter().find(|(r, _)| *r > self.cursor).copied(),
+        };
         if let Some((_, i)) = next {
             self.go_to_mark(i);
         }
     }
 
-    /// The mark above the cursor; the mark whose row, replies or first
-    /// line the cursor is on is where we are, not where we go.
+    /// The mark above the cursor; the mark whose lines, row or replies the
+    /// cursor is on is where we are, not where we go.
     pub fn prev_mark(&mut self) {
         let marks = self.shown_marks();
+        if let Some(pos) = self.at_mark(&marks) {
+            if let Some(&(_, i)) = pos.checked_sub(1).and_then(|p| marks.get(p)) {
+                self.go_to_mark(i);
+            }
+            return;
+        }
+        // The innermost of the marks the cursor is in: the one starting last.
         let here = marks
             .iter()
-            .find(|(r, _)| (*r..=self.below_mark(*r)).contains(&self.cursor))
-            .map_or(self.cursor, |(r, _)| *r);
+            .filter(|(r, i)| (*r..=self.block_end(*i)).contains(&self.cursor))
+            .map(|(r, _)| *r)
+            .max()
+            .unwrap_or(self.cursor);
         if let Some((_, i)) = marks.into_iter().rev().find(|(r, _)| *r < here) {
             self.go_to_mark(i);
         }
+    }
+
+    /// The last row of mark `i` (by index): the end of its thread, or of
+    /// what is being typed under it.
+    fn block_end(&self, i: usize) -> usize {
+        let Some(mut r) = self.mark_rows.get(i).copied().flatten() else {
+            return 0;
+        };
+        while matches!(
+            self.rows.get(r + 1),
+            Some(
+                Row::MarkLine(m, _) | Row::Turn(m, _) | Row::TurnLine(m, _, _)
+            ) if *m == i
+        ) || matches!(
+            self.rows.get(r + 1),
+            Some(Row::Compose | Row::ComposeLine(_))
+        ) {
+            r += 1;
+        }
+        r
     }
 
     /// The mark covering a line of file `fi`, if any: the newest when
@@ -295,23 +592,33 @@ impl DiffView {
         self.cursor
     }
 
-    /// The first row below mark row `row` and the replies under it.
-    fn below_mark(&self, row: usize) -> usize {
-        let mut r = row + 1;
-        while matches!(self.rows.get(r), Some(Row::Reply(..))) {
-            r += 1;
-        }
-        r
-    }
-
-    /// The reply whose row the cursor is on: its comment, by its place in
-    /// the order marks were made, and the reply, by index.
-    pub fn reply_at_cursor(&self) -> Option<(usize, usize, &Reply)> {
-        let Row::Reply(m, r) = *self.rows.get(self.cursor)? else {
+    /// The turn whose row the cursor is on: its mark, by its place in the
+    /// order marks were made, and the turn.
+    pub fn turn_at_cursor(&self) -> Option<(usize, &Turn)> {
+        let (Row::Turn(m, t) | Row::TurnLine(m, t, _)) = *self.rows.get(self.cursor)? else {
             return None;
         };
         let mark = &self.marks[m];
-        Some((mark.seq, r, &mark.replies[r]))
+        Some((mark.seq, &mark.thread[t]))
+    }
+
+    /// The mark under the cursor, anyone's, by its place in the order marks
+    /// were made: the newest covering the cursor's line, or the one whose
+    /// row the cursor is on.
+    pub fn any_mark_at_cursor(&self) -> Option<usize> {
+        match self.rows.get(self.cursor)? {
+            Row::Mark(m) | Row::MarkLine(m, _) => Some(self.marks[*m].seq),
+            Row::Line(fi, hi, li) => {
+                let f = &self.files[*fi];
+                let line = &f.hunks[*hi].lines[*li];
+                self.marks
+                    .iter()
+                    .filter(|m| !m.stale && m.path == f.path && m.covers(f, line))
+                    .max_by_key(|m| m.seq)
+                    .map(|m| m.seq)
+            }
+            _ => None,
+        }
     }
 
     /// The user's comment under the cursor, by its place in the order marks
@@ -319,7 +626,7 @@ impl DiffView {
     /// row the cursor is on.
     pub fn comment_at_cursor(&self) -> Option<usize> {
         match self.rows.get(self.cursor)? {
-            Row::Mark(m) => {
+            Row::Mark(m) | Row::MarkLine(m, _) => {
                 let mark = &self.marks[*m];
                 (mark.author == Author::User).then_some(mark.seq)
             }
@@ -339,33 +646,6 @@ impl DiffView {
             }
             _ => None,
         }
-    }
-
-    /// The agent's highlight whose row the cursor is on, as a region to
-    /// comment on: the same lines, answering that letter.
-    pub fn highlight_at_cursor(&self) -> Option<Region> {
-        let Row::Mark(m) = *self.rows.get(self.cursor)? else {
-            return None;
-        };
-        let mark = &self.marks[m];
-        if mark.author != Author::Agent {
-            return None;
-        }
-        let f = self.files.iter().find(|f| f.path == mark.path)?;
-        let old = mark.old_side || f.status == Status::Deleted;
-        let lines = if old { &f.old_lines } else { &f.new_lines };
-        Some(Region {
-            path: mark.path.clone(),
-            start: mark.start,
-            end: mark.end,
-            old_side: mark.old_side,
-            with_deletions: false,
-            text: lines
-                .get(mark.start - 1..mark.end)
-                .map(<[String]>::to_vec)
-                .unwrap_or_default(),
-            re: Some(mark.label.clone()),
-        })
     }
 
     /// The lines between rows `a` and `b` (either order) as a region to
@@ -414,7 +694,6 @@ impl DiffView {
             old_side,
             with_deletions: deletions && !old_side,
             text,
-            re: None,
         })
     }
 
@@ -552,68 +831,120 @@ impl DiffView {
         self.rows.clear();
         self.file_starts.clear();
         self.hunk_starts.clear();
+        self.compose_row = None;
         self.mark_rows = vec![None; self.marks.len()];
+        self.mark_line_rows = vec![None; self.marks.len()];
         let mut placed = vec![false; self.marks.len()];
+        let compose_at = self.compose.as_ref().map(|c| c.at.clone());
         let mut max_no = 1;
         for i in 0..self.desc.len() {
             self.rows.push(Row::Desc(i));
         }
-        for (fi, f) in self.files.iter().enumerate() {
+        for fi in 0..self.files.len() {
             if !self.only.is_empty() && !self.only.contains(&fi) {
                 continue;
             }
-            if !self.rows.is_empty() {
-                self.rows.push(Row::Blank);
-            }
-            self.file_starts.push(self.rows.len());
-            self.rows.push(Row::File(fi));
-            if f.binary {
-                self.rows.push(Row::Note("binary file"));
+            // What the file is, taken first: the rows are pushed through
+            // methods that need the whole view.
+            let f = &self.files[fi];
+            let path = f.path.clone();
+            let note = if f.binary {
+                Some("binary file")
             } else if f.hunks.is_empty() {
-                self.rows.push(Row::Note("no textual changes"));
-            }
+                Some("no textual changes")
+            } else {
+                None
+            };
             max_no = max_no.max(f.old_lines.len()).max(f.new_lines.len());
             // A plain file shown whole needs no hunk header.
             let whole = f.plain
                 && f.hunks.len() == 1
                 && f.hunks[0].new_start == 1
                 && f.hunks[0].new_count == f.new_lines.len();
-            for (hi, h) in f.hunks.iter().enumerate() {
+            let hunk_lens: Vec<usize> = f.hunks.iter().map(|h| h.lines.len()).collect();
+            // Every line of the file shown, in order, with the numbers a
+            // mark names it by: the new side's (or the file's) and the old.
+            let nos: Vec<(Option<usize>, Option<usize>)> = f
+                .hunks
+                .iter()
+                .flat_map(|h| h.lines.iter())
+                .map(|l| (mark_no(f, l, false), mark_no(f, l, true)))
+                .collect();
+            let no_of = |idx: usize, old_side: bool| if old_side { nos[idx].1 } else { nos[idx].0 };
+            let lines = nos.len();
+            if !self.rows.is_empty() {
+                self.rows.push(Row::Blank);
+            }
+            self.file_starts.push(self.rows.len());
+            self.rows.push(Row::File(fi));
+            if let Some(note) = note {
+                self.rows.push(Row::Note(note));
+            }
+            // Where each block of text goes: after the line at `after`, or
+            // before the first line when `None` and placed. And which line
+            // each mark starts at, as (line, mark).
+            let mut after: Vec<(Option<usize>, Block)> = Vec::new();
+            let mut firsts: Vec<(usize, usize)> = Vec::new();
+            for (m, mark) in self.marks.iter().enumerate() {
+                if placed[m] || mark.path != path {
+                    continue;
+                }
+                let (first, last) = if mark.stale {
+                    // Near where its lines were: after the last line before.
+                    let before = (0..lines)
+                        .rev()
+                        .find(|&i| no_of(i, mark.old_side).is_some_and(|no| no < mark.start));
+                    (None, before)
+                } else {
+                    let mut hit = (0..lines).filter(|&i| {
+                        no_of(i, mark.old_side)
+                            .is_some_and(|no| (mark.start..=mark.end).contains(&no))
+                    });
+                    let Some(first) = hit.next() else {
+                        continue;
+                    };
+                    (Some(first), Some(hit.next_back().unwrap_or(first)))
+                };
+                placed[m] = true;
+                if let Some(first) = first {
+                    firsts.push((first, m));
+                }
+                after.push((last, Block::Mark(m)));
+            }
+            if let Some(ComposeAt::Comment {
+                path: at,
+                line,
+                end,
+                old_side,
+                ..
+            }) = &compose_at
+                && self.compose_row.is_none()
+                && *at == path
+                && let Some(last) = (0..lines)
+                    .rev()
+                    .find(|&i| no_of(i, *old_side).is_some_and(|no| (*line..=*end).contains(&no)))
+            {
+                after.push((Some(last), Block::Compose));
+            }
+            // Blocks with no line before them open the file.
+            for (_, b) in after.iter().filter(|(a, _)| a.is_none()) {
+                self.push_block(*b, &compose_at);
+            }
+            let mut idx = 0;
+            for (hi, &len) in hunk_lens.iter().enumerate() {
                 self.hunk_starts.push(self.rows.len());
                 if !whole {
                     self.rows.push(Row::Hunk(fi, hi));
                 }
-                for li in 0..h.lines.len() {
-                    // A mark's row goes above its first line shown; a stale
-                    // mark's above the first line at or past where it was.
-                    for (m, mark) in self.marks.iter().enumerate() {
-                        let Some(no) = mark_no(f, &h.lines[li], mark.old_side) else {
-                            continue;
-                        };
-                        let here = if mark.stale {
-                            no >= mark.start
-                        } else {
-                            (mark.start..=mark.end).contains(&no)
-                        };
-                        if !placed[m] && mark.path == f.path && here {
-                            placed[m] = true;
-                            self.mark_rows[m] = Some(self.rows.len());
-                            self.rows.push(Row::Mark(m));
-                            self.rows
-                                .extend((0..mark.replies.len()).map(|r| Row::Reply(m, r)));
-                        }
+                for li in 0..len {
+                    for &(_, m) in firsts.iter().filter(|(i, _)| *i == idx) {
+                        self.mark_line_rows[m] = Some(self.rows.len());
                     }
                     self.rows.push(Row::Line(fi, hi, li));
-                }
-            }
-            // A stale mark past every line shown ends the file.
-            for (m, mark) in self.marks.iter().enumerate() {
-                if !placed[m] && mark.stale && mark.path == f.path {
-                    placed[m] = true;
-                    self.mark_rows[m] = Some(self.rows.len());
-                    self.rows.push(Row::Mark(m));
-                    self.rows
-                        .extend((0..mark.replies.len()).map(|r| Row::Reply(m, r)));
+                    for (_, b) in after.iter().filter(|(a, _)| *a == Some(idx)) {
+                        self.push_block(*b, &compose_at);
+                    }
+                    idx += 1;
                 }
             }
         }
@@ -627,14 +958,71 @@ impl DiffView {
         self.fit();
     }
 
+    /// The rows of a mark's text, its thread, and what is being typed
+    /// under it, or of a comment being typed on lines with no mark yet.
+    fn push_block(&mut self, block: Block, compose_at: &Option<ComposeAt>) {
+        match block {
+            Block::Mark(m) => {
+                self.mark_rows[m] = Some(self.rows.len());
+                self.rows.push(Row::Mark(m));
+                let n = text_lines(&self.mark_text(m)).count();
+                self.rows.extend((1..n).map(|k| Row::MarkLine(m, k)));
+                for t in 0..self.marks[m].thread.len() {
+                    self.rows.push(Row::Turn(m, t));
+                    let n = text_lines(&self.turn_text(m, t)).count();
+                    self.rows.extend((1..n).map(|k| Row::TurnLine(m, t, k)));
+                }
+                if *compose_at == Some(ComposeAt::Turn(self.marks[m].seq)) {
+                    self.push_block(Block::Compose, compose_at);
+                }
+            }
+            Block::Compose => {
+                self.compose_row = Some(self.rows.len());
+                self.rows.push(Row::Compose);
+                let n = self
+                    .compose
+                    .as_ref()
+                    .map_or(1, |c| text_lines(&c.text).count());
+                self.rows.extend((1..n).map(Row::ComposeLine));
+            }
+        }
+    }
+
+    /// A mark's text as shown: what is being typed for it, else its own.
+    fn mark_text(&self, m: usize) -> String {
+        let mark = &self.marks[m];
+        self.compose
+            .as_ref()
+            .filter(|c| c.at == ComposeAt::EditMark(mark.seq))
+            .map(|c| c.text.clone())
+            .or_else(|| mark.comment.clone())
+            .unwrap_or_default()
+    }
+
+    /// A turn's text as shown: what is being typed for it, else its own.
+    fn turn_text(&self, m: usize, t: usize) -> String {
+        let mark = &self.marks[m];
+        let turn = &mark.thread[t];
+        self.compose
+            .as_ref()
+            .filter(|c| c.at == ComposeAt::EditTurn(mark.seq, turn.n))
+            .map_or_else(|| turn.text.clone(), |c| c.text.clone())
+    }
+
     // ---- position --------------------------------------------------------
 
     pub fn anchor(&self) -> Option<Anchor> {
-        let fi = self.current_file()?;
+        self.anchor_of(self.cursor)
+    }
+
+    /// Where `row` is, in terms that survive a reload.
+    pub fn anchor_of(&self, row: usize) -> Option<Anchor> {
+        let fi = self.file_at(row)?;
         let path = self.files[fi].path.clone();
         let mut at_mark = None;
-        let mut at_reply = None;
-        let (line, at_hunk) = match self.rows.get(self.cursor)? {
+        let mut at_turn = None;
+        let mut at_line = 0;
+        let (line, at_hunk) = match self.rows.get(row)? {
             Row::Line(fi, hi, li) => {
                 let l = &self.files[*fi].hunks[*hi].lines[*li];
                 (l.new_no.map(|n| (1, n)).or(l.old_no.map(|n| (0, n))), false)
@@ -648,17 +1036,36 @@ impl DiffView {
                 };
                 (Some(at), true)
             }
-            // A mark's row or a reply's: the mark's first line, and the row
+            // A mark's row or a turn's: the mark's first line, and the row
             // itself if it stays.
-            Row::Mark(m) | Row::Reply(m, _) => {
+            Row::Mark(m) | Row::MarkLine(m, _) | Row::Turn(m, _) | Row::TurnLine(m, _, _) => {
                 let mark = &self.marks[*m];
                 at_mark = Some(mark.seq);
-                if let Row::Reply(_, r) = self.rows[self.cursor] {
-                    at_reply = Some(r);
+                match self.rows[row] {
+                    Row::Turn(_, t) => at_turn = Some((t, mark.thread[t].n)),
+                    Row::TurnLine(_, t, k) => {
+                        at_turn = Some((t, mark.thread[t].n));
+                        at_line = k;
+                    }
+                    Row::MarkLine(_, k) => at_line = k,
+                    _ => {}
                 }
                 let old = mark.old_side || self.files[fi].status == Status::Deleted;
                 (Some((if old { 0 } else { 1 }, mark.start)), false)
             }
+            // What is being typed: once saved, the cursor belongs on it.
+            Row::Compose | Row::ComposeLine(_) => match self.compose.as_ref().map(|c| &c.at) {
+                Some(ComposeAt::Comment { line, old_side, .. }) => {
+                    let old = *old_side || self.files[fi].status == Status::Deleted;
+                    (Some((if old { 0 } else { 1 }, *line)), false)
+                }
+                Some(ComposeAt::Turn(seq)) => {
+                    at_mark = Some(*seq);
+                    at_turn = Some((usize::MAX, usize::MAX));
+                    (None, false)
+                }
+                _ => (None, false),
+            },
             _ => (None, false),
         };
         Some(Anchor {
@@ -666,20 +1073,27 @@ impl DiffView {
             line,
             at_hunk,
             at_mark,
-            at_reply,
-            offset: self.cursor - self.scroll,
+            at_turn,
+            at_line,
+            offset: row.saturating_sub(self.scroll),
         })
     }
 
     pub fn restore(&mut self, a: Anchor) {
-        let Some(fi) = self.files.iter().position(|f| f.path == a.path) else {
+        let Some(row) = self.locate(&a) else {
             self.fit();
             return;
         };
-        let Some(start) = self.file_row(fi) else {
-            self.fit();
-            return;
-        };
+        self.cursor = row;
+        self.scroll = self.cursor.saturating_sub(a.offset);
+        self.fit();
+    }
+
+    /// The row `a` names now, if its file is still shown: the same line,
+    /// or the nearest; the same mark's row or turn when it was on one.
+    pub fn locate(&self, a: &Anchor) -> Option<usize> {
+        let fi = self.files.iter().position(|f| f.path == a.path)?;
+        let start = self.file_row(fi)?;
         let end = self
             .file_starts
             .iter()
@@ -699,7 +1113,7 @@ impl DiffView {
                 }
             }
         }
-        self.cursor = match best {
+        let mut at = match best {
             // Back onto the hunk header when we were on one.
             Some((_, r)) if a.at_hunk => self
                 .hunk_starts
@@ -711,28 +1125,33 @@ impl DiffView {
             Some((_, r)) => r,
             None => start,
         };
-        // Back onto the mark's row, or the reply's under it, when we were on
-        // one and it is still there, among the rows of the marks above the
-        // line.
-        if let Some(seq) = a.at_mark {
-            let mut r = self.cursor;
-            while r > 0
-                && let Some(Row::Mark(m) | Row::Reply(m, _)) = self.rows.get(r - 1)
-            {
-                r -= 1;
-                if matches!(self.rows[r], Row::Mark(_)) && self.marks[*m].seq == seq {
-                    // A reply that went leaves the cursor on the one above.
-                    let replies = self.marks[*m].replies.len();
-                    self.cursor = match a.at_reply {
-                        Some(i) if replies > 0 => r + 1 + i.min(replies - 1),
-                        _ => r,
-                    };
-                    break;
+        // Back onto the mark's row, or the turn's under it, when we were on
+        // one and it is still there.
+        if let Some(seq) = a.at_mark
+            && let Some(m) = self.marks.iter().position(|m| m.seq == seq)
+            && let Some(row) = self.mark_rows[m]
+        {
+            // The same turn by its number; a turn that went leaves the
+            // cursor where it was in the thread, or at the thread's end.
+            let thread = &self.marks[m].thread;
+            at = match a.at_turn {
+                Some((i, n)) if !thread.is_empty() => {
+                    let t = thread
+                        .iter()
+                        .position(|t| t.n == n)
+                        .unwrap_or(i.min(thread.len() - 1));
+                    self.rows
+                        .iter()
+                        .position(|r| *r == Row::Turn(m, t))
+                        .unwrap_or(row)
                 }
-            }
+                _ => row,
+            };
+            // As far into the text as before, while it has the rows.
+            let (_, end) = self.text_span(at);
+            at = (at + a.at_line).min(end);
         }
-        self.scroll = self.cursor.saturating_sub(a.offset);
-        self.fit();
+        Some(at)
     }
 
     fn max_scroll(&self) -> usize {
@@ -751,7 +1170,7 @@ impl DiffView {
     /// (then the other way) past blank rows.
     fn settle_cursor(&mut self, dir: isize) {
         self.cursor = self.cursor.min(self.max_scroll());
-        let rests = |v: &Self, r: usize| !matches!(v.rows.get(r), Some(Row::Blank));
+        let rests = |v: &Self, r: usize| v.rows.get(r).is_some_and(|row| row.rests());
         if rests(self, self.cursor) {
             return;
         }
@@ -788,7 +1207,29 @@ impl DiffView {
                 self.scroll = (self.cursor + 1).saturating_sub(visible);
             }
         }
+        // On the first row of a block of text, the whole block when it fits.
+        let end = self.block_end_at(self.cursor);
+        let visible = self.visible_at(self.scroll);
+        if end > self.cursor && end - self.cursor < visible && end + 1 > self.scroll + visible {
+            self.scroll = end + 1 - visible;
+        }
         self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// The last row of the block of text starting at `row`: the thread
+    /// under a mark, what is typed under it, or `row` itself.
+    fn block_end_at(&self, row: usize) -> usize {
+        match self.rows.get(row) {
+            Some(Row::Mark(m) | Row::Turn(m, _)) => self.block_end(*m),
+            Some(Row::Compose) => {
+                let mut r = row;
+                while matches!(self.rows.get(r + 1), Some(Row::ComposeLine(_))) {
+                    r += 1;
+                }
+                r
+            }
+            _ => row,
+        }
     }
 
     /// Keep scroll and cursor within the rows, and the cursor in sight.
@@ -841,11 +1282,53 @@ impl DiffView {
     }
 
     /// Move the cursor by `delta` rows; the view scrolls to keep up.
+    /// Move the cursor `delta` rows, one stop at a time. A text's rows
+    /// after its first are one stop with it while the text fits on the
+    /// screen; a taller text is walked row by row, so all of it can be seen.
     pub fn move_cursor(&mut self, delta: isize) {
-        let max = self.max_scroll() as isize;
-        self.cursor = (self.cursor as isize + delta).clamp(0, max) as usize;
-        self.settle_cursor(delta.signum());
+        let dir = delta.signum();
+        for _ in 0..delta.unsigned_abs() {
+            let mut r = self.cursor;
+            while let Some(next) = r.checked_add_signed(dir).filter(|&n| n < self.rows.len()) {
+                r = next;
+                let row = self.rows[r];
+                if !row.rests() || row.continues() && self.text_fits(r) {
+                    continue;
+                }
+                self.cursor = r;
+                break;
+            }
+        }
         self.follow();
+    }
+
+    /// Whether the text the row `r` belongs to fits on the screen.
+    fn text_fits(&self, r: usize) -> bool {
+        let (start, end) = self.text_span(r);
+        end - start < self.visible_at(self.scroll)
+    }
+
+    /// The first and last row of the text `r` is a row of: a mark's words
+    /// or a turn's.
+    fn text_span(&self, r: usize) -> (usize, usize) {
+        let same = |a: Row, b: Row| match (a, b) {
+            (Row::Mark(m) | Row::MarkLine(m, _), Row::Mark(n) | Row::MarkLine(n, _)) => m == n,
+            (
+                Row::Turn(m, t) | Row::TurnLine(m, t, _),
+                Row::Turn(n, u) | Row::TurnLine(n, u, _),
+            ) => m == n && t == u,
+            _ => false,
+        };
+        let row = self.rows[r];
+        let mut start = r;
+        while start > 0 && same(row, self.rows[start - 1]) {
+            start -= 1;
+        }
+        let mut end = r;
+        while end + 1 < self.rows.len() && same(row, self.rows[end + 1]) {
+            end += 1;
+        }
+        (start, end)
     }
 
     /// Move the view by `delta` rows, the cursor keeping its place on the
@@ -898,8 +1381,13 @@ impl DiffView {
             return;
         };
         let row = self.scroll + y;
-        if row < self.rows.len() && !matches!(self.rows[row], Row::Blank) {
-            self.cursor = row;
+        if self.rows.get(row).is_some_and(|r| r.rests()) {
+            // A click into text that fits on the screen is a click on it.
+            self.cursor = if self.rows[row].continues() && self.text_fits(row) {
+                self.text_span(row).0
+            } else {
+                row
+            };
             self.follow();
         }
     }
@@ -943,7 +1431,14 @@ impl DiffView {
 
     // ---- rendering --------------------------------------------------------
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer, p: &Palette, hl: &mut Highlighter) {
+    pub fn render(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        p: &Palette,
+        hl: &mut Highlighter,
+        picker: Option<&Picker>,
+    ) {
         let mut y = area.y;
         let mut idx = self.scroll;
         // Sticky header unless the real header is the first visible row.
@@ -958,7 +1453,7 @@ impl DiffView {
                 break;
             };
             let line = Rect::new(area.x, y, area.width, 1);
-            self.render_row(idx, row, line, buf, p, hl);
+            self.render_row(idx, row, line, buf, p, hl, picker);
             if idx == self.cursor {
                 self.render_cursor(row, line, buf, p);
             }
@@ -968,6 +1463,7 @@ impl DiffView {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn render_row(
         &self,
         idx: usize,
@@ -976,49 +1472,93 @@ impl DiffView {
         buf: &mut Buffer,
         p: &Palette,
         hl: &mut Highlighter,
+        picker: Option<&Picker>,
     ) {
         match row {
-            Row::Mark(m) => {
+            Row::Mark(m) | Row::MarkLine(m, _) => {
+                let k = if let Row::MarkLine(_, k) = row { k } else { 0 };
                 let mark = &self.marks[m];
                 let (bg, fg) = p.mark_colors(mark.author);
                 let tint = Style::default().bg(bg);
                 buf.set_style(area, tint);
-                let mut spans = vec![Span::styled(
+                let editing = self
+                    .compose
+                    .as_ref()
+                    .is_some_and(|c| c.at == ComposeAt::EditMark(mark.seq));
+                let mut lead = vec![Span::styled(
                     format!("  [{}] ", mark.label),
                     tint.fg(fg).add_modifier(Modifier::BOLD),
                 )];
-                if mark.stale {
-                    spans.push(Span::styled("stale · ", tint.fg(p.note_fg)));
+                if mark.stale && !editing {
+                    lead.push(Span::styled("stale · ", tint.fg(p.note_fg)));
                 }
                 if mark.author == Author::User {
-                    let who = match &mark.re {
-                        Some(re) => format!("you re [{re}]: "),
-                        None => "you: ".to_string(),
-                    };
-                    spans.push(Span::styled(who, tint.fg(fg).add_modifier(Modifier::BOLD)));
+                    lead.push(Span::styled(
+                        "you: ",
+                        tint.fg(fg).add_modifier(Modifier::BOLD),
+                    ));
                 }
-                if let Some(note) = &mark.note {
-                    spans.push(Span::styled(note.clone(), tint.fg(fg)));
+                // While its source is edited, the words are what is shown. A
+                // picture on the first row still has the lead before it.
+                if !editing && let Some((pic, into)) = picture_at(&mark.pictures, k) {
+                    let lead_w: usize = lead.iter().map(|s| s.content.chars().count()).sum();
+                    if k == 0 {
+                        buf.set_line(area.x, area.y, &Line::from(lead), area.width);
+                    }
+                    self.render_picture(pic, into, idx, lead_w, area, buf, picker);
+                    return;
                 }
-                buf.set_line(area.x, area.y, &Line::from(spans), area.width);
+                let text = self.mark_text(m);
+                let line = text_lines(&text).nth(k).unwrap_or_default().to_string();
+                self.render_text_row(area, buf, lead, line, k, tint.fg(fg));
             }
-            Row::Reply(m, r) => {
-                let reply = &self.marks[m].replies[r];
-                let (bg, fg) = p.mark_colors(reply.author);
+            Row::Turn(m, t) | Row::TurnLine(m, t, _) => {
+                let k = if let Row::TurnLine(_, _, k) = row {
+                    k
+                } else {
+                    0
+                };
+                let turn = &self.marks[m].thread[t];
+                let (bg, fg) = p.mark_colors(turn.author);
                 let tint = Style::default().bg(bg);
                 buf.set_style(area, tint);
-                let who = match reply.author {
-                    Author::User => "you: ",
-                    Author::Agent => "",
+                let editing = self
+                    .compose
+                    .as_ref()
+                    .is_some_and(|c| c.at == ComposeAt::EditTurn(self.marks[m].seq, turn.n));
+                let who = match turn.author {
+                    Author::User => "you",
+                    Author::Agent => "agent",
                 };
-                let spans = vec![
-                    Span::styled(
-                        format!("      [{}] {who}", reply.label),
-                        tint.fg(fg).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(reply.text.clone(), tint.fg(fg)),
-                ];
-                buf.set_line(area.x, area.y, &Line::from(spans), area.width);
+                let lead = vec![Span::styled(
+                    format!("      {who}: "),
+                    tint.fg(fg).add_modifier(Modifier::BOLD),
+                )];
+                if !editing && let Some((pic, into)) = picture_at(&turn.pictures, k) {
+                    let lead_w: usize = lead.iter().map(|s| s.content.chars().count()).sum();
+                    if k == 0 {
+                        buf.set_line(area.x, area.y, &Line::from(lead), area.width);
+                    }
+                    self.render_picture(pic, into, idx, lead_w, area, buf, picker);
+                    return;
+                }
+                let text = self.turn_text(m, t);
+                let line = text_lines(&text).nth(k).unwrap_or_default().to_string();
+                self.render_text_row(area, buf, lead, line, k, tint.fg(fg));
+            }
+            Row::Compose | Row::ComposeLine(_) => {
+                let k = if let Row::ComposeLine(k) = row { k } else { 0 };
+                let Some(c) = &self.compose else { return };
+                let (bg, fg) = p.mark_colors(Author::User);
+                let tint = Style::default().bg(bg);
+                buf.set_style(area, tint);
+                let lead = match &c.at {
+                    ComposeAt::Comment { label, .. } => format!("  [{label}] you: "),
+                    _ => "      you: ".to_string(),
+                };
+                let lead = vec![Span::styled(lead, tint.fg(fg).add_modifier(Modifier::BOLD))];
+                let line = text_lines(&c.text).nth(k).unwrap_or_default().to_string();
+                self.render_text_row(area, buf, lead, line, k, tint.fg(fg));
             }
             Row::Desc(i) => {
                 let mut spans = vec![Span::raw("  ")];
@@ -1076,6 +1616,87 @@ impl DiffView {
                 cell.modifier.insert(Modifier::BOLD);
             }
         }
+    }
+
+    /// A picture's rows: drawn once, from the first of its rows on screen
+    /// down as far as the screen goes, `lead` cells in from the left. Rows
+    /// before that one, and terminals that show no pictures, get the tint
+    /// alone.
+    #[allow(clippy::too_many_arguments)]
+    fn render_picture(
+        &self,
+        pic: &Pic,
+        into: usize,
+        idx: usize,
+        lead: usize,
+        area: Rect,
+        buf: &mut Buffer,
+        picker: Option<&Picker>,
+    ) {
+        let Some(picker) = picker else { return };
+        // The first row of it on screen draws it: its own first row, or
+        // the top of the screen when it starts above.
+        if into != 0 && idx != self.scroll {
+            return;
+        }
+        let picture = &pic.0;
+        let left = usize::from(picture.rows) - into;
+        let shown = (self.scroll + self.visible_at(self.scroll))
+            .saturating_sub(idx)
+            .min(left)
+            .min(usize::from(u16::MAX)) as u16;
+        if shown == 0 || area.width as usize <= lead {
+            return;
+        }
+        let cols = picture.cols.min(area.width - lead as u16);
+        let key = (Arc::as_ptr(picture) as usize, into, shown, cols);
+        let mut encoded = self.encoded.borrow_mut();
+        if let std::collections::hash_map::Entry::Vacant(slot) = encoded.entry(key) {
+            let cell_h = picture.image.height() / u32::from(picture.rows.max(1));
+            let cell_w = picture.image.width() / u32::from(picture.cols.max(1));
+            let slice = image::imageops::crop_imm(
+                &picture.image,
+                0,
+                into as u32 * cell_h,
+                u32::from(cols) * cell_w,
+                u32::from(shown) * cell_h,
+            )
+            .to_image();
+            let size = Size::new(cols, shown);
+            let Ok(protocol) = picker.new_protocol(
+                image::DynamicImage::ImageRgba8(slice),
+                size,
+                Resize::Fit(None),
+            ) else {
+                return;
+            };
+            slot.insert(protocol);
+        }
+        let at = Rect::new(area.x + lead as u16, area.y, cols, shown);
+        Image::new(&encoded[&key])
+            .allow_clipping(true)
+            .render(at, buf);
+    }
+
+    /// One row of a block of text: the lead (letter, who) on the first
+    /// line, the same width of blanks on the lines after it.
+    fn render_text_row(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        lead: Vec<Span<'_>>,
+        line: String,
+        k: usize,
+        style: Style,
+    ) {
+        let mut spans = if k == 0 {
+            lead
+        } else {
+            let w: usize = lead.iter().map(|s| s.content.chars().count()).sum();
+            vec![Span::styled(" ".repeat(w), style)]
+        };
+        spans.push(Span::styled(line, style));
+        buf.set_line(area.x, area.y, &Line::from(spans), area.width);
     }
 
     fn render_file_header(&self, fi: usize, area: Rect, buf: &mut Buffer, p: &Palette) {
@@ -1151,16 +1772,19 @@ impl DiffView {
             Kind::Del => (Some(p.del_bg), p.del_emph, "-"),
             Kind::Context => (None, Color::Reset, " "),
         };
-        // Highlighted context lines take the highlight's tint; changed lines
-        // keep their color and get the bar in the gutter only.
+        // A marked line, or one being marked, takes the mark's tint over
+        // the diff's: the + or - still says what the line is.
         let marked = self.mark_on(fi, l);
         let marking = self
             .marking
             .is_some_and(|(lo, hi)| (lo..=hi).contains(&idx));
-        let line_bg = match (line_bg, marked, marking) {
-            (None, _, true) => Some(p.comment_bg),
-            (None, Some((m, _)), _) => Some(p.mark_colors(m.author).0),
-            (bg, ..) => bg,
+        let (line_bg, emph_bg) = match (marked, marking) {
+            (_, true) => (Some(p.user_bg), p.user_bg),
+            (Some((m, _)), _) => {
+                let bg = p.mark_colors(m.author).0;
+                (Some(bg), bg)
+            }
+            _ => (line_bg, emph_bg),
         };
         let row_style = match line_bg {
             Some(bg) => Style::default().bg(bg),
@@ -1194,32 +1818,19 @@ impl DiffView {
             Kind::Context => (marker, row_style),
         };
         let mut spans = Vec::new();
-        // The mark column: its letter on the mark's first line, a bar below;
-        // a bar too on lines being marked.
+        // The mark column: its letter on the mark's first line. The tint
+        // says how far it runs.
         let gutter = match marked {
-            _ if marking => {
-                let w = self.label_w().max(1);
-                spans.push(Span::styled(
-                    format!("{:<w$}", "▌"),
-                    row_style.fg(p.comment_fg).add_modifier(Modifier::BOLD),
-                ));
-                gutter.chars().skip(w).collect()
-            }
-            Some((m, no)) => {
+            Some((m, no)) if !marking && no == m.start => {
                 let w = self.label_w();
                 let fg = p.mark_colors(m.author).1;
-                let column = if no == m.start {
-                    format!("{:<w$}", m.label)
-                } else {
-                    format!("{:<w$}", "▌")
-                };
                 spans.push(Span::styled(
-                    column,
+                    format!("{:<w$}", m.label),
                     row_style.fg(fg).add_modifier(Modifier::BOLD),
                 ));
                 gutter.chars().skip(w).collect()
             }
-            None => gutter,
+            _ => gutter,
         };
         spans.push(Span::styled(gutter, row_style.fg(p.gutter_fg)));
         spans.push(Span::styled(
@@ -1298,7 +1909,7 @@ impl Mark {
     }
 }
 
-/// The number a highlight is addressed by: the new side's, or the old side's
+/// The number a mark is addressed by: the new side's, or the old side's
 /// in a deleted file.
 fn line_no(f: &FileDiff, line: &crate::diff::DiffLine) -> Option<usize> {
     match f.status {

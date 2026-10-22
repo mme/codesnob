@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, SystemTime};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::watch::Msg;
 
 /// Which repository on which host.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoId {
     pub host: String,
     pub owner: String,
@@ -36,7 +36,7 @@ impl RepoId {
 }
 
 /// A PR as typed: a URL, `owner/repo#123`, or `#123` (the current repo).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spec {
     pub repo: Option<RepoId>,
     pub number: u64,

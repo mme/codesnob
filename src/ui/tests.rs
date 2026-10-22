@@ -114,6 +114,8 @@ impl Harness {
                 let key = match name {
                     "esc" => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
                     "enter" => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    "s-enter" => KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+                    "a-enter" => KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
                     "down" => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
                     "up" => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
                     "bs" => KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
@@ -163,6 +165,16 @@ impl Harness {
     }
 
     /// The screen row drawn as the cursor's, and its text.
+    /// The background of the first cell of the first row showing `needle`.
+    fn bg_of(&mut self, needle: &str) -> Color {
+        let screen = self.screen();
+        let y = screen
+            .lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} on screen:\n{screen}"));
+        self.term.backend().buffer()[(0, y as u16)].bg
+    }
+
     fn cursor(&mut self) -> (usize, String) {
         let screen = self.screen();
         let p = Palette::dark();
@@ -170,7 +182,7 @@ impl Harness {
             p.add_bg,
             p.del_bg,
             p.mark_bg,
-            p.comment_bg,
+            p.user_bg,
             p.header_bg,
             p.add_emph,
             p.del_emph,
@@ -187,6 +199,140 @@ impl Harness {
         assert_eq!(rows.len(), 1, "exactly one cursor row:\n{screen}");
         let text = screen.lines().nth(rows[0]).unwrap_or("").to_string();
         (rows[0], text)
+    }
+
+    /// What the daemon does for an agent: apply `f` to a copy of the
+    /// location on screen's marks and hand the result back, as the daemon
+    /// does after every change.
+    fn agent<T>(
+        &mut self,
+        note: Option<String>,
+        f: impl FnOnce(&mut Marks) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut state = self.app.cur().unwrap().state().expect("a keyed location");
+        let r = f(&mut state.marks)?;
+        self.app.dispatch(Msg::Location {
+            state: Box::new(state),
+            note,
+        });
+        self.settle();
+        Ok(r)
+    }
+
+    /// `get_review`: every mark, and how many of the user's words were
+    /// unread before.
+    fn review(&mut self) -> (Vec<crate::proto::MarkInfo>, usize) {
+        self.agent(None, |m| {
+            let unread = m.unread();
+            Ok((m.read(&[])?, unread))
+        })
+        .unwrap()
+    }
+
+    fn reply(&mut self, letter: &str, text: &str) -> Result<String, String> {
+        let letter = letter.to_string();
+        let text = text.to_string();
+        let mut state = self.app.cur().unwrap().state().expect("a keyed location");
+        let l = state.marks.reply(&letter, &text)?;
+        self.app.dispatch(Msg::Location {
+            state: Box::new(state),
+            note: Some(format!("agent replied under [{l}]")),
+        });
+        self.settle();
+        Ok(l)
+    }
+
+    fn clear(
+        &mut self,
+        which: &str,
+        letters: &[&str],
+        user_asked: bool,
+    ) -> Result<Vec<String>, String> {
+        let letters: Vec<String> = letters.iter().map(|l| l.to_string()).collect();
+        let mut state = self.app.cur().unwrap().state().expect("a keyed location");
+        let cleared = if letters.is_empty() && which == "mine" {
+            state.marks.replace_mine()
+        } else {
+            let letters: Vec<String> = if letters.is_empty() {
+                state
+                    .marks
+                    .marks
+                    .iter()
+                    .filter(|m| which == "all" || m.is_users())
+                    .map(|m| m.label.clone())
+                    .collect()
+            } else {
+                letters
+            };
+            state.marks.delete(&letters, user_asked)?
+        };
+        let note = (!cleared.is_empty()).then(|| {
+            format!(
+                "agent cleared {}",
+                cleared
+                    .iter()
+                    .map(|l| format!("[{l}]"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        });
+        self.app.dispatch(Msg::Location {
+            state: Box::new(state),
+            note,
+        });
+        self.settle();
+        Ok(cleared)
+    }
+
+    /// `mark`: a mark of the agent's with words, without a show.
+    fn mark(&mut self, path: &str, start: usize, end: usize, text: &str) -> String {
+        self.marks(&[hl(path, start, end, Some(text))]).remove(0)
+    }
+
+    /// `mark` with several: one event, as the daemon sends it.
+    fn marks(&mut self, specs: &[crate::proto::MarkSpec]) -> Vec<String> {
+        let mut state = self.app.cur().unwrap().state().expect("a keyed location");
+        let seqs = state.marks.apply(&Op::Marks {
+            marks: specs.to_vec(),
+        });
+        let placed: Vec<crate::proto::MarkInfo> = seqs
+            .iter()
+            .filter_map(|s| state.marks.get(*s))
+            .map(Mark::info)
+            .collect();
+        let labels = placed.iter().map(|m| m.label.clone()).collect();
+        self.app.dispatch(Msg::Location {
+            state: Box::new(state),
+            note: Some(format!("agent marked {}", crate::proto::lettered(&placed))),
+        });
+        self.settle();
+        labels
+    }
+
+    fn move_comment(
+        &mut self,
+        letter: &str,
+        path: Option<&str>,
+        start: usize,
+        end: usize,
+    ) -> Result<String, String> {
+        let mut state = self.app.cur().unwrap().state().expect("a keyed location");
+        let m = state
+            .marks
+            .move_to(letter, path.map(str::to_owned), start, end)?;
+        let lines = if start == end {
+            start.to_string()
+        } else {
+            format!("{start}-{end}")
+        };
+        let note = format!("agent moved [{}] to {} {lines}", m.label, m.path);
+        let label = m.label.clone();
+        self.app.dispatch(Msg::Location {
+            state: Box::new(state),
+            note: Some(note),
+        });
+        self.settle();
+        Ok(label)
     }
 
     fn click(&mut self, row: u16) {
@@ -1077,14 +1223,8 @@ fn leaving_a_location_mid_preview_puts_its_range_back() {
     let b = small_repo("ui-show-preview-b");
     let mut h = Harness::open(&a);
     h.keys("c<down>");
-    h.app.dispatch(Msg::Show(
-        Target {
-            dir: b.clone(),
-            base: None,
-            repo: true,
-        },
-        None,
-    ));
+    h.app
+        .dispatch(Msg::Show(Box::new(view(None, &[]).at(&b)), None));
     h.settle();
     h.keys("-");
     assert_eq!(h.app.cur().unwrap().dir, a);
@@ -1507,19 +1647,56 @@ fn a_pull_request_failing_out_of_sight_says_so_and_goes() {
 
 // ---- comparisons and agent views --------------------------------------------
 
-fn view(range: Option<&str>, files: &[&str]) -> crate::proto::ViewSpec {
-    crate::proto::ViewSpec {
-        range: range.map(str::to_owned),
-        files: files.iter().map(|f| f.to_string()).collect(),
-        ..Default::default()
+/// A show as a test builds it: the view after `#`, the files, the marks.
+#[derive(Clone, Debug, Default)]
+struct Spec {
+    view: String,
+    files: Vec<crate::proto::FileSpec>,
+    marks: Vec<crate::proto::MarkSpec>,
+}
+
+impl Spec {
+    /// The show event the daemon would send for this spec at `dir`, with
+    /// no marks of its own: a location nobody has marked yet.
+    fn at(&self, dir: &Path) -> ShowEvent {
+        self.with_marks(dir, Marks::default())
+    }
+
+    fn with_marks(&self, dir: &Path, marks: Marks) -> ShowEvent {
+        let key = LocationKey::Repo {
+            dir: dir.to_path_buf(),
+            view: View::parse(&self.view),
+        };
+        let mut state = LocationState::fresh(
+            key,
+            dir.to_path_buf(),
+            dir.file_name().unwrap().to_string_lossy().into_owned(),
+        );
+        state.marks = marks;
+        ShowEvent {
+            state,
+            pr: None,
+            view: crate::proto::ViewSpec {
+                files: self.files.clone(),
+                marks: self.marks.clone(),
+            },
+        }
     }
 }
 
-fn target(dir: &Path) -> Target {
-    Target {
-        dir: dir.to_path_buf(),
-        base: None,
-        repo: true,
+/// A diff view: `range` as the agent would write it after `#`, or the
+/// branch diff; narrowed to `files`.
+fn view(range: Option<&str>, files: &[&str]) -> Spec {
+    Spec {
+        view: range.unwrap_or("branch").to_string(),
+        files: files
+            .iter()
+            .map(|f| crate::proto::FileSpec {
+                path: f.to_string(),
+                lines: None,
+            })
+            .collect(),
+        marks: Vec::new(),
     }
 }
 
@@ -1597,10 +1774,8 @@ fn an_agent_updates_the_location_in_place_and_esc_returns() {
     h.keys("NN");
     let before = h.app.cur().unwrap().view.scroll;
 
-    h.app.show_view(
-        target(&dir.join("src")),
-        view(Some("main..feature"), &["a.txt", "gone.txt"]),
-    );
+    h.app
+        .show_view(view(Some("main..feature"), &["a.txt", "gone.txt"]).at(&dir));
     h.settle();
     assert_eq!(
         h.app.locations.len(),
@@ -1638,7 +1813,7 @@ fn an_agent_view_of_another_repo_returns_to_the_previous_location() {
     let a = branch_with_history("ui-agent-a");
     let b = small_repo("ui-agent-b");
     let mut h = Harness::open(&a);
-    h.app.show_view(target(&b), view(None, &["readme.md"]));
+    h.app.show_view(view(None, &["readme.md"]).at(&b));
     h.settle();
     assert_eq!(h.app.cur().unwrap().dir, b);
     assert!(
@@ -1659,18 +1834,27 @@ fn an_agent_view_of_another_repo_returns_to_the_previous_location() {
 }
 
 #[test]
-fn an_agent_view_without_a_range_shows_everything_and_a_branch_name_sets_the_base() {
+fn an_agents_branch_view_shows_everything_and_a_comparison_is_its_own_location() {
     let dir = branch_with_history("ui-agent-base");
     crate::testutil::git(&dir, &["branch", "older", "main"]);
     let mut h = Harness::open(&dir);
     h.keys("u");
-    h.app.show_view(target(&dir), view(None, &[]));
+    h.app.show_view(view(None, &[]).at(&dir));
     h.settle();
     let scope = h.app.scope();
     assert!(scope.ends_with("since main · Esc returns"), "{scope}");
-    h.app.show_view(target(&dir), view(Some("older"), &[]));
+    assert_eq!(
+        h.app.cur().unwrap().key.as_ref().map(LocationKey::name),
+        Some(format!("{}#branch", dir.display()))
+    );
+    h.app.show_view(view(Some("older...HEAD"), &[]).at(&dir));
     h.settle();
-    assert!(h.app.scope().contains("since older"), "{}", h.app.scope());
+    assert!(h.app.scope().contains("older...HEAD"), "{}", h.app.scope());
+    assert_eq!(
+        h.app.cur().unwrap().key.as_ref().map(LocationKey::name),
+        Some(format!("{}#older...HEAD", dir.display())),
+        "the comparison as typed names the location"
+    );
     h.keys("<esc>");
     assert!(
         h.status().starts_with("feature · uncommitted changes"),
@@ -1682,20 +1866,21 @@ fn an_agent_view_without_a_range_shows_everything_and_a_branch_name_sets_the_bas
 
 // ---- files as they are ----------------------------------------------------------
 
-fn code(rev: Option<&str>, files: &[(&str, Option<usize>)]) -> crate::proto::ViewSpec {
-    crate::proto::ViewSpec {
-        code: Some(crate::proto::CodeSpec {
-            rev: rev.map(str::to_owned),
-            files: files
-                .iter()
-                .map(|(p, l)| crate::proto::CodeFile {
-                    path: p.to_string(),
-                    line: *l,
-                    ..Default::default()
-                })
-                .collect(),
-        }),
-        ..Default::default()
+/// Files as they are, or as of `rev`; a line is a mark without words.
+fn code(rev: Option<&str>, files: &[(&str, Option<usize>)]) -> Spec {
+    Spec {
+        view: rev.unwrap_or("").to_string(),
+        files: files
+            .iter()
+            .map(|(p, _)| crate::proto::FileSpec {
+                path: p.to_string(),
+                lines: None,
+            })
+            .collect(),
+        marks: files
+            .iter()
+            .filter_map(|(p, l)| l.map(|l| hl(p, l, l, None)))
+            .collect(),
     }
 }
 
@@ -1705,7 +1890,7 @@ fn the_cursor_moves_within_the_view_and_the_view_follows_near_the_edge() {
     let dir = repo_with_long_file("ui-cursor");
     let mut h = Harness::open(&dir);
     h.app
-        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
     h.settle();
     let (row, text) = h.cursor();
     assert_eq!(row, 0, "opens with the cursor on the header: {text}");
@@ -1780,7 +1965,7 @@ fn paging_moves_the_view_and_keeps_the_cursor_in_sight() {
     let dir = repo_with_long_file("ui-cursor-page");
     let mut h = Harness::open(&dir);
     h.app
-        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
     h.settle();
     h.keys(" ");
     let screen = h.screen();
@@ -1844,21 +2029,41 @@ fn enter_comments_on_the_cursors_line() {
     let dir = repo_with_long_file("ui-comment-line");
     let mut h = Harness::open(&dir);
     h.app
-        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
     h.settle();
     h.screen();
     h.keys("jjjjj<enter>");
-    let screen = h.screen();
     assert!(
-        screen.contains(" Comment ") && screen.contains("src/long.rs 5"),
-        "the prompt names the line:\n{screen}"
+        h.status()
+            .starts_with("src/long.rs 5 · Enter saves · Shift-Enter breaks the line · Esc cancels"),
+        "the status bar names the line: {}",
+        h.status()
     );
-    assert!(screen.contains("Enter saves, Esc cancels"), "{screen}");
-    h.keys("looks good<enter>");
+    h.keys("looks go");
+    let screen = h.screen();
+    let lines: Vec<&str> = screen.lines().collect();
+    let row = lines
+        .iter()
+        .position(|l| l.contains("[A] you: looks go"))
+        .unwrap_or_else(|| panic!("typed where it will go:\n{screen}"));
+    assert!(
+        lines[row - 1].contains("// line 5"),
+        "under its line:\n{screen}"
+    );
+    assert!(
+        !screen.contains(" Comment "),
+        "no panel while typing:\n{screen}"
+    );
+    h.keys("od<enter>");
     let screen = h.screen();
     assert!(
         screen.contains("[A] you: looks good"),
-        "the comment sits above its line, lettered:\n{screen}"
+        "the comment sits under its line, lettered:\n{screen}"
+    );
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("[A] you: looks good"),
+        "saved, the cursor rests on it: {text}"
     );
     let line5 = screen.lines().find(|l| l.contains("// line 5")).unwrap();
     assert!(line5.starts_with("A "), "{line5}");
@@ -1873,21 +2078,27 @@ fn enter_comments_on_the_cursors_line() {
     // Esc in the prompt keeps nothing.
     h.keys("jjj<enter>nope<esc>");
     assert!(!h.screen().contains("nope") && !h.screen().contains("[B]"));
-    assert_eq!(h.app.cur().unwrap().marks.len(), 1);
+    assert_eq!(h.app.cur().unwrap().marks.marks.len(), 1);
 
-    // Enter on the comment's own row edits it.
+    // Enter on the comment's own row answers it; e edits it.
     h.keys("<");
     let (_, text) = h.cursor();
     assert!(
         text.contains("// line 5"),
         "the jump lands on the first line: {text}"
     );
-    h.keys("k<enter>");
+    h.keys("j<enter>");
+    assert!(h.screen().contains("reply under [A]"), "{}", h.screen());
+    h.keys("<esc>e");
     let screen = h.screen();
     assert!(screen.contains("[A] src/long.rs 5"), "edits [A]:\n{screen}");
     h.keys("<c-u>still good<enter>");
     assert!(h.screen().contains("[A] you: still good"), "{}", h.screen());
-    assert_eq!(h.app.cur().unwrap().marks.len(), 1, "edited, not added");
+    assert_eq!(
+        h.app.cur().unwrap().marks.marks.len(),
+        1,
+        "edited, not added"
+    );
     cleanup(dir);
 }
 
@@ -1896,7 +2107,7 @@ fn ctrl_space_marks_a_region_for_a_comment() {
     let dir = repo_with_long_file("ui-comment-region");
     let mut h = Harness::open(&dir);
     h.app
-        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
     h.settle();
     h.screen();
     h.keys("jjjjjjjjjj<c- >");
@@ -1912,13 +2123,11 @@ fn ctrl_space_marks_a_region_for_a_comment() {
         "{}",
         h.status()
     );
-    let screen = h.screen();
-    let barred: Vec<&str> = screen.lines().filter(|l| l.starts_with('▌')).collect();
-    assert_eq!(
-        barred.len(),
-        4,
-        "the lines being marked carry a bar:\n{screen}"
-    );
+    // The cursor's own row (13) is shaded; the rest show the tint.
+    let tinted: Vec<usize> = (10..=14)
+        .filter(|n| h.bg_of(&format!("// line {n}")) == Palette::dark().user_bg)
+        .collect();
+    assert_eq!(tinted, [10, 11, 12], "the lines being marked are tinted");
     h.keys("kkkkkk");
     assert!(
         h.status().starts_with("marking lines 7-10"),
@@ -1927,7 +2136,7 @@ fn ctrl_space_marks_a_region_for_a_comment() {
     );
     h.keys("<esc>");
     assert!(h.status().contains("marking cancelled"), "{}", h.status());
-    assert!(!h.screen().lines().any(|l| l.starts_with('▌')));
+    assert_ne!(h.bg_of("// line 10"), Palette::dark().user_bg);
 
     // v starts one too; a second Ctrl-Space ends it.
     h.keys("vjj<c- >");
@@ -1935,7 +2144,7 @@ fn ctrl_space_marks_a_region_for_a_comment() {
     h.keys("three lines<enter>");
     let screen = h.screen();
     assert!(screen.contains("[A] you: three lines"), "{screen}");
-    let m = &h.app.cur().unwrap().marks[0];
+    let m = &h.app.cur().unwrap().marks.marks[0];
     assert_eq!((m.start, m.end), (7, 9));
     assert_eq!(
         m.text.as_deref(),
@@ -1966,8 +2175,8 @@ fn comments_are_deleted_one_by_one_or_cleared_after_a_question() {
     let dir = repo_with_long_file("ui-comment-delete");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![hl("src/long.rs", 2, 3, Some("theirs"))];
-    h.app.show_view(target(&dir), spec);
+    spec.marks = vec![hl("src/long.rs", 2, 3, Some("theirs"))];
+    h.app.show_view(spec.at(&dir));
     h.settle();
     h.screen();
     // Opens at [A], the cursor on line 2.
@@ -1975,7 +2184,7 @@ fn comments_are_deleted_one_by_one_or_cleared_after_a_question() {
     h.keys("jjjj<enter>two<enter>");
     h.keys("kj");
     assert!(
-        h.status().contains("2 yours") && h.status().contains("3 marks"),
+        h.status().contains("2 yours") && h.status().contains("of 3"),
         "{}",
         h.status()
     );
@@ -1986,30 +2195,29 @@ fn comments_are_deleted_one_by_one_or_cleared_after_a_question() {
         "{}",
         h.screen()
     );
-    h.keys("gjx");
-    assert!(
-        h.status().contains("no comment of yours here"),
-        "an agent's highlight stays: {}",
-        h.status()
-    );
-    assert!(h.screen().contains("[A] theirs"));
     h.keys("X");
     assert!(
-        h.status().contains("clear your 1 comment here? y/n"),
+        h.status().contains("clear 2 marks here (1 yours)? y/n"),
         "{}",
         h.status()
     );
     h.keys("n");
     assert!(h.status().contains("kept") && h.screen().contains("[B] you: one"));
-    h.keys("Xy");
-    assert!(h.status().contains("1 comment cleared"), "{}", h.status());
-    assert!(!h.screen().contains("[B]") && h.screen().contains("[A] theirs"));
-    h.keys("X");
+    h.keys("gjjjj");
+    let (_, line) = h.cursor();
+    assert!(line.contains("[A] theirs"), "{line}");
+    h.keys("x");
     assert!(
-        h.status().contains("no comments of yours here"),
-        "{}",
+        h.status().contains("[A] removed"),
+        "the agent's mark goes too: {}",
         h.status()
     );
+    assert!(!h.screen().contains("[A] theirs"), "{}", h.screen());
+    h.keys("Xy");
+    assert!(h.status().contains("1 mark cleared"), "{}", h.status());
+    assert!(!h.screen().contains("[B]"), "{}", h.screen());
+    h.keys("X");
+    assert!(h.status().contains("no marks here"), "{}", h.status());
     // The letters go on where they left off.
     h.keys("jjjjjjj<enter>again<enter>");
     assert!(h.screen().contains("[D] you: again"), "{}", h.screen());
@@ -2027,7 +2235,7 @@ fn a_comment_on_deleted_lines_speaks_in_old_line_numbers() {
     h.keys("jj<enter>");
     assert!(h.screen().contains("gone.txt old 1"), "{}", h.screen());
     h.keys("why<enter>");
-    let m = &h.app.cur().unwrap().marks[0];
+    let m = &h.app.cur().unwrap().marks.marks[0];
     assert!(m.old_side && (m.start, m.end) == (1, 1) && !m.with_deletions);
     assert!(h.screen().contains("[A] you: why"), "{}", h.screen());
     // Deleted and added lines together: the new side's numbers, flagged.
@@ -2035,7 +2243,7 @@ fn a_comment_on_deleted_lines_speaks_in_old_line_numbers() {
     h.keys("jj<c- >j<enter>");
     assert!(h.screen().contains("a.txt 1"), "{}", h.screen());
     h.keys("both<enter>");
-    let m = &h.app.cur().unwrap().marks[1];
+    let m = &h.app.cur().unwrap().marks.marks[1];
     assert!(
         !m.old_side && m.with_deletions && (m.start, m.end) == (1, 1),
         "{:?}",
@@ -2049,16 +2257,16 @@ fn a_comment_follows_its_lines_through_an_edit() {
     let dir = repo_with_long_file("ui-comment-follow");
     let mut h = Harness::open(&dir);
     h.app
-        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
     h.settle();
     h.screen();
     h.keys("jjjjjjjjjj<enter>here<enter>");
-    assert_eq!(h.app.cur().unwrap().marks[0].start, 10);
+    assert_eq!(h.app.cur().unwrap().marks.marks[0].start, 10);
     let body: String = std::iter::once("// new\n".to_string())
         .chain((1..=60).map(|i| format!("// line {i}\n")))
         .collect();
     std::fs::write(dir.join("src/long.rs"), body).unwrap();
-    wait_until(&mut h, &|h| h.app.cur().unwrap().marks[0].start == 11);
+    wait_until(&mut h, &|h| h.app.cur().unwrap().marks.marks[0].start == 11);
     assert!(h.screen().contains("[A] you: here"), "{}", h.screen());
     cleanup(dir);
 }
@@ -2068,15 +2276,18 @@ fn an_agents_call_is_answered_with_letters_location_and_unread_count() {
     let dir = repo_with_long_file("ui-ack");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![
+    spec.marks = vec![
         hl("src/long.rs", 30, 30, Some("later")),
         hl("src/long.rs", 10, 11, None),
     ];
-    let ack = h.app.show_view(target(&dir), spec);
+    let ack = h.app.show_view(spec.at(&dir));
     h.settle();
     h.screen();
-    assert_eq!(ack.location, "L1");
-    assert_eq!(ack.dir, dir);
+    assert_eq!(
+        h.app.cur().unwrap().key.as_ref().map(LocationKey::name),
+        Some(dir.display().to_string()),
+        "named by its path, the files as they are"
+    );
     let letters: Vec<(String, usize)> = ack
         .marks
         .iter()
@@ -2084,19 +2295,23 @@ fn an_agents_call_is_answered_with_letters_location_and_unread_count() {
         .collect();
     assert_eq!(
         letters,
-        [("A".to_string(), 10), ("B".to_string(), 30)],
-        "lettered by position, as the viewer shows them"
+        [("A".to_string(), 30), ("B".to_string(), 10)],
+        "lettered in the order given"
     );
-    assert!(ack.applied && ack.unread == 0);
-    assert!(h.status().contains("L1  ·"), "{}", h.status());
+    assert!(ack.applied);
+    assert!(!h.status().contains("L1"), "no ids: {}", h.status());
 
     h.keys("jjjjj<enter>hm<enter>k");
     assert!(h.status().contains("1 yours (1 unread)"), "{}", h.status());
     let ack = h
         .app
-        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
     h.settle();
-    assert_eq!(ack.unread, 1, "the reply nudges the agent");
+    assert_eq!(
+        h.app.cur().unwrap().unread(),
+        1,
+        "the same view keeps its marks"
+    );
     assert!(ack.marks.is_empty());
     cleanup(dir);
 }
@@ -2106,53 +2321,50 @@ fn get_review_lists_every_mark_and_counts_comments_as_read() {
     let dir = repo_with_long_file("ui-review");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![hl("src/long.rs", 20, 22, Some("the loop"))];
-    h.app.show_view(target(&dir), spec);
+    spec.marks = vec![hl("src/long.rs", 20, 22, Some("the loop"))];
+    h.app.show_view(spec.at(&dir));
     h.settle();
     h.screen();
-    h.keys("jjj<enter>needs a name<enter>");
-    let r = h.app.review(None).unwrap();
-    assert_eq!((r.location.as_str(), r.unread), ("L1", 1));
-    assert_eq!(r.dir, dir);
-    assert_eq!(r.showing, "src/long.rs · working tree");
-    assert_eq!(r.marks.len(), 2);
-    let a = &r.marks[0];
+    h.keys("jjjj<enter>needs a name<enter>k");
+    assert!(h.status().contains("1 unread"), "{}", h.status());
+    let (marks, unread) = h.review();
+    assert_eq!(unread, 1);
+    assert_eq!(marks.len(), 2);
+    let a = &marks[0];
     assert_eq!(
-        (a.label.as_str(), a.author.as_str(), a.start, a.end),
-        ("A", "agent", 20, 22)
+        (a.label.as_str(), a.author, a.start, a.end),
+        ("A", Author::Agent, 20, 22)
     );
     assert_eq!(a.text.as_deref(), Some("the loop"));
     assert!(a.lines.is_empty(), "no code for the agent's own highlights");
-    let b = &r.marks[1];
+    assert!(!a.theirs);
+    let b = &marks[1];
     assert_eq!(
-        (b.label.as_str(), b.author.as_str(), b.start, b.end),
-        ("B", "user", 23, 23)
+        (b.label.as_str(), b.author, b.start, b.end),
+        ("B", Author::User, 23, 23)
     );
-    assert!(b.new, "not read before");
+    assert!(b.new && b.theirs, "not read before");
     assert_eq!(b.lines, ["// line 23"]);
     assert_eq!(b.text.as_deref(), Some("needs a name"));
-    let text = r.render();
-    assert!(
-        text.contains("[B] comment src/long.rs 23 (new): needs a name\n    23 | // line 23"),
-        "{text}"
+    assert_eq!(
+        b.render(),
+        "[B] user mark src/long.rs 23 (new): needs a name\n    23 | // line 23"
     );
 
-    // Read once, a comment stays until edited.
-    let r = h.app.review(Some("L1")).unwrap();
-    assert!(!r.marks[1].new && r.unread == 0, "{r:?}");
+    // Read, the viewer no longer counts it unread, and a comment stays
+    // read until edited.
+    h.keys("j");
     assert!(!h.status().contains("unread"), "{}", h.status());
+    let (marks, unread) = h.review();
+    assert!(!marks[1].new && unread == 0, "{marks:?}");
     h.keys("<");
-    h.keys("jjje<c-u>better name<enter>");
-    let r = h.app.review(None).unwrap();
+    h.keys(">");
+    h.keys("je<c-u>better name<enter>");
+    let (marks, unread) = h.review();
     assert!(
-        r.marks[1].new && r.unread == 1,
-        "an edit makes it new again: {r:?}"
+        marks[1].new && unread == 1,
+        "an edit makes it new again: {marks:?}"
     );
-
-    let err = h.app.review(Some("L9")).unwrap_err();
-    assert_eq!(err, "no location L9 in this viewer");
-    let err = h.app.review(Some("nine")).unwrap_err();
-    assert!(err.contains("look like L3"), "{err}");
     cleanup(dir);
 }
 
@@ -2161,38 +2373,31 @@ fn clear_marks_takes_letters_or_an_author() {
     let dir = repo_with_long_file("ui-clear");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![
+    spec.marks = vec![
         hl("src/long.rs", 10, 10, Some("a")),
         hl("src/long.rs", 20, 20, Some("b")),
     ];
-    h.app.show_view(target(&dir), spec);
+    h.app.show_view(spec.at(&dir));
     h.settle();
     h.screen();
     h.keys("jj<enter>one<enter>");
     h.keys("jjjjj<enter>two<enter>");
-    let r = h
-        .app
-        .clear_marks(None, "mine", &["a".to_string()], false)
-        .unwrap();
-    assert_eq!(r.cleared, ["A"]);
-    assert_eq!((r.remaining, r.unread), (3, 2));
+    let cleared = h.clear("mine", &["a"], false).unwrap();
+    assert_eq!(cleared, ["A"]);
+    let loc = h.app.cur().unwrap();
+    assert_eq!((loc.marks.marks.len(), loc.unread()), (3, 2));
     assert!(h.status().contains("agent cleared [A]"), "{}", h.status());
     assert!(!h.screen().contains("[A] a"), "{}", h.screen());
-    let err = h
-        .app
-        .clear_marks(None, "mine", &["Z".to_string()], false)
-        .unwrap_err();
-    assert_eq!(err, "no mark [Z] on L1");
-    let r = h.app.clear_marks(None, "mine", &[], false).unwrap();
-    assert_eq!(r.cleared, ["B"]);
+    let err = h.clear("mine", &["Z"], false).unwrap_err();
+    assert_eq!(err, "no mark [Z]");
+    let cleared = h.clear("mine", &[], false).unwrap();
+    assert_eq!(cleared, ["B"]);
     assert!(h.screen().contains("[D] you: two") && !h.screen().contains("[B] b"));
-    let r = h.app.clear_marks(Some("L1"), "user", &[], true).unwrap();
-    assert_eq!(
-        (r.cleared.as_slice(), r.remaining),
-        (["C".to_string(), "D".to_string()].as_slice(), 0)
-    );
-    let r = h.app.clear_marks(None, "all", &[], false).unwrap();
-    assert!(r.cleared.is_empty());
+    let cleared = h.clear("user", &[], true).unwrap();
+    assert_eq!(cleared, ["C", "D"]);
+    assert!(h.app.cur().unwrap().marks.marks.is_empty());
+    let cleared = h.clear("all", &[], false).unwrap();
+    assert!(cleared.is_empty());
     cleanup(dir);
 }
 
@@ -2201,61 +2406,54 @@ fn the_users_comments_go_only_when_the_user_asked() {
     let dir = repo_with_long_file("ui-clear-user");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![hl("src/long.rs", 10, 10, Some("a"))];
-    h.app.show_view(target(&dir), spec);
+    spec.marks = vec![hl("src/long.rs", 10, 10, Some("a"))];
+    h.app.show_view(spec.at(&dir));
     h.settle();
     h.screen();
     h.keys("jj<enter>one<enter>");
     h.keys("jjjjj<enter>two<enter>");
-    h.app.reply_to(None, "B", "noted").unwrap();
+    h.reply("B", "noted").unwrap();
 
     // By letter, by author, or along with everything: refused, and nothing
     // goes, not even the agent's own marks named with them.
-    let err = h
-        .app
-        .clear_marks(None, "mine", &["A".to_string(), "b".to_string()], false)
-        .unwrap_err();
+    let err = h.clear("mine", &["A", "b"], false).unwrap_err();
     assert!(
         err.starts_with("[B] is the user's: it goes only when the user explicitly asks for that")
-            && err.contains("user_explicitly_asked_to_delete_comments")
-            && err.ends_with("reply to it"),
+            && err.contains("user_explicitly_asked_to_delete")
+            && err.ends_with("reply under it"),
         "{err}"
     );
-    let err = h.app.clear_marks(None, "user", &[], false).unwrap_err();
+    let err = h.clear("user", &[], false).unwrap_err();
     assert!(err.starts_with("[B] [C] are the user's"), "{err}");
-    assert!(h.app.clear_marks(None, "all", &[], false).is_err());
+    assert!(h.clear("all", &[], false).is_err());
     let left: Vec<String> = h
         .app
         .cur()
         .unwrap()
         .marks
+        .marks
         .iter()
-        .map(|m| format!("{}{}", m.label, m.replies.len()))
+        .map(|m| format!("{}{}", m.label, m.thread.len()))
         .collect();
     assert_eq!(left, ["A0", "B1", "C0"], "nothing went");
 
-    // The agent's own reply under the user's comment is the agent's.
-    let r = h
-        .app
-        .clear_marks(None, "mine", &["B1".to_string()], false)
-        .unwrap();
-    assert_eq!(r.cleared, ["B1"]);
-    let screen = h.screen();
+    // The agent's own reply is part of the user's thread now: it cannot
+    // be picked out, and replies have no letters to name it by.
+    let err = h.clear("mine", &["B1"], false).unwrap_err();
     assert!(
-        screen.contains("[B] you: one") && !screen.contains("[B1] noted"),
-        "{screen}"
+        err.starts_with("no mark [B1]; replies have no letters"),
+        "{err}"
     );
 
-    // When the user asked, they go.
-    let r = h
-        .app
-        .clear_marks(None, "mine", &["B".to_string()], true)
-        .unwrap();
-    assert_eq!(
-        (r.cleared.as_slice(), r.remaining),
-        (["B".to_string()].as_slice(), 2)
+    // When the user asked, the mark goes whole, thread and all.
+    let cleared = h.clear("mine", &["B"], true).unwrap();
+    assert_eq!(cleared, ["B"]);
+    assert_eq!(h.app.cur().unwrap().marks.marks.len(), 2);
+    let screen = h.screen();
+    assert!(
+        !screen.contains("[B] you") && !screen.contains("agent: noted"),
+        "{screen}"
     );
-    assert!(!h.screen().contains("[B] you"), "{}", h.screen());
     cleanup(dir);
 }
 
@@ -2264,15 +2462,17 @@ fn the_agent_answers_a_comment_under_its_letter() {
     let dir = repo_with_long_file("ui-reply");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![hl("src/long.rs", 10, 10, Some("look"))];
-    h.app.show_view(target(&dir), spec);
+    spec.marks = vec![hl("src/long.rs", 10, 10, Some("look"))];
+    h.app.show_view(spec.at(&dir));
     h.settle();
     h.screen();
-    h.keys("jj<enter>why<enter>");
-    let r = h.app.reply_to(None, "b", "  because  ").unwrap();
-    assert_eq!((r.location.as_str(), r.label.as_str()), ("L1", "B1"));
-    assert_eq!(r.render(), "replied [B1] on L1");
-    assert!(h.status().contains("agent replied [B1]"), "{}", h.status());
+    h.keys("jjj<enter>why<enter>");
+    assert_eq!(h.reply("b", "  because  ").unwrap(), "B");
+    assert!(
+        h.status().contains("agent replied under [B]"),
+        "{}",
+        h.status()
+    );
     let screen = h.screen();
     let lines: Vec<&str> = screen.lines().collect();
     let b = lines
@@ -2280,46 +2480,43 @@ fn the_agent_answers_a_comment_under_its_letter() {
         .position(|l| l.contains("[B] you: why"))
         .unwrap_or_else(|| panic!("{screen}"));
     assert!(
-        lines[b + 1].contains("[B1] because") && lines[b + 2].contains("// line 12"),
-        "the reply sits under its comment, above the code:\n{screen}"
+        lines[b - 1].contains("// line 12")
+            && lines[b + 1].contains("agent: because")
+            && lines[b + 2].contains("// line 13"),
+        "the reply sits under its comment, under the code, with no letter of its own:\n{screen}"
     );
 
-    // A reply's label answers its comment; the numbers go on.
-    let r = h.app.reply_to(Some("L1"), "B1", "and more").unwrap();
-    assert_eq!(r.label, "B2");
-    let err = h.app.reply_to(None, "A", "x").unwrap_err();
-    assert!(err.contains("your own highlight"), "{err}");
-    assert_eq!(
-        h.app.reply_to(None, "B", " ").unwrap_err(),
-        "a reply needs text"
-    );
-    assert_eq!(
-        h.app.reply_to(None, "Q", "x").unwrap_err(),
-        "no mark [Q] on L1"
-    );
-    assert_eq!(
-        h.app.reply_to(None, "B9", "x").unwrap_err(),
-        "no mark [B9] on L1"
-    );
-
-    // The review carries them under the comment.
-    let r = h.app.review(None).unwrap();
-    let b = &r.marks[1];
-    let labels: Vec<&str> = b.replies.iter().map(|r| r.label.as_str()).collect();
-    assert_eq!(labels, ["B1", "B2"]);
-    assert_eq!(b.replies[0].author, "agent");
+    // Replies go at the end of the thread; nothing else to address.
+    assert_eq!(h.reply("B", "and more").unwrap(), "B");
+    let err = h.reply("A", "x").unwrap_err();
+    assert!(err.contains("your own"), "{err}");
+    assert_eq!(h.reply("B", " ").unwrap_err(), "a reply needs text");
+    assert_eq!(h.reply("Q", "x").unwrap_err(), "no mark [Q]");
     assert!(
-        !b.replies[0].new,
-        "the agent's own reply is never new to it"
+        h.reply("B1", "x")
+            .unwrap_err()
+            .starts_with("no mark [B1]; replies have no letters"),
     );
+
+    // The review carries the thread under the comment.
+    let (marks, _) = h.review();
+    let b = &marks[1];
+    let authors: Vec<Author> = b.thread.iter().map(|t| t.author).collect();
+    assert_eq!(authors, [Author::Agent, Author::Agent]);
+    assert!(!b.thread[0].new, "the agent's own reply is never new to it");
+    let r = crate::proto::ReviewResult {
+        marks,
+        new: 0,
+        report: crate::proto::Report::of(&dir.display().to_string(), &h.app.cur().unwrap().marks),
+    };
     let text = r.render();
     assert!(
-        text.contains("1 comment by the user, 2 replies")
-            && text.contains("\n    [B1] agent reply: because\n    [B2] agent reply: and more"),
+        text.contains("1 by the user, 2 replies")
+            && text.contains("\n    agent: because\n    agent: and more"),
         "{text}"
     );
 
-    // < and > step from mark to mark, over the replies: from [B]'s line
+    // < and > step from mark to mark, over the thread: from [B]'s line
     // back to [A], and on to [B]'s line again.
     h.keys("<");
     let (_, line) = h.cursor();
@@ -2335,64 +2532,106 @@ fn the_user_answers_the_agent_in_the_same_thread() {
     let dir = repo_with_long_file("ui-reply-user");
     let mut h = Harness::open(&dir);
     h.app
-        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
     h.settle();
     h.screen();
     h.keys("jjjjj<enter>hm<enter>");
-    h.app.review(None).unwrap();
-    h.app.reply_to(None, "A", "fixed").unwrap();
+    h.review();
+    h.reply("A", "fixed").unwrap();
 
-    // Enter on the agent's reply answers it, under the same letter.
-    h.keys("k");
+    // Enter on the agent's reply, where the cursor landed, answers it at
+    // the end of the thread, and the answer is typed right there.
     let (_, line) = h.cursor();
-    assert!(line.contains("[A1] fixed"), "{line}");
+    assert!(line.contains("agent: fixed"), "{line}");
     h.keys("<enter>");
-    assert!(h.screen().contains("reply under [A]"), "{}", h.screen());
-    h.keys("thanks<enter>");
-    assert!(h.status().contains("[A2] saved"), "{}", h.status());
-    assert!(h.screen().contains("[A2] you: thanks"), "{}", h.screen());
-    let loc = h.app.cur().unwrap();
-    assert_eq!((loc.comments(), loc.unread()), (2, 1));
-    let r = h.app.review(None).unwrap();
-    assert!(r.marks[0].replies[1].new && r.unread == 1, "{r:?}");
     assert!(
-        r.render().contains("[A2] user reply (new): thanks"),
+        h.status().starts_with(
+            "reply under [A] · Enter saves · Shift-Enter breaks the line · Esc cancels"
+        ),
         "{}",
-        r.render()
+        h.status()
+    );
+    h.keys("than");
+    let screen = h.screen();
+    let lines: Vec<&str> = screen.lines().collect();
+    let fixed = lines
+        .iter()
+        .position(|l| l.contains("agent: fixed"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    assert!(
+        lines[fixed + 1].contains("you: than") && lines[fixed + 2].contains("// line"),
+        "typed under the thread, above the code:\n{screen}"
+    );
+    h.keys("ks<enter>");
+    assert!(
+        h.status().contains("reply under [A] saved"),
+        "{}",
+        h.status()
+    );
+    assert!(h.screen().contains("you: thanks"), "{}", h.screen());
+    let loc = h.app.cur().unwrap();
+    assert_eq!((loc.users_words(), loc.unread()), (2, 1));
+    let (marks, unread) = h.review();
+    assert!(marks[0].thread[1].new && unread == 1, "{marks:?}");
+    assert!(
+        marks[0]
+            .render()
+            .ends_with("\n    agent: fixed\n    user (new): thanks"),
+        "{}",
+        marks[0].render()
     );
 
-    // Enter or e on the user's own reply edits it, and it is new again.
-    h.keys("j");
+    // e on the user's own reply, where the cursor rests once it is saved,
+    // edits it, and it is new again.
     let (_, line) = h.cursor();
-    assert!(line.contains("[A2] you: thanks"), "{line}");
+    assert!(line.contains("you: thanks"), "{line}");
     h.keys("e");
-    assert!(h.screen().contains("[A2] under [A]"), "{}", h.screen());
+    assert!(
+        h.screen().contains("your reply under [A]"),
+        "{}",
+        h.screen()
+    );
     h.keys("<c-u>thanks!<enter>");
-    assert!(h.screen().contains("[A2] you: thanks!"), "{}", h.screen());
+    assert!(h.screen().contains("you: thanks!"), "{}", h.screen());
     assert_eq!(h.app.cur().unwrap().unread(), 1);
     let (_, line) = h.cursor();
     assert!(
-        line.contains("[A2]"),
+        line.contains("you: thanks!"),
         "the cursor stays on the reply: {line}"
     );
 
     // x removes the user's own reply, never the agent's.
     h.keys("x");
-    assert!(h.status().contains("[A2] removed"), "{}", h.status());
+    assert!(
+        h.status().contains("your reply under [A] removed"),
+        "{}",
+        h.status()
+    );
     let (_, line) = h.cursor();
-    assert!(line.contains("[A1] fixed"), "{line}");
+    assert!(line.contains("agent: fixed"), "{line}");
     h.keys("x");
     assert!(
-        h.status().contains("no comment of yours here"),
+        h.status()
+            .contains("the agent's reply; x on the mark removes the thread"),
         "{}",
         h.status()
     );
     h.keys("e");
     assert!(h.status().contains("Enter answers it"), "{}", h.status());
 
-    // Numbers are not reused.
-    h.keys("<enter>again<enter>");
-    assert!(h.status().contains("[A3] saved"), "{}", h.status());
+    // Enter on the comment's own row answers it too.
+    h.keys("k<enter>again<enter>");
+    assert!(
+        h.status().contains("reply under [A] saved"),
+        "{}",
+        h.status()
+    );
+    let thread: Vec<usize> = h.app.cur().unwrap().marks.marks[0]
+        .thread
+        .iter()
+        .map(|t| t.n)
+        .collect();
+    assert_eq!(thread, [1, 3], "numbers are not reused");
     cleanup(dir);
 }
 
@@ -2401,28 +2640,27 @@ fn the_agent_moves_a_comment_to_the_code_it_is_about() {
     let dir = repo_with_long_file("ui-move");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![hl("src/long.rs", 30, 30, Some("mine"))];
-    h.app.show_view(target(&dir), spec);
+    spec.marks = vec![hl("src/long.rs", 30, 30, Some("mine"))];
+    h.app.show_view(spec.at(&dir));
     h.settle();
     h.screen();
     h.keys("gjjjjj<enter>here<enter>");
-    assert_eq!(h.app.cur().unwrap().marks[1].start, 5);
-    h.app.reply_to(None, "B", "moving it").unwrap();
+    assert_eq!(h.app.cur().unwrap().marks.marks[1].start, 5);
+    h.reply("B", "moving it").unwrap();
+    h.keys("kk");
 
-    let r = h.app.move_comment(None, "b", None, 40, 41).unwrap();
-    assert_eq!(r.render(), "moved [B] to src/long.rs 40-41 on L1");
+    assert_eq!(h.move_comment("b", None, 40, 41).unwrap(), "B");
     assert!(
         h.status().contains("agent moved [B] to src/long.rs 40-41"),
         "{}",
         h.status()
     );
-    h.settle();
     let (_, line) = h.cursor();
     assert!(
         line.contains("// line 5"),
         "the user's cursor stays: {line}"
     );
-    let m = &h.app.cur().unwrap().marks[1];
+    let m = &h.app.cur().unwrap().marks.marks[1];
     assert_eq!((m.label.as_str(), m.start, m.end), ("B", 40, 41));
     assert_eq!(
         m.text.as_deref(),
@@ -2437,16 +2675,17 @@ fn the_agent_moves_a_comment_to_the_code_it_is_about() {
         .position(|l| l.contains("[B] you: here"))
         .unwrap_or_else(|| panic!("{screen}"));
     assert!(
-        lines[b + 1].contains("[B1] moving it") && lines[b + 2].contains("// line 40"),
+        lines[b - 1].contains("// line 41") && lines[b + 1].contains("agent: moving it"),
         "{screen}"
     );
 
-    // Only the user's comments, by their letter.
-    let err = h.app.move_comment(None, "A", None, 1, 1).unwrap_err();
-    assert!(err.contains("your own highlight"), "{err}");
-    let err = h.app.move_comment(None, "B1", None, 1, 1).unwrap_err();
-    assert_eq!(err, "[B1] is a reply; it moves with its comment, [B]");
-    let err = h.app.move_comment(None, "B", None, 5, 4).unwrap_err();
+    // By their letter; replies have none.
+    let err = h.move_comment("B1", None, 1, 1).unwrap_err();
+    assert!(
+        err.starts_with("no mark [B1]; replies have no letters"),
+        "{err}"
+    );
+    let err = h.move_comment("B", None, 5, 4).unwrap_err();
     assert!(err.contains("run forward"), "{err}");
 
     // It follows its new lines through an edit, as any comment does.
@@ -2454,56 +2693,56 @@ fn the_agent_moves_a_comment_to_the_code_it_is_about() {
         .chain((1..=60).map(|i| format!("// line {i}\n")))
         .collect();
     std::fs::write(dir.join("src/long.rs"), body).unwrap();
-    wait_until(&mut h, &|h| h.app.cur().unwrap().marks[1].start == 41);
-    assert_eq!(h.app.cur().unwrap().marks[1].end, 42);
+    wait_until(&mut h, &|h| h.app.cur().unwrap().marks.marks[1].start == 41);
+    assert_eq!(h.app.cur().unwrap().marks.marks[1].end, 42);
     cleanup(dir);
 }
 
 #[test]
-fn append_adds_files_and_keeps_every_mark() {
-    let dir = repo_with_long_file("ui-append");
+fn a_show_adds_marks_and_removes_none() {
+    let dir = repo_with_long_file("ui-shows-add");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![hl("src/long.rs", 10, 10, Some("first"))];
-    h.app.show_view(target(&dir), spec);
+    spec.marks = vec![hl("src/long.rs", 10, 10, Some("first"))];
+    h.app.show_view(spec.at(&dir));
     h.settle();
     h.screen();
     h.keys("jjj<enter>mine<enter>");
     let mut spec = code(None, &[("a.txt", None)]);
-    spec.highlights = vec![hl("a.txt", 1, 1, Some("second"))];
-    spec.append = true;
-    let ack = h.app.show_view(target(&dir), spec);
+    spec.marks = vec![hl("a.txt", 1, 1, Some("second"))];
+    let ack = h.app.show_view(spec.at(&dir));
     h.settle();
     let screen = h.screen();
     assert_eq!(ack.marks[0].label, "C");
+    let mine: Vec<String> = h
+        .app
+        .cur()
+        .unwrap()
+        .marks
+        .mine()
+        .iter()
+        .map(|m| m.label.clone())
+        .collect();
+    assert_eq!(mine, ["A", "C"], "the agent's marks stay on the location");
     assert!(
-        screen.contains("[A] first")
-            && screen.contains("[B] you: mine")
-            && screen.contains("[C] second"),
-        "every mark stays and the new file joins:\n{screen}"
-    );
-    assert!(h.status().contains("agent added [C]"), "{}", h.status());
-    h.keys("k");
-    assert!(
-        h.status().starts_with("2 files · working tree"),
-        "{}",
-        h.status()
-    );
-
-    // Without append the next call replaces the view and the agent's marks.
-    let mut spec = code(None, &[("a.txt", None)]);
-    spec.highlights = vec![hl("a.txt", 1, 1, Some("third"))];
-    h.app.show_view(target(&dir), spec);
-    h.settle();
-    let screen = h.screen();
-    assert!(
-        screen.contains("[D] third") && !screen.contains("[C]"),
-        "{screen}"
+        screen.contains("[C] second") && !screen.contains("[A]"),
+        "the view changed:\n{screen}"
     );
     assert_eq!(
-        h.app.cur().unwrap().marks.len(),
-        2,
-        "the user's comment stays, off screen"
+        h.app.cur().unwrap().marks.marks.len(),
+        3,
+        "every mark stays, off screen"
+    );
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.marks = vec![hl("src/long.rs", 20, 20, Some("third"))];
+    h.app.show_view(spec.at(&dir));
+    h.settle();
+    h.screen();
+    h.keys("<<");
+    let screen = h.screen();
+    assert!(
+        screen.contains("[A] first") && screen.contains("[B] you: mine"),
+        "back on the file, the earlier marks are there:\n{screen}"
     );
     cleanup(dir);
 }
@@ -2515,11 +2754,8 @@ fn a_switch_waits_behind_a_banner_while_comments_are_unread() {
     let mut h = Harness::open(&a);
     h.keys("jj<enter>look<enter>k");
     assert!(h.status().contains("1 unread"), "{}", h.status());
-    h.app.dispatch(Msg::View(
-        target(&b),
-        Box::new(view(None, &["readme.md"])),
-        None,
-    ));
+    h.app
+        .dispatch(Msg::Show(Box::new(view(None, &["readme.md"]).at(&b)), None));
     h.settle();
     let screen = h.screen();
     assert_eq!(h.app.cur().unwrap().dir, a, "still here");
@@ -2559,59 +2795,53 @@ fn a_switch_waits_behind_a_banner_while_comments_are_unread() {
 }
 
 #[test]
-fn the_locations_are_listed_with_their_unread_comments() {
+fn the_viewer_tells_the_daemon_what_it_has_open() {
     let a = repo_with_long_file("ui-locations-a");
     let b = small_repo("ui-locations-b");
     let mut h = Harness::open(&a);
     h.keys("jj<enter>look<enter>k");
-    h.app.dispatch(Msg::View(
-        target(&b),
-        Box::new(view(None, &["readme.md"])),
-        None,
-    ));
+    h.app
+        .dispatch(Msg::Show(Box::new(view(None, &["readme.md"]).at(&b)), None));
     h.settle();
     h.keys("y");
     h.settle();
-    let r = h.app.locations_info();
-    assert_eq!(r.viewer, format!("v{}", std::process::id()));
-    let each: Vec<(&str, bool, usize, usize, usize)> = r
-        .locations
-        .iter()
-        .map(|l| {
-            (
-                l.location.as_str(),
-                l.on_screen,
-                l.marks,
-                l.comments,
-                l.unread,
-            )
-        })
-        .collect();
+    let entry = h.app.link.entry();
     assert_eq!(
-        each,
-        [("L2", true, 0, 0, 0), ("L1", false, 1, 1, 1)],
-        "the one on screen first; the comment left behind is still unread"
+        entry.location,
+        Some(LocationKey::Repo {
+            dir: b.clone(),
+            view: View::Branch
+        })
     );
-    assert_eq!((&r.locations[0].dir, &r.locations[1].dir), (&b, &a));
-    assert!(
-        r.locations[0].showing.starts_with("readme.md only · "),
-        "{}",
-        r.locations[0].showing
-    );
-    assert!(
-        !r.locations[1].showing.is_empty(),
-        "described off screen too"
-    );
-    let text = r.render();
-    assert!(
-        text.contains("1 mark, 1 by the user, 1 unread")
-            && text.ends_with("read unread comments with get_review and the location's id"),
-        "{text}"
-    );
+    assert_eq!(entry.target.as_ref().map(|t| &t.dir), Some(&b));
+    let open: Vec<(String, &str)> = entry
+        .open
+        .iter()
+        .map(|o| (o.key.name(), o.showing.as_str()))
+        .collect();
+    assert_eq!(open.len(), 2, "both locations, the one on screen first");
+    assert_eq!(open[0].0, format!("{}#branch", b.display()));
+    assert!(open[0].1.starts_with("readme.md only · "), "{}", open[0].1);
+    assert_eq!(open[1].0, format!("{}#branch", a.display()));
+    assert!(!open[1].1.is_empty(), "described off screen too");
 
-    // Read by its id, it is read in the list too.
-    h.app.review(Some("L1")).unwrap();
-    assert_eq!(h.app.locations_info().locations[1].unread, 0);
+    // The comment left behind is still unread there, in this viewer's copy.
+    assert_eq!(h.app.locations[1].unread(), 1);
+    h.keys("-");
+    assert_eq!(
+        h.app.link.entry().location,
+        Some(LocationKey::Repo {
+            dir: a.clone(),
+            view: View::Branch
+        })
+    );
+    // With two open, the status bar says which this is, in a short name.
+    h.keys("j");
+    assert!(
+        h.status().contains("codesnob-ui-locatio…  ·"),
+        "{}",
+        h.status()
+    );
     cleanup(a);
     cleanup(b);
 }
@@ -2623,12 +2853,14 @@ fn a_held_request_is_dropped_with_esc_or_replaced_by_a_newer_one() {
     let c = small_repo("ui-gate-drop-c");
     let mut h = Harness::open(&a);
     h.keys("jj<enter>look<enter>");
-    let ack = h.app.show_view(target(&b), view(None, &[]));
+    let ack = h.app.show_view(view(None, &[]).at(&b));
     assert!(ack.applied, "show_view itself never holds; dispatch does");
     h.keys("-");
     assert_eq!(h.app.cur().unwrap().dir, a);
-    h.app.dispatch(Msg::Show(target(&b), None));
-    h.app.dispatch(Msg::Show(target(&c), None));
+    h.app
+        .dispatch(Msg::Show(Box::new(view(None, &[]).at(&b)), None));
+    h.app
+        .dispatch(Msg::Show(Box::new(view(None, &[]).at(&c)), None));
     h.settle();
     assert!(
         h.screen().contains("wants to show codesnob-ui-gate-drop-c"),
@@ -2654,16 +2886,12 @@ fn a_held_request_applies_once_the_agent_reads_the_comments() {
     let b = small_repo("ui-gate-read-b");
     let mut h = Harness::open(&a);
     h.keys("jj<enter>look<enter>");
-    h.app.dispatch(Msg::View(
-        target(&b),
-        Box::new(view(None, &["readme.md"])),
-        None,
-    ));
+    h.app
+        .dispatch(Msg::Show(Box::new(view(None, &["readme.md"]).at(&b)), None));
     h.settle();
     assert_eq!(h.app.cur().unwrap().dir, a);
-    let r = h.app.review(None).unwrap();
-    assert_eq!(r.unread, 1);
-    h.settle();
+    let (_, unread) = h.review();
+    assert_eq!(unread, 1);
     assert_eq!(
         h.app.cur().unwrap().dir,
         b,
@@ -2680,7 +2908,8 @@ fn typing_holds_a_switch_even_without_unread_comments() {
     let b = small_repo("ui-gate-typing-b");
     let mut h = Harness::open(&a);
     h.keys("jj<enter>half a thou");
-    h.app.dispatch(Msg::Show(target(&b), None));
+    h.app
+        .dispatch(Msg::Show(Box::new(view(None, &[]).at(&b)), None));
     h.settle();
     assert_eq!(h.app.cur().unwrap().dir, a);
     h.keys("ght<enter>");
@@ -2696,15 +2925,15 @@ fn typing_holds_a_switch_even_without_unread_comments() {
         h.screen()
     );
     // Reading while the user types changes nothing; afterwards it does.
-    h.keys("v");
-    h.app.review(None).unwrap();
+    h.keys("kv");
+    h.review();
     assert_eq!(
         h.app.cur().unwrap().dir,
         a,
         "a marking in progress keeps it held"
     );
     h.keys("<esc>");
-    h.app.review(None).unwrap();
+    h.review();
     assert_eq!(h.app.cur().unwrap().dir, b);
     cleanup(a);
     cleanup(b);
@@ -2715,17 +2944,16 @@ fn an_update_of_the_same_location_goes_through_and_says_what_it_added() {
     let dir = repo_with_long_file("ui-gate-inplace");
     let mut h = Harness::open(&dir);
     h.app
-        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
     h.settle();
     h.screen();
     h.keys("jjjjjjjjjj<enter>here<enter>");
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![
+    spec.marks = vec![
         hl("src/long.rs", 30, 30, Some("one")),
         hl("src/long.rs", 40, 40, Some("two")),
     ];
-    h.app
-        .dispatch(Msg::View(target(&dir), Box::new(spec), None));
+    h.app.dispatch(Msg::Show(Box::new(spec.at(&dir)), None));
     h.settle();
     assert!(h.status().contains("agent added [B] [C]"), "{}", h.status());
     let (_, text) = h.cursor();
@@ -2740,12 +2968,9 @@ fn without_a_review_in_progress_a_switch_is_immediate() {
     let b = small_repo("ui-gate-free-b");
     let mut h = Harness::open(&a);
     h.keys("jj<enter>look<enter>");
-    h.app.review(None).unwrap();
-    h.app.dispatch(Msg::View(
-        target(&b),
-        Box::new(view(None, &["readme.md"])),
-        None,
-    ));
+    h.review();
+    h.app
+        .dispatch(Msg::Show(Box::new(view(None, &["readme.md"]).at(&b)), None));
     h.settle();
     assert_eq!(h.app.cur().unwrap().dir, b);
     cleanup(a);
@@ -2753,16 +2978,433 @@ fn without_a_review_in_progress_a_switch_is_immediate() {
 }
 
 #[test]
+fn shift_enter_breaks_the_line_and_enter_on_a_marked_line_continues_the_thread() {
+    let dir = repo_with_long_file("ui-multiline");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
+    h.settle();
+    h.screen();
+    h.keys("jjjjj<enter>first line<s-enter>second<a-enter>third");
+    let screen = h.screen();
+    let lines: Vec<&str> = screen.lines().collect();
+    let row = lines
+        .iter()
+        .position(|l| l.contains("[A] you: first line"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    assert!(
+        lines[row + 1].trim() == "second" && lines[row + 2].trim() == "third",
+        "every line of the text has a row, indented under the first:\n{screen}"
+    );
+    assert!(
+        lines[row + 1].find("second") == lines[row].find("first line"),
+        "lined up with the text:\n{screen}"
+    );
+    assert!(lines[row + 3].contains("// line 6"), "{screen}");
+    h.keys("<enter>");
+    assert_eq!(
+        h.app.cur().unwrap().marks.marks[0].comment.as_deref(),
+        Some("first line\nsecond\nthird")
+    );
+    let (_, text) = h.cursor();
+    assert!(text.contains("[A] you: first line"), "{text}");
+    // A reply is typed under the whole text, with the cursor on it.
+    h.keys("<enter>");
+    let (row, text) = h.cursor();
+    assert!(
+        text.trim_end().ends_with("you:"),
+        "on the row being typed: {text}"
+    );
+    let screen = h.screen();
+    assert!(
+        screen.lines().nth(row - 1).unwrap().trim() == "third",
+        "under the last line of the text:\n{screen}"
+    );
+    h.keys("ok<enter>");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("you: ok"),
+        "saved, the cursor stays on it: {text}"
+    );
+    h.keys("<enter>nope<esc>");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("you: ok"),
+        "cancelled, the cursor goes back: {text}"
+    );
+    h.keys("j");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("// line 6"),
+        "the cursor steps over the text's rows: {text}"
+    );
+    // Enter on the thread's last turn, on the mark's row, or on the marked
+    // line goes on in the thread, not into a new mark; Esc goes back to
+    // where Enter was pressed.
+    h.keys("k<enter>");
+    assert!(h.screen().contains("reply under [A]"), "{}", h.screen());
+    h.keys("<esc>");
+    let (_, text) = h.cursor();
+    assert!(text.contains("you: ok"), "{text}");
+    h.keys("k<enter>");
+    let (_, text) = h.cursor();
+    assert!(
+        text.trim_end().ends_with("you:"),
+        "on the row being typed: {text:?}"
+    );
+    assert!(h.screen().contains("reply under [A]"), "{}", h.screen());
+    h.keys("<esc>");
+    let (_, text) = h.cursor();
+    assert!(text.contains("[A] you: first line"), "{text}");
+    h.keys("k<enter>");
+    assert!(h.screen().contains("reply under [A]"), "{}", h.screen());
+    h.keys("<esc>");
+    assert_eq!(h.app.cur().unwrap().marks.marks.len(), 1);
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("// line 5"),
+        "cancelled, back on the line: {text}"
+    );
+    // v marks the same line again, on purpose.
+    h.keys("v");
+    assert!(h.status().starts_with("marking line 5"), "{}", h.status());
+    h.keys("<enter>another<enter>");
+    assert_eq!(h.app.cur().unwrap().marks.marks.len(), 2);
+    let (marks, _) = h.review();
+    assert_eq!(
+        marks[0].render(),
+        "[A] user mark src/long.rs 5 (new): first line\n    second\n    third\n    5 | // line 5\n    user (new): ok"
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn an_agents_mark_on_a_diff_shows_its_text_under_the_lines() {
+    let dir = repo_with_long_file("ui-mark-on-diff");
+    let body: String = (1..=60)
+        .map(|i| {
+            if (30..=33).contains(&i) {
+                format!("// line {i} changed\n")
+            } else {
+                format!("// line {i}\n")
+            }
+        })
+        .collect();
+    std::fs::write(dir.join("src/long.rs"), body).unwrap();
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(view(Some("worktree"), &["src/long.rs"]).at(&dir));
+    h.settle();
+    h.screen();
+    let labels = h.marks(&[hl("src/long.rs", 30, 31, Some("one\ntwo"))]);
+    assert_eq!(labels, ["A"]);
+    let screen = h.screen();
+    let lines: Vec<&str> = screen.lines().collect();
+    let a = lines
+        .iter()
+        .position(|l| l.contains("[A] one"))
+        .unwrap_or_else(|| panic!("the text shows:\n{screen}"));
+    assert!(lines[a - 1].contains("// line 31 changed"), "{screen}");
+    assert!(lines[a + 1].trim() == "two", "{screen}");
+    assert!(lines[a + 2].contains("// line 32 changed"), "{screen}");
+    // Line 30 holds the cursor, whose row is shaded; 31 shows the tint.
+    let p = Palette::dark();
+    assert_eq!(
+        h.bg_of("// line 31 changed"),
+        p.mark_bg,
+        "the mark's tint takes over the added line"
+    );
+    assert_eq!(
+        h.bg_of("// line 32 changed"),
+        p.add_bg,
+        "the diff colour past it"
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn the_previous_mark_from_an_inner_one_is_the_mark_around_it() {
+    let dir = repo_with_long_file("ui-marks-nested");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.marks = vec![
+        hl("src/long.rs", 10, 20, Some("outer")),
+        hl("src/long.rs", 15, 16, Some("inner")),
+    ];
+    h.app.show_view(spec.at(&dir));
+    h.settle();
+    h.screen();
+    h.keys(">");
+    assert!(h.status().contains("[B] 2 of 2"), "{}", h.status());
+    h.keys("<");
+    assert!(h.status().contains("[A] 1 of 2"), "{}", h.status());
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 10"), "{text}");
+    cleanup(dir);
+}
+
+#[test]
+fn a_show_of_the_same_repository_waits_while_the_user_types() {
+    let dir = repo_with_long_file("ui-hold-same-repo");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
+    h.settle();
+    h.screen();
+    h.keys("jjjjj<enter>half a");
+    let spec = code(None, &[("a.txt", None)]);
+    h.app.dispatch(Msg::Show(Box::new(spec.at(&dir)), None));
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen.contains("[A] you: half a") && screen.contains("wants to show"),
+        "the composer stays and the request waits:\n{screen}"
+    );
+    h.keys(" thought<s-enter>and<c-w>more<enter>");
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen.contains("a.txt") && !screen.contains("wants to show"),
+        "saved, the request went through:\n{screen}"
+    );
+    h.keys("<");
+    let (marks, _) = h.review();
+    assert_eq!(
+        marks[0].text.as_deref(),
+        Some("half a thought\nmore"),
+        "Ctrl-W took a word, not the line before it"
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn the_cursor_stays_on_its_turn_when_an_earlier_one_goes() {
+    let dir = repo_with_long_file("ui-turn-stays");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
+    h.settle();
+    h.screen();
+    h.keys("jjj<enter>why<enter>");
+    h.keys("<enter>first<enter>");
+    h.keys("<enter>second<enter>");
+    h.keys("<enter>third<enter>");
+    h.keys("k");
+    let (_, text) = h.cursor();
+    assert!(text.contains("you: second"), "{text}");
+    // Another viewer removes the first turn; this cursor keeps its turn.
+    h.agent(None, |m| {
+        m.apply(&Op::Delete { seq: 0, n: Some(1) });
+        Ok(())
+    })
+    .unwrap();
+    let (_, text) = h.cursor();
+    assert!(text.contains("you: second"), "{text}");
+    h.keys("x");
+    assert!(h.screen().contains("you: third") && !h.screen().contains("you: second"));
+    cleanup(dir);
+}
+
+#[test]
+fn a_selection_keeps_its_lines_while_rows_arrive_above_it() {
+    let dir = repo_with_long_file("ui-select-shift");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
+    h.settle();
+    h.screen();
+    h.keys(&"j".repeat(30));
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 30"), "{text}");
+    h.keys("vjj");
+    assert!(
+        h.status().starts_with("marking lines 30-32"),
+        "{}",
+        h.status()
+    );
+    // The agent's mark above adds rows; the user is busy, so no jump.
+    assert_eq!(h.mark("src/long.rs", 10, 10, "one\ntwo\nthree"), "A");
+    assert!(
+        h.status().starts_with("marking lines 30-32"),
+        "{}",
+        h.status()
+    );
+    h.keys("<enter>");
+    assert!(
+        h.status().starts_with("src/long.rs 30-32 ·"),
+        "the comment goes on the lines selected: {}",
+        h.status()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn marks_starting_on_the_same_line_are_stepped_through_one_by_one() {
+    let dir = repo_with_long_file("ui-marks-same-line");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.marks = vec![
+        hl("src/long.rs", 10, 12, Some("short")),
+        hl("src/long.rs", 10, 20, Some("long")),
+        hl("src/long.rs", 30, 30, Some("later")),
+    ];
+    h.app.show_view(spec.at(&dir));
+    h.settle();
+    h.screen();
+    assert!(h.status().contains("[A] 1 of 3"), "{}", h.status());
+    h.keys(">");
+    assert!(h.status().contains("[B] 2 of 3"), "{}", h.status());
+    h.keys(">");
+    assert!(h.status().contains("[C] 3 of 3"), "{}", h.status());
+    h.keys("<");
+    assert!(h.status().contains("[B] 2 of 3"), "{}", h.status());
+    h.keys("<");
+    assert!(h.status().contains("[A] 1 of 3"), "{}", h.status());
+    h.keys("<");
+    assert!(
+        h.status().contains("[A] 1 of 3"),
+        "nothing before: {}",
+        h.status()
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn a_mark_on_a_line_the_diff_did_not_show_is_jumped_to_once_it_is() {
+    let dir = repo_with_long_file("ui-jump-later");
+    let body: String = (1..=60)
+        .map(|i| {
+            if i == 50 {
+                "// line 50 changed\n".to_string()
+            } else {
+                format!("// line {i}\n")
+            }
+        })
+        .collect();
+    std::fs::write(dir.join("src/long.rs"), body).unwrap();
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(view(Some("worktree"), &["src/long.rs"]).at(&dir));
+    h.settle();
+    h.screen();
+    assert!(
+        !h.screen().contains("// line 5\n"),
+        "line 5 is outside the hunk"
+    );
+    assert_eq!(h.mark("src/long.rs", 5, 5, "up here"), "A");
+    wait_until(&mut h, &|h| h.cursor().1.contains("// line 5"));
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("// line 5"),
+        "jumped once the line came in: {text}"
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn a_tall_block_at_the_end_scrolls_into_view_row_by_row() {
+    let dir = repo_with_long_file("ui-tall-block");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
+    h.settle();
+    h.screen();
+    let text: String = (1..=60)
+        .map(|i| format!("row {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(h.mark("src/long.rs", 60, 60, &text), "A");
+    h.keys("G");
+    let screen = h.screen();
+    let (_, line) = h.cursor();
+    assert!(
+        line.contains("row 60"),
+        "G lands on the last row of the text: {line}\n{screen}"
+    );
+    h.keys(&"k".repeat(59));
+    let (_, line) = h.cursor();
+    assert!(line.contains("[A] row 1"), "k walks up through it: {line}");
+    assert!(!h.screen().contains("row 60"), "{}", h.screen());
+    h.keys(&"j".repeat(59));
+    let (_, line) = h.cursor();
+    assert!(line.contains("row 60"), "j walks down through it: {line}");
+    assert!(
+        h.screen().contains("row 60"),
+        "the tail came into view:\n{}",
+        h.screen()
+    );
+    // Deep in the text, the keys still mean the mark.
+    h.keys("<enter>");
+    assert!(h.screen().contains("reply under [A]"), "{}", h.screen());
+    h.keys("<esc>x");
+    assert!(h.status().contains("[A] removed"), "{}", h.status());
+    cleanup(dir);
+}
+
+#[test]
+fn a_mermaid_fence_in_a_mark_is_drawn_as_a_diagram() {
+    let dir = repo_with_long_file("ui-mermaid");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
+    h.settle();
+    h.screen();
+    let text =
+        "How it flows:\n```mermaid\nflowchart LR\n  V[Viewer] --> D[Daemon]\n```\nThat is all.";
+    assert_eq!(h.mark("src/long.rs", 10, 10, text), "A");
+    let screen = h.screen();
+    assert!(
+        screen.contains("[A] How it flows:")
+            && (screen.contains("drawing the diagram…") || screen.contains('┌')),
+        "the words show at once, the drawing is on its way or there:\n{screen}"
+    );
+    wait_until(&mut h, &|h| h.screen().contains('┌'));
+    let screen = h.screen();
+    let rows: Vec<&str> = screen.lines().collect();
+    let a = rows
+        .iter()
+        .position(|l| l.contains("[A] How it flows:"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    let drawing: Vec<&str> = rows[a + 1..]
+        .iter()
+        .take_while(|l| !l.contains("That is all."))
+        .copied()
+        .collect();
+    assert!(
+        drawing.iter().any(|l| l.contains("Viewer"))
+            && drawing.iter().any(|l| l.contains("Daemon")),
+        "the nodes are drawn under the words:\n{screen}"
+    );
+    assert!(
+        !screen.contains("```") && !screen.contains("drawing the diagram"),
+        "the fence is gone:\n{screen}"
+    );
+    assert!(
+        rows[a + 1 + drawing.len()].contains("That is all."),
+        "the text goes on after the drawing:\n{screen}"
+    );
+    // The agent reads its own fence back, not the drawing.
+    let (marks, _) = h.review();
+    assert!(marks[0].text.as_deref().unwrap().contains("```mermaid"));
+    // The cursor steps over the drawing's rows as over any text.
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 10"), "{text}");
+    h.keys("jj");
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 11"), "{text}");
+    cleanup(dir);
+}
+
+#[test]
 fn deleting_a_comment_from_its_own_row_leaves_the_cursor_on_its_line() {
     let dir = repo_with_long_file("ui-comment-row-delete");
     let mut h = Harness::open(&dir);
     h.app
-        .show_view(target(&dir), code(None, &[("src/long.rs", None)]));
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
     h.settle();
     h.screen();
     h.keys(&"j".repeat(40));
     h.keys("<enter>gone soon<enter>");
-    h.keys("k");
     let (_, text) = h.cursor();
     assert!(
         text.contains("[A] you: gone soon"),
@@ -2789,36 +3431,195 @@ fn deleting_a_comment_from_its_own_row_leaves_the_cursor_on_its_line() {
 }
 
 #[test]
+fn the_agents_news_moves_the_cursor_unless_the_user_is_busy() {
+    let dir = repo_with_long_file("ui-agent-news");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
+    h.settle();
+    h.screen();
+    h.keys("jj<enter>why<enter>");
+    h.keys("G");
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 60"), "{text}");
+    // A reply of the agent's: the cursor lands on it, the mark at the top.
+    h.reply("A", "because").unwrap();
+    let (row, text) = h.cursor();
+    assert!(text.contains("agent: because"), "{text}");
+    let screen = h.screen();
+    assert!(
+        screen
+            .lines()
+            .nth(row - 1)
+            .unwrap()
+            .contains("[A] you: why"),
+        "{screen}"
+    );
+    // Typing holds the cursor where it is.
+    h.keys("G<enter>");
+    assert!(h.screen().contains("you:"), "{}", h.screen());
+    assert_eq!(h.mark("src/long.rs", 40, 40, "later"), "B");
+    assert!(h.app.composing.is_some(), "still typing");
+    h.keys("<esc>");
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 60"), "{text}");
+    assert!(h.status().contains("agent marked [B]"), "{}", h.status());
+    cleanup(dir);
+}
+
+#[test]
+fn several_marks_in_one_call_jump_once_and_separate_calls_wait_for_a_move() {
+    let dir = repo_with_long_file("ui-agent-burst");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
+    h.settle();
+    h.screen();
+    // One call, three marks: the cursor goes to the first.
+    let labels = h.marks(&[
+        hl("src/long.rs", 20, 20, Some("one")),
+        hl("src/long.rs", 40, 40, Some("two")),
+        hl("src/long.rs", 50, 50, Some("three")),
+    ]);
+    assert_eq!(labels, ["A", "B", "C"]);
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 20"), "{text}");
+    assert!(
+        h.status().contains("agent marked [A] src/long.rs 20, [B]"),
+        "{}",
+        h.status()
+    );
+    // Another call while the cursor still sits there: no jump.
+    assert_eq!(h.mark("src/long.rs", 30, 30, "four"), "D");
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 20"), "still on the first: {text}");
+    // Once the user has moved, the next one jumps again.
+    h.keys("j");
+    assert_eq!(h.mark("src/long.rs", 45, 45, "five"), "E");
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 45"), "{text}");
+    // Given bottom first, they are lettered as given and the cursor goes
+    // to the topmost.
+    h.keys("j");
+    let labels = h.marks(&[
+        hl("src/long.rs", 58, 58, Some("low")),
+        hl("src/long.rs", 48, 48, Some("high")),
+    ]);
+    assert_eq!(labels, ["F", "G"]);
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 48"), "{text}");
+    let f = h.app.cur().unwrap().marks.get(5).unwrap();
+    assert_eq!((f.label.as_str(), f.start), ("F", 58), "lettered as given");
+    // Rows arriving above the cursor do not count as the user moving.
+    assert_eq!(h.mark("src/long.rs", 1, 1, "way up"), "H");
+    let (_, text) = h.cursor();
+    assert!(
+        text.contains("// line 48"),
+        "still where the last jump put it: {text}"
+    );
+    cleanup(dir);
+}
+
+#[test]
+fn an_agent_marks_lines_without_a_show() {
+    let dir = repo_with_long_file("ui-agent-comment");
+    let mut h = Harness::open(&dir);
+    h.app
+        .show_view(code(None, &[("src/long.rs", None)]).at(&dir));
+    h.settle();
+    h.screen();
+    assert_eq!(h.mark("src/long.rs", 30, 31, "unused"), "A");
+    // The user was idle, so the view goes to it.
+    let (_, text) = h.cursor();
+    assert!(text.contains("// line 30"), "{text}");
+    let screen = h.screen();
+    let a = screen
+        .lines()
+        .position(|l| l.contains("[A] unused"))
+        .unwrap_or_else(|| panic!("the text is drawn under its lines:\n{screen}"));
+    assert!(
+        screen.lines().nth(a - 1).unwrap().contains("// line 31"),
+        "{screen}"
+    );
+    let loc = h.app.cur().unwrap();
+    assert_eq!(
+        loc.marks.marks[0].text.as_deref().map(|t| t.len()),
+        Some(2),
+        "the viewer took its lines"
+    );
+    assert_eq!(loc.users_words(), 0, "not the user's");
+    // The next show adds to it.
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.marks = vec![hl("src/long.rs", 5, 5, None)];
+    let ack = h.app.show_view(spec.at(&dir));
+    h.settle();
+    h.screen();
+    assert_eq!(ack.marks[0].label, "B");
+    let mine: Vec<String> = h
+        .app
+        .cur()
+        .unwrap()
+        .marks
+        .mine()
+        .iter()
+        .map(|m| m.label.clone())
+        .collect();
+    assert_eq!(mine, ["A", "B"]);
+    h.keys(">");
+    assert!(h.screen().contains("[A] unused"), "{}", h.screen());
+    let (marks, _) = h.review();
+    let a = marks.iter().find(|m| m.label == "A").unwrap();
+    assert_eq!(a.render(), "[A] agent mark src/long.rs 30-31: unused");
+    // The user answers it like any mark: Enter on its row, below its lines.
+    h.keys("jj<enter>");
+    assert!(h.screen().contains("reply under [A]"), "{}", h.screen());
+    h.keys("why?<enter>");
+    assert!(h.screen().contains("you: why?"), "{}", h.screen());
+    assert!(h.app.cur().unwrap().marks.marks[0].is_users());
+    cleanup(dir);
+}
+
+#[test]
 fn enter_on_an_agents_highlight_answers_it() {
     let dir = repo_with_long_file("ui-comment-reply");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![hl("src/long.rs", 20, 22, Some("the loop"))];
-    h.app.show_view(target(&dir), spec);
+    spec.marks = vec![hl("src/long.rs", 20, 22, Some("the loop"))];
+    h.app.show_view(spec.at(&dir));
     h.settle();
     h.screen();
-    h.keys("k");
+    h.keys("jjj");
     let (_, text) = h.cursor();
     assert!(text.contains("[A] the loop"), "{text}");
     h.keys("<enter>");
-    assert!(
-        h.screen().contains("re [A] src/long.rs 20-22"),
-        "{}",
-        h.screen()
-    );
+    assert!(h.screen().contains("reply under [A]"), "{}", h.screen());
     h.keys("not a loop<enter>");
     let screen = h.screen();
-    assert!(screen.contains("[B] you re [A]: not a loop"), "{screen}");
-    let m = &h.app.cur().unwrap().marks[1];
-    assert_eq!((m.start, m.end, m.re.as_deref()), (20, 22, Some("A")));
-    assert_eq!(m.text.as_deref().map(|t| t.len()), Some(3));
-    let r = h.app.review(None).unwrap();
+    let lines: Vec<&str> = screen.lines().collect();
+    let a = lines
+        .iter()
+        .position(|l| l.contains("[A] the loop"))
+        .unwrap();
     assert!(
-        r.render()
-            .contains("[B] comment src/long.rs 20-22 (new, re [A]): not a loop"),
-        "{}",
-        r.render()
+        lines[a + 1].contains("you: not a loop"),
+        "the answer sits in the thread under the highlight:\n{screen}"
     );
+    let loc = h.app.cur().unwrap();
+    assert_eq!(loc.marks.marks.len(), 1, "no mark of its own");
+    assert!(
+        loc.marks.marks[0].is_users(),
+        "the thread is the user's now"
+    );
+    assert_eq!((loc.users_words(), loc.unread()), (1, 1));
+    let (marks, _) = h.review();
+    assert_eq!(
+        marks[0].render(),
+        "[A] agent mark src/long.rs 20-22: the loop\n    user (new): not a loop"
+    );
+    assert!(marks[0].theirs);
+    // The agent may answer there now.
+    h.reply("A", "it is").unwrap();
+    assert!(h.screen().contains("agent: it is"), "{}", h.screen());
     cleanup(dir);
 }
 
@@ -2827,17 +3628,17 @@ fn angle_brackets_step_from_the_cursor_not_from_the_last_jump() {
     let dir = repo_with_long_file("ui-marks-from-cursor");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![
+    spec.marks = vec![
         hl("src/long.rs", 10, 10, Some("a")),
         hl("src/long.rs", 30, 30, Some("b")),
         hl("src/long.rs", 50, 50, Some("c")),
     ];
-    h.app.show_view(target(&dir), spec);
+    h.app.show_view(spec.at(&dir));
     h.settle();
     h.screen();
     assert!(h.status().contains("[A] 1 of 3"), "{}", h.status());
-    // Twenty-five lines down, plus [B]'s own row on the way.
-    h.keys(&"j".repeat(26));
+    // Twenty-five lines down, plus [A]'s and [B]'s own rows on the way.
+    h.keys(&"j".repeat(27));
     let (_, text) = h.cursor();
     assert!(text.contains("// line 35"), "{text}");
     h.keys(">");
@@ -2884,44 +3685,46 @@ fn show_code_opens_a_whole_file_at_its_line_and_esc_returns() {
     let dir = repo_with_long_file("ui-code-one");
     let mut h = Harness::open(&dir);
     h.app
-        .show_view(target(&dir), code(None, &[("src/long.rs", Some(40))]));
+        .show_view(code(None, &[("src/long.rs", Some(40))]).at(&dir));
     h.settle();
     let status = h.app.scope();
     assert_eq!(status, "src/long.rs · working tree · Esc returns");
     let screen = h.screen();
     let marked = screen
         .lines()
-        .find(|l| l.contains('▶'))
+        .find(|l| l.starts_with("A "))
         .expect("the line is marked");
     assert!(
         marked.contains("40") && marked.contains("// line 40"),
         "{marked}"
     );
-    let row = screen.lines().position(|l| l.contains('▶')).unwrap();
-    assert!(
-        (5..15).contains(&row),
-        "about a third of the way down: row {row}\n{screen}"
+    assert_eq!(
+        screen.lines().position(|l| l.starts_with("A ")),
+        Some(1),
+        "the mark's line at the top\n{screen}"
     );
     assert!(!screen.contains("@@"), "a whole file has no hunk headers");
     assert!(h.status().contains("src/long.rs"), "{}", h.status());
 
     h.keys("<esc>");
     assert!(h.app.scope().contains("since main"), "{}", h.app.scope());
-    assert!(!h.screen().contains('▶'));
+    assert!(
+        !h.screen().contains("A 40"),
+        "the mark belongs to the file view"
+    );
     cleanup(dir);
 }
 
 #[test]
-fn show_code_with_several_files_shows_excerpts() {
+fn marks_without_files_show_excerpts_of_the_marked_files() {
     let dir = repo_with_long_file("ui-code-many");
     let mut h = Harness::open(&dir);
-    h.app.show_view(
-        target(&dir),
-        code(
-            None,
-            &[("src/long.rs", Some(30)), ("src/deep/one.rs", Some(1))],
-        ),
-    );
+    let mut spec = code(None, &[]);
+    spec.marks = vec![
+        hl("src/long.rs", 30, 30, None),
+        hl("src/deep/one.rs", 1, 1, None),
+    ];
+    h.app.show_view(spec.at(&dir));
     h.settle();
     assert!(
         h.app.scope().starts_with("2 files · working tree"),
@@ -2930,10 +3733,13 @@ fn show_code_with_several_files_shows_excerpts() {
     );
     let screen = h.screen();
     assert!(
-        screen.contains("⋯ lines 22–38"),
+        screen.contains("A 30") && screen.contains("// line 33"),
         "an excerpt around line 30: {screen}"
     );
-    assert!(!screen.contains("// line 50"), "not the whole file");
+    assert!(
+        !screen.contains("// line 50") && !screen.contains("// line 20"),
+        "not the whole file: {screen}"
+    );
     cleanup(dir);
 }
 
@@ -2942,7 +3748,7 @@ fn show_code_at_a_revision_reads_it_from_there() {
     let dir = branch_with_history("ui-code-rev");
     let mut h = Harness::open(&dir);
     h.app
-        .show_view(target(&dir), code(Some("main"), &[("gone.txt", None)]));
+        .show_view(code(Some("main"), &[("gone.txt", None)]).at(&dir));
     h.settle();
     let scope = h.app.scope();
     assert!(scope.starts_with("gone.txt @ "), "{scope}");
@@ -2979,13 +3785,18 @@ fn a_file_view_follows_edits_without_moving() {
     let dir = repo_with_long_file("ui-code-live");
     let mut h = Harness::open(&dir);
     h.app
-        .show_view(target(&dir), code(None, &[("src/long.rs", Some(40))]));
+        .show_view(code(None, &[("src/long.rs", Some(40))]).at(&dir));
     h.settle();
     h.keys("jjj");
+    // The first row with a line number, its letter column dropped.
     let first_numbered = |h: &mut Harness| {
         h.screen()
             .lines()
-            .find(|l| l.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+            .map(|l| {
+                l.trim_start_matches(|c: char| c.is_ascii_uppercase())
+                    .trim_start()
+            })
+            .find(|l| l.starts_with(|c: char| c.is_ascii_digit()))
             .unwrap()
             .to_string()
     };
@@ -3005,12 +3816,12 @@ fn a_file_view_follows_edits_without_moving() {
 
 // ---- highlights ---------------------------------------------------------------
 
-fn hl(path: &str, start: usize, end: usize, note: Option<&str>) -> crate::proto::HighlightSpec {
-    crate::proto::HighlightSpec {
+fn hl(path: &str, start: usize, end: usize, text: Option<&str>) -> crate::proto::MarkSpec {
+    crate::proto::MarkSpec {
         path: path.to_string(),
         start,
         end,
-        note: note.map(str::to_owned),
+        text: text.map(str::to_owned),
     }
 }
 
@@ -3019,11 +3830,11 @@ fn highlights_are_numbered_tinted_and_stepped_through() {
     let dir = repo_with_long_file("ui-marks");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![
+    spec.marks = vec![
         hl("src/long.rs", 20, 22, Some("the loop")),
         hl("src/long.rs", 45, 45, None),
     ];
-    h.app.show_view(target(&dir), spec);
+    h.app.show_view(spec.at(&dir));
     h.settle();
     let screen = h.screen();
     let note = screen
@@ -3033,41 +3844,58 @@ fn highlights_are_numbered_tinted_and_stepped_through() {
     assert!(note.contains("the loop"), "{note}");
     let row = screen.lines().position(|l| l.contains("[A]")).unwrap();
     assert_eq!(
-        row, 1,
-        "[A] sits at the top, under the file header:\n{screen}"
+        row, 4,
+        "[A]'s first line sits at the top, its text under its three lines:\n{screen}"
     );
-    let marked: Vec<&str> = screen
-        .lines()
-        .filter(|l| (l.starts_with('▌') || l.starts_with('A')) && l.contains("// line 2"))
+    assert!(
+        screen.lines().nth(1).unwrap().contains("// line 20"),
+        "{screen}"
+    );
+    // Line 20 holds the cursor, whose row is shaded.
+    let tinted: Vec<usize> = (21..=24)
+        .filter(|n| h.bg_of(&format!("// line {n}")) == Palette::dark().mark_bg)
         .collect();
-    assert_eq!(marked.len(), 3, "lines 20-22 carry the mark: {screen}");
+    assert_eq!(tinted, [21, 22], "lines 20-22 carry the mark's tint");
+    let line = |n: usize| {
+        screen
+            .lines()
+            .find(|l| l.contains(&format!("// line {n}")))
+            .unwrap()
+            .to_string()
+    };
     assert!(
-        marked[0].starts_with("A ") && marked[1].starts_with("▌ "),
-        "the letter on the first line, the bar below: {marked:?}"
+        line(20).starts_with("A ") && line(21).starts_with("  ") && line(22).starts_with("  "),
+        "the letter on the first line, nothing beside the others: {screen}"
     );
     assert!(
-        marked.iter().all(|l| l.contains(" 2")),
-        "the mark sits beside the number, not on it: {marked:?}"
+        line(20).contains(" 2"),
+        "the letter sits beside the number, not on it: {}",
+        line(20)
     );
     assert!(h.status().contains("[A] 1 of 2"), "{}", h.status());
 
     h.keys(">");
     assert_eq!(
         h.screen().lines().position(|l| l.contains("[B]")),
-        Some(1),
-        "every jump puts the note at the top"
+        Some(2),
+        "every jump puts the first line at the top, the text under it"
     );
     assert!(h.status().contains("[B] 2 of 2"), "{}", h.status());
     h.keys("<");
     assert!(h.status().contains("[A] 1 of 2"), "{}", h.status());
     h.keys(":");
     assert!(h.screen().contains("Next mark [>]"), "{}", h.screen());
+    let marks_before = h.app.cur().unwrap().marks.clone();
     h.keys("<esc><esc>");
     assert!(
-        h.status().contains("of 2") && h.screen().contains("+60"),
-        "Esc returns to the diff and the marks stay with their code: {}",
+        !h.status().contains("of 2") && h.screen().contains("+60"),
+        "Esc returns to the diff, whose marks are its own: {}",
         h.status()
     );
+    // The file view is shown again: its marks are still there.
+    h.app
+        .show_view(code(None, &[("src/long.rs", None)]).with_marks(&dir, marks_before));
+    h.settle();
     h.keys("><");
     assert!(h.screen().contains("[A] the loop"), "{}", h.screen());
     cleanup(dir);
@@ -3078,11 +3906,11 @@ fn letters_are_fixed_and_a_new_call_continues_the_sequence() {
     let dir = repo_with_long_file("ui-marks-letters");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![
+    spec.marks = vec![
         hl("src/long.rs", 10, 11, Some("first")),
         hl("src/long.rs", 30, 30, Some("second")),
     ];
-    h.app.show_view(target(&dir), spec);
+    h.app.show_view(spec.at(&dir));
     h.settle();
     let screen = h.screen();
     assert!(
@@ -3091,28 +3919,30 @@ fn letters_are_fixed_and_a_new_call_continues_the_sequence() {
     );
 
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![hl("src/long.rs", 20, 20, Some("third"))];
-    h.app.show_view(target(&dir), spec);
+    spec.marks = vec![hl("src/long.rs", 20, 20, Some("third"))];
+    h.app.show_view(spec.at(&dir));
     h.settle();
     let screen = h.screen();
     assert!(
         screen.contains("[C] third"),
         "the next call goes on from where the letters were:\n{screen}"
     );
+    assert!(h.status().contains("[C] 2 of 3"), "{}", h.status());
+    h.keys("<");
+    let screen = h.screen();
     assert!(
-        !screen.contains("[A]") && !screen.contains("[B]"),
-        "and replaces the agent's earlier highlights:\n{screen}"
+        screen.contains("[A] first") && screen.contains("[B] second"),
+        "and keeps the earlier marks:\n{screen}"
     );
-    assert!(h.status().contains("[C] 1 of 1"), "{}", h.status());
 
     // Twenty-six more and the letters go on past Z.
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = (1..=20).map(|i| hl("src/long.rs", i, i, None)).collect();
-    h.app.show_view(target(&dir), spec);
+    spec.marks = (1..=20).map(|i| hl("src/long.rs", i, i, None)).collect();
+    h.app.show_view(spec.at(&dir));
     h.settle();
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = (40..=43).map(|i| hl("src/long.rs", i, i, None)).collect();
-    h.app.show_view(target(&dir), spec);
+    spec.marks = (40..=43).map(|i| hl("src/long.rs", i, i, None)).collect();
+    h.app.show_view(spec.at(&dir));
     h.settle();
     let screen = h.screen();
     assert!(
@@ -3134,11 +3964,11 @@ fn overlapping_marks_show_the_newest_letter_and_all_of_them_under_the_cursor() {
     let dir = repo_with_long_file("ui-marks-overlap");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![
+    spec.marks = vec![
         hl("src/long.rs", 10, 20, Some("outer")),
         hl("src/long.rs", 15, 16, Some("inner")),
     ];
-    h.app.show_view(target(&dir), spec);
+    h.app.show_view(spec.at(&dir));
     h.settle();
     let screen = h.screen();
     let line = |n: usize| {
@@ -3149,21 +3979,26 @@ fn overlapping_marks_show_the_newest_letter_and_all_of_them_under_the_cursor() {
             .to_string()
     };
     assert!(line(10).starts_with("A "), "{}", line(10));
-    assert!(line(12).starts_with("▌ "), "{}", line(12));
+    assert!(line(12).starts_with("  "), "{}", line(12));
     assert!(
         line(15).starts_with("B "),
         "the newer mark wins the gutter: {}",
         line(15)
     );
-    assert!(line(16).starts_with("▌ "), "{}", line(16));
-    assert!(
-        line(17).starts_with("▌ "),
-        "back to the outer mark: {}",
-        line(17)
+    assert!(line(16).starts_with("  "), "{}", line(16));
+    assert!(line(17).starts_with("  "), "{}", line(17));
+    // Line 10 holds the cursor, whose row is shaded.
+    let tinted: Vec<usize> = (11..=21)
+        .filter(|n| h.bg_of(&format!("// line {n}")) == Palette::dark().mark_bg)
+        .collect();
+    assert_eq!(
+        tinted,
+        (11..=20).collect::<Vec<_>>(),
+        "every marked line is tinted"
     );
     assert!(!h.status().contains("[A] [B]"), "{}", h.status());
-    // Five lines down and over [B]'s own row.
-    h.keys("jjjjjj");
+    // Five lines down.
+    h.keys("jjjjj");
     assert!(
         h.cursor().1.contains("// line 15") && h.status().contains("[A] [B]"),
         "both letters under the cursor: {}",
@@ -3187,8 +4022,8 @@ fn a_highlight_on_an_unchanged_line_shows_it_in_the_diff() {
     std::fs::write(dir.join("src/long.rs"), body).unwrap();
     let mut h = Harness::open(&dir);
     let mut spec = view(Some("worktree"), &["src/long.rs"]);
-    spec.highlights = vec![hl("src/long.rs", 50, 50, Some("not changed, but look"))];
-    h.app.show_view(target(&dir), spec);
+    spec.marks = vec![hl("src/long.rs", 50, 50, Some("not changed, but look"))];
+    h.app.show_view(spec.at(&dir));
     h.settle();
     let screen = h.screen();
     assert!(screen.contains("not changed, but look"), "{screen}");
@@ -3205,8 +4040,8 @@ fn highlights_follow_their_code_and_go_when_it_does() {
     let dir = repo_with_long_file("ui-marks-follow");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.highlights = vec![hl("src/long.rs", 30, 31, Some("watch me"))];
-    h.app.show_view(target(&dir), spec);
+    spec.marks = vec![hl("src/long.rs", 30, 31, Some("watch me"))];
+    h.app.show_view(spec.at(&dir));
     h.settle();
 
     // Two lines inserted at the top: the highlight moves down with its text.
@@ -3215,9 +4050,9 @@ fn highlights_follow_their_code_and_go_when_it_does() {
         .collect();
     std::fs::write(dir.join("src/long.rs"), body).unwrap();
     wait_until(&mut h, &|h| {
-        h.screen().contains("new a") || h.app.cur().unwrap().marks[0].start == 32
+        h.screen().contains("new a") || h.app.cur().unwrap().marks.marks[0].start == 32
     });
-    let m = &h.app.cur().unwrap().marks[0];
+    let m = &h.app.cur().unwrap().marks.marks[0];
     assert_eq!(
         (m.start, m.end),
         (32, 33),
@@ -3228,7 +4063,7 @@ fn highlights_follow_their_code_and_go_when_it_does() {
     // the status bar says so.
     let body: String = (1..=60).map(|i| format!("// other {i}\n")).collect();
     std::fs::write(dir.join("src/long.rs"), body).unwrap();
-    wait_until(&mut h, &|h| h.app.cur().unwrap().marks[0].stale);
+    wait_until(&mut h, &|h| h.app.cur().unwrap().marks.marks[0].stale);
     assert!(
         h.status().contains("[A] no longer matches its code"),
         "{}",
@@ -3240,10 +4075,8 @@ fn highlights_follow_their_code_and_go_when_it_does() {
         "the row stays, flagged:\n{screen}"
     );
     assert!(
-        !screen
-            .lines()
-            .any(|l| l.starts_with('▌') || l.starts_with('A')),
-        "no line is tinted or barred:\n{screen}"
+        !screen.lines().any(|l| l.starts_with('A')),
+        "no line is lettered:\n{screen}"
     );
     cleanup(dir);
 }
@@ -3275,139 +4108,145 @@ fn angle_brackets_move_between_hunks_without_highlights() {
 }
 
 #[test]
-fn highlights_are_numbered_by_where_they_sit_not_the_order_given() {
+fn marks_are_lettered_as_given_and_walked_by_where_they_sit() {
     let dir = repo_with_long_file("ui-marks-order");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None)]);
-    // Given out of order; numbered top to bottom.
-    spec.highlights = vec![
+    // Given out of order: lettered as given, walked top to bottom.
+    spec.marks = vec![
         hl("src/long.rs", 45, 45, Some("lowest")),
         hl("src/long.rs", 10, 11, Some("highest")),
         hl("src/long.rs", 30, 30, Some("middle")),
     ];
-    h.app.show_view(target(&dir), spec);
+    h.app.show_view(spec.at(&dir));
     h.settle();
-    let at_top = |h: &mut Harness| h.screen().lines().nth(1).unwrap_or("").to_string();
+    // The first rows under the header: a mark's lines, then its text.
+    let at_top = |h: &mut Harness| {
+        h.screen()
+            .lines()
+            .skip(1)
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     assert!(
-        at_top(&mut h).contains("[A] highest"),
-        "opens at [A]: {}",
+        at_top(&mut h).contains("[A] lowest"),
+        "opens at [A], the first given: {}",
         at_top(&mut h)
     );
+    assert!(h.status().contains("[A] 3 of 3"), "{}", h.status());
     h.keys(">");
-    assert!(at_top(&mut h).contains("[B] middle"), "{}", at_top(&mut h));
-    h.keys(">");
-    assert!(at_top(&mut h).contains("[C] lowest"), "{}", at_top(&mut h));
-    h.keys(">");
-    assert!(at_top(&mut h).contains("[C] lowest"), "stays on the last");
-    h.keys("jjj<");
-    assert!(
-        at_top(&mut h).contains("[C] lowest"),
-        "< goes to the mark above the cursor, which is still [C]: {}",
-        at_top(&mut h)
-    );
+    assert!(at_top(&mut h).contains("[A] lowest"), "stays on the last");
     h.keys("<");
-    assert!(at_top(&mut h).contains("[B] middle"), "{}", at_top(&mut h));
-    assert!(h.status().contains("[B] 2 of 3"), "{}", h.status());
+    assert!(at_top(&mut h).contains("[C] middle"), "{}", at_top(&mut h));
+    h.keys("<");
+    assert!(at_top(&mut h).contains("[B] highest"), "{}", at_top(&mut h));
+    assert!(h.status().contains("[B] 1 of 3"), "{}", h.status());
+    h.keys("jjj>");
+    assert!(
+        at_top(&mut h).contains("[C] middle"),
+        "> goes to the mark below the cursor: {}",
+        at_top(&mut h)
+    );
+    assert!(h.status().contains("[C] 2 of 3"), "{}", h.status());
     cleanup(dir);
 }
 
 #[test]
-fn highlights_across_files_go_in_the_order_the_files_are_shown() {
+fn marks_across_files_are_walked_in_the_order_the_files_are_shown() {
     let dir = repo_with_long_file("ui-marks-files");
     let mut h = Harness::open(&dir);
-    // Listed long.rs first, so its highlights come first though its path sorts last.
-    let mut spec = code(None, &[("src/long.rs", None), ("src/deep/one.rs", None)]);
-    spec.highlights = vec![
-        hl("src/deep/one.rs", 1, 1, Some("in one")),
+    // Listed long.rs first, so its marks come first though its path sorts
+    // last; no files named, so each shows around its marks.
+    let mut spec = code(None, &[]);
+    spec.marks = vec![
         hl("src/long.rs", 50, 50, Some("long low")),
         hl("src/long.rs", 5, 5, Some("long high")),
+        hl("src/deep/one.rs", 1, 1, Some("in one")),
     ];
-    h.app.show_view(target(&dir), spec);
+    h.app.show_view(spec.at(&dir));
     h.settle();
-    // Excerpts: all three are on screen, top to bottom in number order.
-    let screen = h.screen();
-    let row = |want: &str| {
-        screen
-            .lines()
-            .position(|l| l.contains(want))
-            .unwrap_or_else(|| panic!("{want} on screen:\n{screen}"))
-    };
-    assert!(row("[A] long high") < row("[B] long low"), "{screen}");
-    assert!(row("[B] long low") < row("[C] in one"), "{screen}");
-    h.keys(">>");
+    // Excerpts, in file and line order; opens at the first given.
+    assert!(h.status().contains("[A] 2 of 3"), "{}", h.status());
+    assert!(h.screen().contains("[A] long low"), "{}", h.screen());
+    h.keys(">");
     assert!(h.status().contains("[C] 3 of 3"), "{}", h.status());
+    assert!(h.screen().contains("[C] in one"), "{}", h.screen());
+    h.keys("<<");
+    assert!(h.status().contains("[B] 1 of 3"), "{}", h.status());
+    assert!(h.screen().contains("[B] long high"), "{}", h.screen());
+    let screen = h.screen();
+    let row = |want: &str| screen.lines().position(|l| l.contains(want));
+    assert!(row("[B] long high") < row("[A] long low"), "{screen}");
     cleanup(dir);
 }
 
 #[test]
-fn a_line_inside_a_highlight_opens_at_that_highlight() {
+fn a_show_opens_at_the_first_mark_given_wherever_it_sits() {
     let dir = repo_with_long_file("ui-marks-line-in");
     let mut h = Harness::open(&dir);
-    // As an agent sent it: the line, and its highlight listed first.
-    let mut spec = code(None, &[("src/long.rs", Some(40))]);
-    spec.highlights = vec![
+    // As an agent sent it: the point first, the rest around it.
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.marks = vec![
         hl("src/long.rs", 38, 42, Some("the point")),
         hl("src/long.rs", 5, 6, Some("setup")),
         hl("src/long.rs", 20, 20, Some("helper")),
         hl("src/long.rs", 55, 55, Some("after")),
     ];
-    h.app.show_view(target(&dir), spec);
+    h.app.show_view(spec.at(&dir));
+    h.settle();
+    let screen = h.screen();
+    assert!(
+        screen.lines().nth(1).unwrap_or("").contains("// line 38"),
+        "its first line at the top:\n{screen}"
+    );
+    let rows: Vec<&str> = screen.lines().collect();
+    let a = rows
+        .iter()
+        .position(|l| l.contains("[A] the point"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    assert!(
+        rows[a - 1].contains("// line 42"),
+        "its text under its lines:\n{screen}"
+    );
+    assert!(h.status().contains("[A] 3 of 4"), "{}", h.status());
+    h.keys(">");
+    assert!(h.status().contains("[D] 4 of 4"), "{}", h.status());
+    h.keys("<<");
+    assert!(h.status().contains("[C] 2 of 4"), "{}", h.status());
+    cleanup(dir);
+}
+
+#[test]
+fn a_mark_without_words_is_a_place_to_open_at() {
+    let dir = repo_with_long_file("ui-marks-line-out");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.marks = vec![
+        hl("src/long.rs", 30, 30, None),
+        hl("src/long.rs", 5, 5, Some("early")),
+        hl("src/long.rs", 55, 55, Some("late")),
+    ];
+    h.app.show_view(spec.at(&dir));
     h.settle();
     let screen = h.screen();
     assert!(
         screen
             .lines()
             .nth(1)
-            .unwrap_or("")
-            .contains("[C] the point"),
-        "its note at the top:\n{screen}"
+            .is_some_and(|l| l.starts_with("A ") && l.contains("// line 30")),
+        "opens at the wordless mark, its line at the top:\n{screen}"
     );
-    assert!(
-        screen
-            .lines()
-            .any(|l| l.contains('▶') && l.contains("// line 40")),
-        "the line is marked:\n{screen}"
-    );
-    assert!(h.status().contains("[C] 3 of 4"), "{}", h.status());
-    h.keys(">");
-    assert!(h.status().contains("[D] 4 of 4"), "{}", h.status());
-    h.keys("<<");
-    assert!(h.status().contains("[B] 2 of 4"), "{}", h.status());
-    cleanup(dir);
-}
-
-#[test]
-fn a_line_outside_the_highlights_opens_at_the_line() {
-    let dir = repo_with_long_file("ui-marks-line-out");
-    let mut h = Harness::open(&dir);
-    let mut spec = code(None, &[("src/long.rs", Some(30))]);
-    spec.highlights = vec![
-        hl("src/long.rs", 5, 5, Some("early")),
-        hl("src/long.rs", 55, 55, Some("late")),
-    ];
-    h.app.show_view(target(&dir), spec);
-    h.settle();
-    let screen = h.screen();
-    assert!(
-        screen
-            .lines()
-            .any(|l| l.contains('▶') && l.contains("// line 30")),
-        "{screen}"
-    );
-    assert!(
-        h.status().contains("2 marks") && !h.status().contains(" of 2"),
-        "no highlight is current yet: {}",
-        h.status()
-    );
+    assert!(h.status().contains("[A] 2 of 3"), "{}", h.status());
     h.keys(">");
     assert_eq!(
-        h.screen().lines().position(|l| l.contains("[B] late")),
-        Some(1),
-        "the next mark below line 30"
+        h.screen().lines().position(|l| l.contains("[C] late")),
+        Some(2),
+        "the next mark below line 30, its line at the top"
     );
-    assert!(h.status().contains("[B] 2 of 2"), "{}", h.status());
+    assert!(h.status().contains("[C] 3 of 3"), "{}", h.status());
     h.keys("<<");
-    assert!(h.status().contains("[A] 1 of 2"), "{}", h.status());
+    assert!(h.status().contains("[B] 1 of 3"), "{}", h.status());
     cleanup(dir);
 }
 
@@ -3415,13 +4254,13 @@ fn a_line_outside_the_highlights_opens_at_the_line() {
 fn one_file_can_show_just_its_highlights_like_a_diff() {
     let dir = repo_with_long_file("ui-code-excerpts");
     let mut h = Harness::open(&dir);
-    let mut spec = code(None, &[("src/long.rs", None)]);
-    spec.code.as_mut().unwrap().files[0].excerpts = Some(true);
-    spec.highlights = vec![
+    // No files named: the marked file shows around its marks.
+    let mut spec = code(None, &[]);
+    spec.marks = vec![
         hl("src/long.rs", 10, 11, Some("first")),
         hl("src/long.rs", 45, 45, Some("second")),
     ];
-    h.app.show_view(target(&dir), spec);
+    h.app.show_view(spec.at(&dir));
     h.settle();
     let view = &h.app.cur().unwrap().view;
     let shown = |line| view.row_of_line("src/long.rs", line).is_some();
@@ -3436,16 +4275,16 @@ fn one_file_can_show_just_its_highlights_like_a_diff() {
 }
 
 #[test]
-fn one_of_several_files_can_show_whole() {
+fn files_show_whole_or_the_region_asked_for() {
     let dir = repo_with_long_file("ui-code-whole");
     let mut h = Harness::open(&dir);
     let mut spec = code(None, &[("src/long.rs", None), ("src/deep/one.rs", None)]);
-    spec.code.as_mut().unwrap().files[0].excerpts = Some(false);
-    spec.highlights = vec![
+    spec.files[1].lines = Some((1, 1));
+    spec.marks = vec![
         hl("src/long.rs", 5, 5, None),
         hl("src/deep/one.rs", 1, 1, None),
     ];
-    h.app.show_view(target(&dir), spec);
+    h.app.show_view(spec.at(&dir));
     h.settle();
     let view = &h.app.cur().unwrap().view;
     assert!(
@@ -3453,6 +4292,22 @@ fn one_of_several_files_can_show_whole() {
         "long.rs shows whole"
     );
     assert!(view.row_of_line("src/deep/one.rs", 1).is_some());
+    assert!(
+        view.row_of_line("src/deep/one.rs", 2).is_none(),
+        "only the region of one.rs"
+    );
+    // A region of the long file, with a mark inside it.
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    spec.files[0].lines = Some((20, 30));
+    spec.marks = vec![hl("src/long.rs", 25, 25, Some("in the window"))];
+    h.app.show_view(spec.at(&dir));
+    h.settle();
+    let view = &h.app.cur().unwrap().view;
+    assert!(view.row_of_line("src/long.rs", 20).is_some());
+    assert!(view.row_of_line("src/long.rs", 30).is_some());
+    assert!(view.row_of_line("src/long.rs", 19).is_none());
+    assert!(view.row_of_line("src/long.rs", 31).is_none());
+    assert!(h.screen().contains("in the window"), "{}", h.screen());
     cleanup(dir);
 }
 
