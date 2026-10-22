@@ -4336,3 +4336,75 @@ fn the_open_prompt_shows_a_file_as_of_a_revision() {
     );
     cleanup(dir);
 }
+
+#[test]
+fn long_words_wrap_to_the_width_and_the_cursor_and_jumps_still_work() {
+    let dir = repo_with_long_file("ui-wrap");
+    let mut h = Harness::open(&dir);
+    let mut spec = code(None, &[("src/long.rs", None)]);
+    let long = "the loop here runs once per row of the table, which is fine for small tables but \
+                quadratic once the join on the left grows; a map keyed by id would make it linear";
+    spec.marks = vec![
+        hl("src/long.rs", 20, 21, Some(long)),
+        hl("src/long.rs", 50, 50, Some("short")),
+    ];
+    h.app.show_view(spec.at(&dir));
+    h.settle();
+    let screen = h.screen();
+    let rows: Vec<&str> = screen.lines().collect();
+    let a = rows
+        .iter()
+        .position(|l| l.contains("[A] the loop here"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    assert!(
+        rows.iter().all(|l| l.chars().count() <= 120),
+        "nothing runs past the width:\n{screen}"
+    );
+    assert!(
+        rows[a + 1]
+            .trim_start()
+            .starts_with(|c: char| c.is_alphabetic())
+            && !rows[a + 1].contains("// line"),
+        "the words go on under the lead:\n{screen}"
+    );
+    assert!(
+        screen.contains("make it linear"),
+        "the end of the text is shown:\n{screen}"
+    );
+    // A block that fits is one stop for the cursor, wrapped or not, and
+    // the jumps land on the marks.
+    assert!(h.status().contains("[A] 1 of 2"), "{}", h.status());
+    h.keys("jjj");
+    let (row, text) = h.cursor();
+    assert_eq!(row, a + 2, "past both rows of the text: {text}");
+    assert!(text.contains("// line 22"), "{text}");
+    h.keys(">");
+    assert!(h.status().contains("[B] 2 of 2"), "{}", h.status());
+    h.keys("<");
+    assert!(h.status().contains("[A] 1 of 2"), "{}", h.status());
+    assert!(
+        h.screen().lines().nth(1).unwrap().contains("// line 20"),
+        "{}",
+        h.screen()
+    );
+    // What is typed wraps too, the caret at the end of the last row.
+    h.keys("<enter>");
+    let typed = "a reply that is long enough to need a second row on a screen of this width, \
+                 surely, since it keeps going well past the hundred and twenty columns there are";
+    h.keys(typed);
+    let screen = h.screen();
+    let you = screen
+        .lines()
+        .position(|l| l.contains("you: a reply that"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    let next = screen.lines().nth(you + 1).unwrap_or("");
+    assert!(
+        next.contains("columns there are") && !next.contains("you:"),
+        "the rest on a second row, under the lead: {screen}"
+    );
+    h.keys("<enter>");
+    let (marks, _) = h.review();
+    let b = marks.iter().find(|m| m.label == "A").unwrap();
+    assert_eq!(b.thread[0].text, typed, "saved as typed, unwrapped");
+    cleanup(dir);
+}

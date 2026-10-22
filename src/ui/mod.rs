@@ -351,13 +351,14 @@ fn drawn(m: &Mark, target: &diagram::Target, tx: &Sender<Msg>) -> diffview::Mark
             .map(|(at, p)| (*at, diffview::Pic(p.clone())))
             .collect()
     };
-    // The room a drawing has: what is left of the width after the lead
-    // of its row, letter and author and all.
-    let mark_lead = 2 + m.label.chars().count() + 3 + 8 + 5;
-    let comment = m
-        .comment
-        .as_deref()
-        .map(|c| diagram::display(c, &target.after(mark_lead), tx));
+    // The room the words have: what is left of the width after the lead
+    // of their row, letter and author and all. Drawings get the same,
+    // and the words wrap to it.
+    let mark_lead = diffview::mark_lead(&m.label, m.stale, m.author);
+    let comment = m.comment.as_deref().map(|c| {
+        let room = target.after(mark_lead);
+        wrapped(diagram::display(c, &room, tx), room.width())
+    });
     diffview::Mark {
         path: m.path.clone(),
         start: m.start,
@@ -373,8 +374,8 @@ fn drawn(m: &Mark, target: &diagram::Target, tx: &Sender<Msg>) -> diffview::Mark
             .thread
             .iter()
             .map(|t| {
-                let lead = 6 + "agent: ".len();
-                let shown = diagram::display(&t.text, &target.after(lead), tx);
+                let room = target.after(diffview::turn_lead(t.author));
+                let shown = wrapped(diagram::display(&t.text, &room, tx), room.width());
                 diffview::Turn {
                     n: t.n,
                     author: t.author,
@@ -382,6 +383,41 @@ fn drawn(m: &Mark, target: &diagram::Target, tx: &Sender<Msg>) -> diffview::Mark
                     text: shown.text,
                 }
             })
+            .collect(),
+    }
+}
+
+/// `shown` with its words wrapped to `width` columns; the rows its
+/// pictures take stay as they are, and the pictures follow their lines.
+fn wrapped(shown: diagram::Shown, width: usize) -> diagram::Shown {
+    let lines: Vec<&str> = shown.text.split('\n').collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut at = vec![0; lines.len() + 1];
+    let mut i = 0;
+    while i < lines.len() {
+        at[i] = out.len();
+        match shown.pictures.iter().find(|(start, _)| *start == i) {
+            Some((_, p)) => {
+                // Its rows are blank lines, kept one to one.
+                let rows = usize::from(p.rows).max(1);
+                for (j, l) in lines[i..(i + rows).min(lines.len())].iter().enumerate() {
+                    at[i + j] = out.len();
+                    out.push((*l).to_string());
+                }
+                i += rows;
+            }
+            None => {
+                out.extend(diffview::wrap(lines[i], width));
+                i += 1;
+            }
+        }
+    }
+    diagram::Shown {
+        text: out.join("\n"),
+        pictures: shown
+            .pictures
+            .into_iter()
+            .map(|(start, p)| (at[start.min(lines.len())], p))
             .collect(),
     }
 }
@@ -3704,7 +3740,7 @@ impl App {
         if let Some(loc) = self.locations.first_mut() {
             let cursor = loc.view.cursor();
             loc.view.marking = marking.map(|from| (from.min(cursor), from.max(cursor)));
-            loc.view.resize(self.body_h);
+            loc.view.resize(self.body_h, self.body_w);
             loc.view.set_compose(compose);
             // A target line inside a highlight opens at that highlight, its
             // note at the top; any other target line sits about a third of
