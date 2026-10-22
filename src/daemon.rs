@@ -510,7 +510,7 @@ fn handle(
                     return Err(no_viewer());
                 }
                 let loc = st.registry.ensure(key.clone(), dir.clone(), name.clone());
-                let edited = match loc.marks.edit(&marks, replace, user_asked) {
+                let mut edited = match loc.marks.edit(&marks, replace, user_asked) {
                     Ok(e) => e,
                     Err(e) => {
                         // Recorded for nothing: an empty location goes.
@@ -518,6 +518,10 @@ fn handle(
                         return Err(query_error(e));
                     }
                 };
+                // Lettered as they will stand on screen, top down.
+                let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+                let diff = key.view().is_none_or(crate::location::View::is_diff);
+                crate::marks::in_view_order(&mut edited.adds, &paths, diff);
                 let state = loc.clone();
                 let mut notes = Vec::new();
                 if !edited.deleted.is_empty() {
@@ -1101,6 +1105,12 @@ mod tests {
                     end: 2,
                     text: None,
                 }),
+                MarkEntry::Add(proto::MarkSpec {
+                    path: "a.rs".to_string(),
+                    start: 7,
+                    end: 7,
+                    text: None,
+                }),
                 MarkEntry::Move {
                     letter: "A".to_string(),
                     path: "a.rs".to_string(),
@@ -1138,13 +1148,20 @@ mod tests {
             "the daemon's copy comes along"
         );
         assert_eq!(show.view.files[0].path, "a.rs");
+        let placed: Vec<(&str, usize)> = show
+            .view
+            .marks
+            .iter()
+            .map(|m| (m.path.as_str(), m.start))
+            .collect();
         assert_eq!(
-            show.view.marks.len(),
-            1,
-            "the new mark is the viewer's to place"
+            placed,
+            [("a.rs", 7), ("b.rs", 2)],
+            "the new marks are the viewer's to place, in the order it shows them"
         );
         // The viewer, lettering from a copy that was behind, calls its new
-        // mark [B] and says so right after its op; the daemon knows it as [C].
+        // marks [B] [C] and says so right after its op; the daemon knows
+        // them as [C] [D].
         let op = Request {
             id: "v".to_string(),
             method: Method::ViewerOp {
@@ -1159,32 +1176,33 @@ mod tests {
             id: "v".to_string(),
             method: Method::ViewerReply {
                 id,
-                result: json!({ "marks": [{ "label": "B", "author": "agent", "path": "b.rs", "start": 2, "end": 2 }], "applied": true }),
+                result: json!({ "marks": [
+                    { "label": "B", "author": "agent", "path": "a.rs", "start": 7, "end": 7 },
+                    { "label": "C", "author": "agent", "path": "b.rs", "start": 2, "end": 2 }
+                ], "applied": true }),
             },
         };
         writer.write_all(to_line(&reply).as_bytes()).unwrap();
         let r: ShowResult = serde_json::from_value(caller.join().unwrap().unwrap()).unwrap();
         assert_eq!(r.shown, "everything since the branch point · a.rs");
-        assert_eq!(
-            r.marked[0].label, "C",
-            "the daemon's letter, not the viewer's"
-        );
+        let marked: Vec<&str> = r.marked.iter().map(|m| m.label.as_str()).collect();
+        assert_eq!(marked, ["C", "D"], "the daemon's letters, not the viewer's");
         assert_eq!(r.moved[0].label, "A");
         assert_eq!(r.deleted, ["B"]);
         assert_eq!(r.viewer, "v1");
         assert_eq!(r.report.location, at);
         assert_eq!(
             (r.report.total, r.report.by_user, r.report.unread),
-            (2, 1, 1)
+            (3, 1, 1)
         );
         assert_eq!(r.report.mine[0].label, "C");
         assert!(r.report.notes.is_empty(), "{:?}", r.report.notes);
         let text = r.render();
-        assert!(text.starts_with("shown: everything since the branch point · a.rs\nmarked: [C] b.rs 2\nmoved: [A] a.rs 5\ndeleted: [B]\nlocation: "), "{text}");
+        assert!(text.starts_with("shown: everything since the branch point · a.rs\nmarked: [C] a.rs 7, [D] b.rs 2\nmoved: [A] a.rs 5\ndeleted: [B]\nlocation: "), "{text}");
 
         // The viewer's op was announced too.
         let (state, _) = location_event(&mut reader);
-        assert_eq!(state.marks.marks.len(), 2);
+        assert_eq!(state.marks.marks.len(), 3);
         // Only deletions: the marks change, the view does not.
         let caller = d.show(
             &at,
@@ -1195,7 +1213,7 @@ mod tests {
             false,
         );
         let (state, note) = location_event(&mut reader);
-        assert_eq!(state.marks.marks.len(), 1);
+        assert_eq!(state.marks.marks.len(), 2);
         assert_eq!(note.as_deref(), Some("agent deleted [C]"));
         let r: ShowResult = serde_json::from_value(caller.join().unwrap().unwrap()).unwrap();
         assert!(r.shown.is_empty() && r.viewer.is_empty());

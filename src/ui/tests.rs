@@ -2296,7 +2296,7 @@ fn an_agents_call_is_answered_with_letters_location_and_unread_count() {
     assert_eq!(
         letters,
         [("A".to_string(), 30), ("B".to_string(), 10)],
-        "lettered in the order given"
+        "lettered in the order sent; the daemon sorts them"
     );
     assert!(ack.applied);
     assert!(!h.status().contains("L1"), "no ids: {}", h.status());

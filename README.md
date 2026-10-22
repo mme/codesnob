@@ -142,7 +142,7 @@ The server gives the agent three tools, and every call names its
 
 | Tool | Does |
 |---|---|
-| `show` | put a location on screen: whole files, regions of them, or every file a comparison touches, and set the marks on it. New marks are lettered in the order given, up to 20 per call; an entry with a letter moves that mark or, with `delete`, removes it; `replace` removes the agent's own marks first. A ```mermaid fence in a mark's words is drawn as a diagram |
+| `show` | put a location on screen: whole files, regions of them, or every file a comparison touches, and set the marks on it. New marks are lettered as they stand on screen, file by file and top down, up to 20 per call; an entry with a letter moves that mark or, with `delete`, removes it; `replace` removes the agent's own marks first. A ```mermaid fence in a mark's words is drawn as a diagram |
 | `review` | read the marks on a location, the agent's and yours, or only some by letter, with the threads under them, the code under your marks and what is new |
 | `reply` | answer in the thread under a mark |
 
@@ -235,8 +235,9 @@ A mark is a line range with a letter, `[A]`, `[B]`, … in the order marks
 were made, whoever made it, with words on it or not. A mark keeps its
 letter, so you and the agent can both say "B" and mean the same lines.
 Yours are drawn in teal, the agent's in purple. Yours always carry words,
-since Enter is how you make one; the agent's carry words when you asked it
-to explain, review or comment, and are bare when it is only pointing.
+since Enter is how you make one; the agent's carry words when it has
+something to say about the lines, a sentence or a diagram, and are bare
+when it is only pointing.
 
 Every mark stays until someone removes it. A show adds marks and removes
 none unless told to, so the agent is told to pass `replace` when it points

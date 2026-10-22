@@ -2422,7 +2422,7 @@ impl App {
 
     /// An agent's show: the location for that view in place, or opened,
     /// remembering what was on screen so Esc can go back to it; then its
-    /// new marks, lettered in the order given.
+    /// new marks, lettered in the order sent: as they stand on screen.
     pub fn show_view(&mut self, show: ShowEvent) -> ShowAck {
         // Whatever the last key said is old news once the agent shows something.
         self.message = None;

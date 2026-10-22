@@ -8,6 +8,15 @@ the machinery, not decoration.
 
 <!-- next -->
 
+## Unreleased
+
+- **Letters run down the screen.** The marks one `show` adds are lettered
+  as they stand in the viewer, file by file and top down, whatever order
+  the agent gave them in.
+- **A mark with something to say.** The agent is asked to put a sentence,
+  or a diagram, on a mark where the lines alone do not tell the story,
+  and to leave one bare where they do.
+
 ## v0.2.0
 
 - **Locations are named by what they are.** The `L3` ids are gone. To an
