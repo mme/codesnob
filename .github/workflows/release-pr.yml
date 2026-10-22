@@ -92,12 +92,28 @@ jobs:
           git log $RANGE --no-merges --format='- %s' > /tmp/commits.md
           echo "last=${LAST:-the beginning}" >> "$GITHUB_OUTPUT"
 
+      - name: Promote the unreleased notes
+        id: unreleased
+        env:
+          NEW: ${{ steps.version.outputs.new }}
+        run: |
+          # Notes written as the changes merged, under "## Unreleased", are
+          # the release's notes: the heading becomes the version's.
+          if grep -q '^## Unreleased$' CHANGELOG.md; then
+            sed -i "s/^## Unreleased\$/## v$NEW/" CHANGELOG.md
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Draft the release notes
-        # Claude reads the same history and writes the changelog section a
-        # human would. Runs on the maintainer's subscription (`claude
-        # setup-token` -> CLAUDE_CODE_OAUTH_TOKEN secret) and is allowed to
-        # fail: the step below ships the raw commit list instead, because a
-        # release must never block on its narrator.
+        # Without unreleased notes, Claude reads the history and writes the
+        # changelog section a human would. Runs on the maintainer's
+        # subscription (`claude setup-token` -> CLAUDE_CODE_OAUTH_TOKEN
+        # secret) and is allowed to fail: the step below ships the raw
+        # commit list instead, because a release must never block on its
+        # narrator.
+        if: steps.unreleased.outputs.found != 'true'
         continue-on-error: true
         uses: anthropics/claude-code-action@c81e3bc69d1b18badbb63ba39581218f02421678 # v1
         with:

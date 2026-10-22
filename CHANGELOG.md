@@ -1,19 +1,15 @@
 # Changelog
 
-Every release, newest first. A version's section is drafted when its release
-PR is prepared (`release / create-pr`), can be edited on that PR like any
-other file, and becomes the GitHub Release's body verbatim when the PR
-merges. The marker below is where the next section is inserted; it is part of
-the machinery, not decoration.
+Every release, newest first. Changes land under `## Unreleased` as they
+merge; when a release PR is prepared (`release / create-pr`) that section
+becomes the version's, or one is drafted from the commits when there is
+none. It can be edited on that PR like any other file and becomes the GitHub
+Release's body verbatim when the PR merges. The marker below is where the
+next section goes; it is part of the machinery, not decoration.
 
 <!-- next -->
 
 ## v0.2.1
-
-- Letter new marks as they stand on screen, and ask for words where the lines need them
-- Wrap a mark's words, its thread and what is typed to the width
-
-## Unreleased
 
 - **Words wrap.** A mark's text, the turns under it and what you type
   break at the width, at a space where there is one, instead of running
