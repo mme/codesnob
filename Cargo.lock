@@ -428,6 +428,7 @@ dependencies = [
  "serde_json",
  "syntect",
  "two-face",
+ "unicode-width",
 ]
 
 [[package]]

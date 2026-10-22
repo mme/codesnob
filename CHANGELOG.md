@@ -8,6 +8,13 @@ the machinery, not decoration.
 
 <!-- next -->
 
+## Unreleased
+
+- **Words wrap.** A mark's text, the turns under it and what you type
+  break at the width, at a space where there is one, instead of running
+  off the screen; a resize wraps them again. A block that fits is still
+  one stop for the cursor, and jumps land on the marks as before.
+
 ## v0.2.0
 
 - **Locations are named by what they are.** The `L3` ids are gone. To an
