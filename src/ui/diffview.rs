@@ -72,6 +72,81 @@ fn text_lines(text: &str) -> std::str::Split<'_, char> {
     text.split('\n')
 }
 
+/// `text` broken into rows no wider than `width` columns: at the last
+/// space that fits, else mid-word; its own line breaks kept. A width of
+/// zero leaves it alone.
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = Vec::new();
+    for line in text_lines(text) {
+        if width == 0 {
+            out.push(line.to_string());
+            continue;
+        }
+        let mut rest = line;
+        loop {
+            let mut cols = 0;
+            let mut cut = None;
+            let mut last_space = None;
+            for (i, c) in rest.char_indices() {
+                let w = c.width().unwrap_or(0);
+                if cols + w > width {
+                    cut = Some(i);
+                    break;
+                }
+                cols += w;
+                if c == ' ' {
+                    last_space = Some(i);
+                }
+            }
+            let Some(cut) = cut else {
+                out.push(rest.to_string());
+                break;
+            };
+            // A space right at the cut is the break; else the last one
+            // before it; else mid-word.
+            let at = if rest[cut..].starts_with(' ') {
+                cut
+            } else {
+                match last_space {
+                    Some(sp) if sp > 0 => sp,
+                    _ => cut.max(1),
+                }
+            };
+            out.push(rest[..at].trim_end().to_string());
+            rest = rest[at..].trim_start();
+            if rest.is_empty() {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The columns before the words on a mark's first row: the letter, a
+/// stale note, and who wrote them.
+pub fn mark_lead(label: &str, stale: bool, author: Author) -> usize {
+    5 + label.chars().count()
+        + if stale {
+            "stale · ".chars().count()
+        } else {
+            0
+        }
+        + if author == Author::User {
+            "you: ".len()
+        } else {
+            0
+        }
+}
+
+/// The columns before the words on a turn's row.
+pub fn turn_lead(author: Author) -> usize {
+    6 + match author {
+        Author::User => "you: ".len(),
+        Author::Agent => "agent: ".len(),
+    }
+}
+
 /// A picture in some text, the same one as long as it is the same
 /// drawing.
 #[derive(Clone, Debug)]
@@ -221,6 +296,8 @@ pub struct DiffView {
     cursor: usize,
     /// The height of the body at the last draw; what "in sight" means.
     body_h: usize,
+    /// Its width, which text being typed wraps to.
+    body_w: usize,
     /// A line to mark with ▶ in a plain file: (path, line number).
     pub target: Option<(String, usize)>,
     /// Scroll to `target` at the next draw, once the screen height is known.
@@ -305,8 +382,18 @@ impl DiffView {
     /// Show what is being typed where it will go, and keep it in sight.
     /// The rows change only when where it goes does.
     pub fn set_compose(&mut self, compose: Option<Composing>) {
-        let shape = |c: Option<&Composing>| c.map(|c| (c.at.clone(), text_lines(&c.text).count()));
-        let moved = shape(self.compose.as_ref()) != shape(compose.as_ref());
+        let before = self
+            .compose
+            .as_ref()
+            .map(|c| (c.at.clone(), self.compose_lines().len()));
+        let after = compose.as_ref().map(|c| {
+            let lead = self.compose_lead(&c.at);
+            (
+                c.at.clone(),
+                wrap(&c.text, self.body_w.saturating_sub(lead)).len(),
+            )
+        });
+        let moved = before != after;
         if moved {
             // Taken while the rows, and what is typed on them, still stand.
             let anchor = self.anchor();
@@ -328,10 +415,7 @@ impl DiffView {
             // The cursor sits on what is being typed, and the view shows
             // its last line, scrolling just enough.
             self.cursor = row;
-            let lines = self
-                .compose
-                .as_ref()
-                .map_or(1, |c| text_lines(&c.text).count());
+            let lines = self.compose_lines().len();
             let last = row + lines - 1;
             for _ in 0..2 {
                 let visible = self.visible_at(self.scroll);
@@ -382,9 +466,11 @@ impl DiffView {
                 (row, 6 + who)
             }
         };
-        let lines: Vec<&str> = text_lines(&c.text).collect();
+        let lines = self.compose_lines();
         let row = row + lines.len() - 1;
-        let last = lines.last().map_or(0, |l| l.chars().count());
+        let last = lines
+            .last()
+            .map_or(0, |l| unicode_width::UnicodeWidthStr::width(l.as_str()));
         if row < self.scroll {
             return None;
         }
@@ -965,11 +1051,11 @@ impl DiffView {
             Block::Mark(m) => {
                 self.mark_rows[m] = Some(self.rows.len());
                 self.rows.push(Row::Mark(m));
-                let n = text_lines(&self.mark_text(m)).count();
+                let n = self.mark_lines(m).len();
                 self.rows.extend((1..n).map(|k| Row::MarkLine(m, k)));
                 for t in 0..self.marks[m].thread.len() {
                     self.rows.push(Row::Turn(m, t));
-                    let n = text_lines(&self.turn_text(m, t)).count();
+                    let n = self.turn_lines(m, t).len();
                     self.rows.extend((1..n).map(|k| Row::TurnLine(m, t, k)));
                 }
                 if *compose_at == Some(ComposeAt::Turn(self.marks[m].seq)) {
@@ -979,34 +1065,44 @@ impl DiffView {
             Block::Compose => {
                 self.compose_row = Some(self.rows.len());
                 self.rows.push(Row::Compose);
-                let n = self
-                    .compose
-                    .as_ref()
-                    .map_or(1, |c| text_lines(&c.text).count());
+                let n = self.compose_lines().len();
                 self.rows.extend((1..n).map(Row::ComposeLine));
             }
         }
     }
 
-    /// A mark's text as shown: what is being typed for it, else its own.
-    fn mark_text(&self, m: usize) -> String {
+    /// A mark's text as shown, by row: what is being typed for it, wrapped
+    /// to the width, else its own words, wrapped when they were drawn.
+    fn mark_lines(&self, m: usize) -> Vec<String> {
         let mark = &self.marks[m];
-        self.compose
+        match self
+            .compose
             .as_ref()
             .filter(|c| c.at == ComposeAt::EditMark(mark.seq))
-            .map(|c| c.text.clone())
-            .or_else(|| mark.comment.clone())
-            .unwrap_or_default()
+        {
+            Some(c) => wrap(
+                &c.text,
+                self.body_w
+                    .saturating_sub(mark_lead(&mark.label, false, mark.author)),
+            ),
+            None => text_lines(mark.comment.as_deref().unwrap_or_default())
+                .map(str::to_owned)
+                .collect(),
+        }
     }
 
     /// A turn's text as shown: what is being typed for it, else its own.
-    fn turn_text(&self, m: usize, t: usize) -> String {
+    fn turn_lines(&self, m: usize, t: usize) -> Vec<String> {
         let mark = &self.marks[m];
         let turn = &mark.thread[t];
-        self.compose
+        match self
+            .compose
             .as_ref()
             .filter(|c| c.at == ComposeAt::EditTurn(mark.seq, turn.n))
-            .map_or_else(|| turn.text.clone(), |c| c.text.clone())
+        {
+            Some(c) => wrap(&c.text, self.body_w.saturating_sub(turn_lead(turn.author))),
+            None => text_lines(&turn.text).map(str::to_owned).collect(),
+        }
     }
 
     // ---- position --------------------------------------------------------
@@ -1240,9 +1336,51 @@ impl DiffView {
     }
 
     /// Tell the view how tall the body is, which decides what is in sight.
-    pub fn resize(&mut self, body_h: usize) {
+    pub fn resize(&mut self, body_h: usize, body_w: usize) {
         self.body_h = body_h.max(1);
+        if self.body_w != body_w {
+            self.body_w = body_w;
+            // What is typed wraps to the new width.
+            if self.compose.is_some() {
+                let anchor = self.anchor();
+                self.build_rows();
+                if let Some(a) = anchor {
+                    self.restore(a);
+                }
+            }
+        }
         self.fit();
+    }
+
+    /// The lead before what is being typed.
+    fn compose_lead(&self, at: &ComposeAt) -> usize {
+        match at {
+            ComposeAt::Comment { label, .. } => mark_lead(label, false, Author::User),
+            ComposeAt::Turn(_) => turn_lead(Author::User),
+            ComposeAt::EditMark(seq) => self
+                .marks
+                .iter()
+                .find(|m| m.seq == *seq)
+                .map_or(7, |m| mark_lead(&m.label, false, m.author)),
+            ComposeAt::EditTurn(seq, n) => self
+                .marks
+                .iter()
+                .find(|m| m.seq == *seq)
+                .and_then(|m| m.thread.iter().find(|t| t.n == *n))
+                .map_or(11, |t| turn_lead(t.author)),
+        }
+    }
+
+    /// What is being typed, as rows: wrapped to the width left after its
+    /// lead.
+    fn compose_lines(&self) -> Vec<String> {
+        match &self.compose {
+            Some(c) => wrap(
+                &c.text,
+                self.body_w.saturating_sub(self.compose_lead(&c.at)),
+            ),
+            None => vec![String::new()],
+        }
     }
 
     /// First row index at which the last row lands on the bottom line,
@@ -1508,8 +1646,7 @@ impl DiffView {
                     self.render_picture(pic, into, idx, lead_w, area, buf, picker);
                     return;
                 }
-                let text = self.mark_text(m);
-                let line = text_lines(&text).nth(k).unwrap_or_default().to_string();
+                let line = self.mark_lines(m).into_iter().nth(k).unwrap_or_default();
                 self.render_text_row(area, buf, lead, line, k, tint.fg(fg));
             }
             Row::Turn(m, t) | Row::TurnLine(m, t, _) => {
@@ -1542,8 +1679,7 @@ impl DiffView {
                     self.render_picture(pic, into, idx, lead_w, area, buf, picker);
                     return;
                 }
-                let text = self.turn_text(m, t);
-                let line = text_lines(&text).nth(k).unwrap_or_default().to_string();
+                let line = self.turn_lines(m, t).into_iter().nth(k).unwrap_or_default();
                 self.render_text_row(area, buf, lead, line, k, tint.fg(fg));
             }
             Row::Compose | Row::ComposeLine(_) => {
@@ -1557,7 +1693,7 @@ impl DiffView {
                     _ => "      you: ".to_string(),
                 };
                 let lead = vec![Span::styled(lead, tint.fg(fg).add_modifier(Modifier::BOLD))];
-                let line = text_lines(&c.text).nth(k).unwrap_or_default().to_string();
+                let line = self.compose_lines().into_iter().nth(k).unwrap_or_default();
                 self.render_text_row(area, buf, lead, line, k, tint.fg(fg));
             }
             Row::Desc(i) => {
@@ -1925,5 +2061,34 @@ fn mark_no(f: &FileDiff, line: &crate::diff::DiffLine, old_side: bool) -> Option
         line.old_no
     } else {
         line_no(f, line)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn words_wrap_at_spaces_and_long_words_break() {
+        assert_eq!(wrap("short", 10), ["short"]);
+        assert_eq!(
+            wrap("the quick brown fox jumps", 10),
+            ["the quick", "brown fox", "jumps"]
+        );
+        assert_eq!(wrap("abcdefghijkl", 5), ["abcde", "fghij", "kl"]);
+        assert_eq!(
+            wrap("one\ntwo three four", 9),
+            ["one", "two three", "four"],
+            "its own breaks are kept"
+        );
+        assert_eq!(wrap("", 5), [""]);
+        assert_eq!(wrap("a b", 0), ["a b"], "no width, no wrapping");
+        assert_eq!(wrap("日本語の文", 4), ["日本", "語の", "文"], "by columns");
+        assert_eq!(mark_lead("A", false, Author::User), "  [A] you: ".len());
+        assert_eq!(
+            mark_lead("AB", true, Author::Agent),
+            "  [AB] stale · ".chars().count()
+        );
+        assert_eq!(turn_lead(Author::Agent), "      agent: ".len());
     }
 }

@@ -82,6 +82,14 @@ pub enum Target {
 impl Target {
     /// The same target with `lead` fewer columns: what is drawn sits that
     /// far in from the left.
+    /// The columns it has.
+    pub fn width(&self) -> usize {
+        match self {
+            Target::Text { width } => *width,
+            Target::Picture { cols, .. } => *cols,
+        }
+    }
+
     pub fn after(&self, lead: usize) -> Target {
         match self {
             Target::Text { width } => Target::Text {
