@@ -8,6 +8,11 @@ the machinery, not decoration.
 
 <!-- next -->
 
+## v0.2.1
+
+- Letter new marks as they stand on screen, and ask for words where the lines need them
+- Wrap a mark's words, its thread and what is typed to the width
+
 ## Unreleased
 
 - **Words wrap.** A mark's text, the turns under it and what you type
