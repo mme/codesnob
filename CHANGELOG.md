@@ -8,7 +8,7 @@ the machinery, not decoration.
 
 <!-- next -->
 
-## Unreleased
+## v0.2.0
 
 - **Locations are named by what they are.** The `L3` ids are gone. To an
   agent, a location is a checkout and a view of it in one name
